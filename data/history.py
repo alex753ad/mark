@@ -2,7 +2,9 @@ import aiosqlite
 import os
 from logger import logger
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "history.db")
+# On Railway, use /data volume for persistence. Locally use project root.
+_DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", os.path.join(os.path.dirname(__file__), ".."))
+DB_PATH = os.path.join(_DATA_DIR, "history.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS level_outcomes (
