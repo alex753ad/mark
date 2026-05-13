@@ -3,8 +3,7 @@
 .env.local
 .env.*.local
 
-# API keys and secrets
-tokens.json
+# API keys and secrets (keep out of git)
 trigger_times.json
 
 # Database
@@ -62,3 +61,19 @@ env/
 *.tmp
 *.bak
 *.backup
+
+# Images and screenshots
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Backup and debug files
+*_backup.py
+debug_*.py
+test_*.py
+CLAUDE*.md
+FINAL_FIXES.md
+QUICK_TEST.md
+UPDATES.md
+PROFILE_MODULE_SPEC.md
