@@ -77,63 +77,47 @@ def _round_number_bonus(price: float) -> int:
 def _calculate_poc_simple(c15m: list[dict], range_low: float, range_high: float, atr: float) -> float | None:
     """
     Calculate Point of Control (POC) - price level with maximum volume.
-    
-    Simple approach: distribute volume across price bins and find max.
+    Volume is weighted by body size (open-close), not full wick range,
+    so POC reflects where real trading happened, not spike extremes.
     """
     if not c15m or range_low >= range_high:
         return None
-    
-    # Create price bins (size = ATR * 0.2)
+
     bin_size = atr * 0.2
     if bin_size == 0:
         return None
-    
-    # Filter candles in range
-    range_candles = [c for c in c15m if range_low <= c["low"] <= range_high or range_low <= c["high"] <= range_high]
-    
+
+    range_candles = [c for c in c15m if c["low"] <= range_high and c["high"] >= range_low]
     if not range_candles:
         return None
-    
-    # Accumulate volume by price bins
+
     volume_by_price = {}
-    
+
     for candle in range_candles:
-        candle_low = max(candle["low"], range_low)
-        candle_high = min(candle["high"], range_high)
-        candle_volume = candle["volume"]
-        
-        if candle_high == candle_low:
-            # Point candle
-            bin_price = round((candle_low - range_low) / bin_size) * bin_size + range_low
-            volume_by_price[bin_price] = volume_by_price.get(bin_price, 0) + candle_volume
-        else:
-            # Distribute volume across bins
-            candle_range = candle_high - candle_low
-            
-            # Calculate how many bins this candle spans
-            num_bins = int((candle_high - candle_low) / bin_size) + 1
-            
-            for i in range(num_bins):
-                bin_low = candle_low + i * bin_size
-                bin_high = min(bin_low + bin_size, candle_high)
-                bin_mid = (bin_low + bin_high) / 2
-                
-                if bin_mid > candle_high:
-                    break
-                
-                # Volume proportional to overlap
-                overlap = (bin_high - bin_low) / candle_range
-                bin_volume = candle_volume * overlap
-                
-                volume_by_price[bin_mid] = volume_by_price.get(bin_mid, 0) + bin_volume
-    
+        body_low  = min(candle["open"], candle["close"])
+        body_high = max(candle["open"], candle["close"])
+        # Use body range for volume distribution; fall back to full range for doji
+        eff_low  = max(body_low  if body_high > body_low else candle["low"],  range_low)
+        eff_high = min(body_high if body_high > body_low else candle["high"], range_high)
+        if eff_high <= eff_low:
+            continue
+
+        candle_range = eff_high - eff_low
+        num_bins = max(1, int(candle_range / bin_size) + 1)
+
+        for i in range(num_bins):
+            bin_low  = eff_low + i * bin_size
+            bin_high = min(bin_low + bin_size, eff_high)
+            bin_mid  = (bin_low + bin_high) / 2
+            if bin_mid > eff_high:
+                break
+            overlap = (bin_high - bin_low) / candle_range
+            volume_by_price[bin_mid] = volume_by_price.get(bin_mid, 0) + candle["volume"] * overlap
+
     if not volume_by_price:
         return None
-    
-    # Find price with maximum volume (POC)
-    poc_price = max(volume_by_price.items(), key=lambda x: x[1])[0]
-    
-    return poc_price
+
+    return max(volume_by_price.items(), key=lambda x: x[1])[0]
 
 
 def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: list[dict] = None) -> list[dict]:
@@ -204,14 +188,13 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     # 1. Pump base levels — one per leg (each step of the staircase)
     seen_bases: set[float] = set()
     for leg_low, leg_high, _, _ in pump_legs:
-        # Only add bases that fall within the support range
         if leg_low < support_range_low or leg_low > support_range_high:
             continue
-        # Avoid near-duplicates across legs
         if any(abs(leg_low - s) <= cluster_radius for s in seen_bases):
             continue
         seen_bases.add(leg_low)
-        pump_base_levels = _find_pump_base_simple(c15m, leg_low, atr)
+        # Use atr_15m for pump_base search — 1M ATR is too narrow for 15M candles
+        pump_base_levels = _find_pump_base_simple(c15m, leg_low, atr_15m)
         for price, candle_count, metadata in pump_base_levels:
             all_levels.append({
                 "level": _round_level(price),
@@ -221,12 +204,11 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
                 **metadata
             })
 
-    # Find pump peak time for post-pump candle counting
+    # Find pump peak: use high_idx from legs (not first occurrence in full history)
     pump_peak_time = 0
-    for c in c15m:
-        if c["high"] >= pump_high * 0.999:
-            pump_peak_time = c["open_time"]
-            break
+    overall_high_idx = max((leg[3] for leg in pump_legs), default=None)
+    if overall_high_idx is not None and overall_high_idx < len(c15m):
+        pump_peak_time = c15m[overall_high_idx]["open_time"]
 
     # 2. Body levels (15M candle bodies in the SUPPORT RANGE)
     body_levels = _find_body_levels_simple(c15m, support_range_low, support_range_high, atr, cluster_radius, pump_peak_time)
@@ -239,26 +221,27 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
             **metadata
         })
     
-    # 3. Wick levels (repeated lows after pump)
-    wick_levels = _find_wick_levels_simple(c15m, pump_high, atr)
+    # 3. Wick levels (repeated lows after pump peak)
+    wick_levels = _find_wick_levels_simple(c15m, pump_peak_time, atr_15m)
     for price, candle_count, metadata in wick_levels:
         all_levels.append({
             "level": _round_level(price),
             "type": "wick_level",
             "candle_count": candle_count,
-            "poc_aligned": False,  # Will be set later
+            "poc_aligned": False,
             **metadata
         })
-    
-    # 4. Order blocks (last bearish candle before pump)
-    order_block = _find_order_block_simple(c15m, pump_low, pump_high)
+
+    # 4. Order block — use pump_start_idx from legs (not first historical occurrence)
+    pump_start_idx = min((leg[2] for leg in pump_legs), default=None)
+    order_block = _find_order_block_simple(c15m, pump_start_idx)
     if order_block:
         price, metadata = order_block
         all_levels.append({
             "level": _round_level(price),
             "type": "order_block",
             "candle_count": 1,
-            "poc_aligned": False,  # Will be set later
+            "poc_aligned": False,
             **metadata
         })
     
@@ -328,20 +311,37 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
                 count=len(levels),
                 prices=[round(l["level"], 6) for l in sorted(levels, key=lambda x: x["level"])])
     
-    # Limit to top 7 levels by quality (POC always included, then by quality)
+    # Limit to top 7 levels by quality
+    # pump_base capped at 3 slots so body/wick levels aren't crowded out
+    # POC always survives regardless of type
     def level_quality(lvl):
         score = 0
         if lvl.get("poc_aligned"):
-            score += 10000  # POC always survives the filter
+            score += 10000
+        # pump_base score decays with distance from current price
+        # so nearest bases rank higher than distant historical ones
         if lvl.get("type") == "pump_base":
-            score += 5000   # pump_base always survives
+            dist_pct = abs(current_price - lvl["level"]) / current_price * 100 if current_price > 0 else 100
+            score += max(0, 5000 - int(dist_pct * 200))
         score += lvl.get("candle_count", 0) * 10
         score += lvl.get("hourly_open_bonus", 0) * 5
         score += lvl.get("round_number_bonus", 0) * 3
         return score
-    
+
     levels.sort(key=level_quality, reverse=True)
-    levels = levels[:7]
+
+    # Enforce pump_base cap: keep at most 3, always keep POC
+    result = []
+    pump_base_count = 0
+    for lvl in levels:
+        if lvl.get("type") == "pump_base" and not lvl.get("poc_aligned"):
+            if pump_base_count >= 3:
+                continue
+            pump_base_count += 1
+        result.append(lvl)
+        if len(result) == 7:
+            break
+    levels = result
     
     # Re-sort by price
     levels.sort(key=lambda x: x["level"])
@@ -620,85 +620,73 @@ def _find_body_levels_simple(c15m: list[dict], range_low: float, range_high: flo
     return levels
 
 
-def _find_wick_levels_simple(c15m: list[dict], pump_high: float, atr: float) -> list[tuple[float, int, dict]]:
-    """Find wick levels - repeated lows after pump peak."""
-    # Find pump peak time
-    pump_peak_time = None
-    for c in c15m:
-        if c["high"] >= pump_high * 0.999:
-            pump_peak_time = c["open_time"]
-            break
-    
+def _find_wick_levels_simple(c15m: list[dict], pump_peak_time: int, atr_15m: float) -> list[tuple[float, int, dict]]:
+    """Find wick levels - repeated lows after pump peak.
+    pump_peak_time: open_time of the peak candle (from _find_pump_legs high_idx).
+    """
     if not pump_peak_time:
         return []
-    
-    # Collect lows after pump peak
-    wick_lows = []
-    for c in c15m:
-        if c["open_time"] > pump_peak_time:
-            wick_lows.append((c["low"], c["volume"], c["open_time"]))
-    
-    # Cluster wicks
+
+    # Collect lows strictly after pump peak
+    wick_lows = [
+        (c["low"], c["volume"], c["open_time"])
+        for c in c15m
+        if c["open_time"] > pump_peak_time
+    ]
+
     levels = []
     used = set()
-    
+
     for i, (price, volume, open_time) in enumerate(wick_lows):
         if i in used:
             continue
-        
+
         cluster = [(price, volume, open_time)]
-        
+
         for j, (other_price, other_volume, other_time) in enumerate(wick_lows):
             if j == i or j in used:
                 continue
-            
-            if abs(other_price - price) <= atr * 0.3:
+            if abs(other_price - price) <= atr_15m * 0.3:
                 cluster.append((other_price, other_volume, other_time))
                 used.add(j)
-        
-        if len(cluster) >= 2:  # Minimum 2 touches
+
+        if len(cluster) >= 2:
             avg_price = sum(p for p, v, t in cluster) / len(cluster)
             total_volume = sum(v for p, v, t in cluster)
             tf_bonus = max(_timeframe_bonus(t) for p, v, t in cluster)
             round_bonus = _round_number_bonus(avg_price)
-            
+
             levels.append((avg_price, len(cluster), {
                 "volume_at_level": total_volume,
                 "hourly_open_bonus": tf_bonus,
                 "round_number_bonus": round_bonus,
             }))
-        
+
         used.add(i)
-    
+
     return levels
 
 
-def _find_order_block_simple(c15m: list[dict], pump_low: float, pump_high: float) -> tuple[float, dict] | None:
-    """Find order block - last bearish candle before pump."""
-    # Find pump start
-    pump_start_idx = None
-    for i, c in enumerate(c15m):
-        if c["low"] <= pump_low * 1.001:
-            pump_start_idx = i
-            break
-    
-    if pump_start_idx is None or pump_start_idx < 2:
+def _find_order_block_simple(c15m: list[dict], pump_start_idx: int | None) -> tuple[float, dict] | None:
+    """Find order block - last bearish candle before pump.
+    pump_start_idx: index of the candle where the pump started (from _find_pump_legs).
+    """
+    if pump_start_idx is None or pump_start_idx < 1:
         return None
-    
-    # Look for last bearish candle before pump
+
+    # Look for last bearish candle in the 5 candles before pump start
     for i in range(pump_start_idx, max(0, pump_start_idx - 5), -1):
         c = c15m[i]
         if c["close"] < c["open"]:  # Bearish
             price = min(c["open"], c["close"])
             tf_bonus = _timeframe_bonus(c["open_time"])
             round_bonus = _round_number_bonus(price)
-            
             return (price, {
                 "volume_at_level": c["volume"],
                 "hourly_open_bonus": tf_bonus,
                 "round_number_bonus": round_bonus,
             })
-    
+
     return None
 
 
