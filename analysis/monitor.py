@@ -245,9 +245,12 @@ async def start_monitor(
                     delta_signal_sent = False
                     stop_delta_tracking(symbol)
                     if last["volume"] > avg_vol:
-                        await send_message(
-                            f"✅ {symbol} отбой от {level} подтверждён — цена выкупается"
-                        )
+                        _now = time.time()
+                        if _now - _rebound_last_sent.get(symbol, 0) > 60:
+                            _rebound_last_sent[symbol] = _now
+                            await send_message(
+                                f"✅ {symbol} отбой от {level} подтверждён — цена выкупается"
+                            )
 
             if level_side == "resistance" and touched and body_close < body_open and body_close < level:
                 avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
@@ -263,9 +266,12 @@ async def start_monitor(
                     delta_signal_sent = False
                     stop_delta_tracking(symbol)
                     if last["volume"] > avg_vol:
-                        await send_message(
-                            f"✅ {symbol} отбой от {level} подтверждён — цена отбита вниз"
-                        )
+                        _now = time.time()
+                        if _now - _rebound_last_sent.get(symbol, 0) > 60:
+                            _rebound_last_sent[symbol] = _now
+                            await send_message(
+                                f"✅ {symbol} отбой от {level} подтверждён — цена отбита вниз"
+                            )
 
             current_price = last["close"]
             if atr > 0:
@@ -334,6 +340,9 @@ async def start_monitor(
 
 # Dedup guard: prevent multiple classify calls for the same touch event
 _classify_last_sent: dict[str, float] = {}  # key: "symbol:level" -> timestamp
+
+# Dedup guard: prevent duplicate rebound messages per symbol
+_rebound_last_sent: dict[str, float] = {}  # key: "symbol" -> timestamp
 
 
 async def _classify_and_log_level_event(
