@@ -249,6 +249,10 @@ async def _auto_screener_loop():
 # Global set of symbols currently being processed in phase1
 _building_levels: set[str] = set()
 
+# Stores the level that was replaced by a closer one during _run_phase1.
+# After breakout of the new level, this level becomes the next monitoring target.
+_previous_levels: dict[str, float] = {}
+
 
 async def _trigger_loop():
     """Main loop checking for correction triggers."""
@@ -398,8 +402,45 @@ async def _run_phase1(symbol: str):
         level_side = nearest.get("level_side", "support")
         task_key = state.make_task_key(nearest["level"])
 
-        if task_key in state.tasks:
-            logger.debug("Nearest level already monitored", symbol=symbol)
+        # Check if there's already a monitored level
+        current_monitored_level = None
+        current_task_key = None
+        for tk in list(state.tasks.keys()):
+            parts = tk.rsplit("_", 1)
+            if len(parts) == 2:
+                try:
+                    current_monitored_level = float(parts[1])
+                    current_task_key = tk
+                    break
+                except ValueError:
+                    pass
+
+        if current_task_key is not None:
+            new_dist = abs(current_price - nearest["level"])
+            old_dist = abs(current_price - current_monitored_level)
+            if new_dist >= old_dist:
+                # New level is not closer — keep old monitor
+                logger.debug("Nearest level already monitored with closer level",
+                             symbol=symbol, current=current_monitored_level)
+                state.phase = "phase2"
+                return
+            # New level IS closer — cancel old, save it, start new
+            _previous_levels[symbol] = current_monitored_level
+            stop_ev = state.stop_flags.get(current_task_key)
+            if stop_ev:
+                stop_ev.set()
+            old_task = state.tasks.get(current_task_key)
+            if old_task:
+                old_task.cancel()
+            state.remove_task(current_task_key)
+            logger.info("Replaced old monitor with closer level",
+                        symbol=symbol, old=current_monitored_level, new=nearest["level"])
+            await send_message(
+                f"🔄 {symbol} найден уровень ближе к цене\n"
+                f"   Старый: {current_monitored_level} → Новый: {nearest['level']}\n"
+                f"   Старый будет следующим после пробоя"
+            )
+        elif task_key in state.tasks:
             state.phase = "phase2"
             return
 
@@ -578,6 +619,26 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
         )
 
     next_started = False
+
+    # --- Priority 0: level saved when it was replaced by a closer one ---
+    prev_level = _previous_levels.pop(symbol, None)
+    if prev_level and _in_range(prev_level):
+        task_key = state.make_task_key(prev_level)
+        if task_key not in state.tasks:
+            task = asyncio.create_task(
+                _monitored(symbol, prev_level, "support")
+            )
+            state.add_task(prev_level, task)
+            state.phase = "phase2"
+            await send_message(
+                f"📋 {symbol} возврат к предыдущему уровню\n"
+                f"   {prev_level}\n"
+                f"👁 Мониторинг запущен"
+            )
+            await log_event(symbol, "monitoring_start",
+                           f"level={prev_level} (previous, after breakout of {broken_level})")
+            next_started = True
+            logger.info("Previous level started after breakout", symbol=symbol, level=prev_level)
 
     # --- Priority 1: cached levels from last /analyze ---
     cached = _last_analysis_cache.get(symbol, [])
