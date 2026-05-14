@@ -196,12 +196,15 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     support_range_low  = current_price * 0.80 if current_price > 0 else pump_low
     support_range_high = current_price * 1.05 if current_price > 0 else pump_high
 
-    # POC: only candles from pump start onward — pre-pump accumulation
-    # (hundreds of low-volume candles) otherwise drowns out the actual
-    # high-volume zone that TradingView Volume Profile shows.
-    poc_candles   = c15m[pump_start_idx:]
+    # POC: calculated from pump PEAK onward (post-pump consolidation).
+    # pump_start candles include the pump itself — big bodies 0.016→0.022
+    # spread volume across low bins and drown out the real consolidation zone.
+    # TradingView POC at 0.021 is the post-peak congestion area, not the pump base.
+    poc_candles = c15m[pump_peak_idx:]
+    if len(poc_candles) < 5:
+        poc_candles = c15m[pump_start_idx:]  # fallback if just pumped
     last_leg_low  = max(leg[0] for leg in pump_legs)
-    poc_range_low = min(last_leg_low, current_price * 0.92)
+    poc_range_low = min(last_leg_low, current_price * 0.90)
     poc_price = _calculate_poc_simple(poc_candles, poc_range_low, support_range_high, atr)
 
     if poc_price:
