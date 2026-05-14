@@ -554,7 +554,4 @@ def _check_volume_trend_approach(symbol: str, level: float, level_side: str = "s
             f"   → вход рискованный, возможен пробой"
         )
     else:
-        return (
-            f"⚠️ {symbol} давление на 1М при подходе к {level} (×{last_vol_ratio})\n"
-            f"   15М не подтверждает — возможен ложный сигнал"
-        )
+        return None
