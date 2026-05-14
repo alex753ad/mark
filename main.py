@@ -892,6 +892,7 @@ async def main():
         start_bot(),
         _trigger_loop(),
         _proximity_loop(),
+        _auto_screener_loop(),
         _startup_monitoring(),
     )
 
