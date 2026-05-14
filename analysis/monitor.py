@@ -440,15 +440,6 @@ def _check_complications(symbol: str, level: float, level_side: str, approach_wa
         if vol_trend:
             return vol_trend, "pressure"
 
-    if not volume_spike_notified:
-        spike = _check_volume_spike(c1m)
-        if spike:
-            return (
-                f"🔴 {symbol} осложнение\n"
-                f"   Объём при падении вырос ×{spike} от нормы\n"
-                f"   → сильный продавец, пробой вероятен"
-            ), "volume_spike"
-
     if not engulf_sent:
         if _check_engulfing(c15m):
             return (
