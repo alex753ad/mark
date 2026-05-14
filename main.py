@@ -165,7 +165,7 @@ async def _auto_screener_loop():
                                 if lvl.get("approach", 0) >= 2 or (lvl.get("was_broken") and not lvl.get("sweep_reclaimed")):
                                     lvl["strength"] = min(lvl["strength"], py)
 
-                            strong = [l for l in supports if l["strength"] >= 4]
+                            strong = [l for l in supports if l["strength"] >= 3]
                             if not strong:
                                 await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Нет сильных уровней (strength < 4), мониторинг не запущен")
                                 continue
@@ -330,7 +330,7 @@ async def _run_phase1(symbol: str):
             calculate_strength(lvl)
 
         # Filter weak levels
-        strong = [lvl for lvl in new_levels if lvl["strength"] >= 4]
+        strong = [lvl for lvl in new_levels if lvl["strength"] >= 3]
 
         # Mark all as analyzed
         for lvl in new_levels:
@@ -525,7 +525,7 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
 
     # --- Priority 1: cached levels from last /analyze ---
     cached = _last_analysis_cache.get(symbol, [])
-    candidates = [l for l in cached if _in_range(l["level"]) and l.get("strength", 0) >= 4]
+    candidates = [l for l in cached if _in_range(l["level"]) and l.get("strength", 0) >= 3]
 
     if candidates:
         nearest = min(candidates, key=lambda l: abs(current_price - l["level"]))
@@ -563,7 +563,7 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
                 lvl.update(get_level_history(symbol, lvl["level"], atr))
             calculate_strength(lvl)
 
-        strong = [l for l in rebuild_candidates if l["strength"] >= 4]
+        strong = [l for l in rebuild_candidates if l["strength"] >= 3]
         if strong:
             nearest = min(strong, key=lambda l: abs(current_price - l["level"]))
             task_key = state.make_task_key(nearest["level"])
@@ -690,7 +690,7 @@ async def _proximity_loop():
 
                     if lvl_price in monitored:
                         continue  # already fully monitored
-                    if strength >= 4:
+                    if strength >= 3:
                         continue  # strong levels are monitored separately
                     if lvl_price >= current_price:
                         continue  # only support levels below price
@@ -834,7 +834,7 @@ async def _startup_monitoring():
                     lvl["python_strength"] = lvl["strength"]
 
                 # Startup: use Python only, no Claude (save tokens)
-                strong = [l for l in supports if l["strength"] >= 4]
+                strong = [l for l in supports if l["strength"] >= 3]
                 if not strong:
                     logger.debug("No strong levels on startup", symbol=symbol)
                     continue
