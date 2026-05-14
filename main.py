@@ -26,12 +26,46 @@ from analysis.trigger import (
 )
 from analysis.monitor import start_monitor
 from bot.telegram import send_message, start_bot
-from config import token_registry, validate_config, TRIGGER_TIMES_FILE
+from config import token_registry, validate_config, TRIGGER_TIMES_FILE, ACTIVE_MONITORS_FILE
 from data.history import init_db, save_level_outcome, update_symbol_profile, get_outcome_probs, log_event
 
 
 # Global semaphore for Claude API rate limiting
 claude_semaphore = asyncio.Semaphore(CLAUDE_MAX_CONCURRENT_REQUESTS)
+
+
+def save_active_monitors():
+    """Save currently active monitors to file for restart recovery."""
+    monitors = []
+    for state in state_manager._states.values():
+        for task_key in state.tasks:
+            parts = task_key.rsplit("_", 1)
+            if len(parts) == 2:
+                try:
+                    monitors.append({
+                        "symbol": parts[0],
+                        "level": float(parts[1]),
+                    })
+                except ValueError:
+                    pass
+    try:
+        with open(ACTIVE_MONITORS_FILE, "w") as f:
+            json.dump(monitors, f, indent=2)
+    except Exception as e:
+        logger.error("Failed to save active monitors", error=str(e))
+
+
+def load_active_monitors() -> list[dict]:
+    """Load saved monitors from file."""
+    if os.path.exists(ACTIVE_MONITORS_FILE):
+        try:
+            with open(ACTIVE_MONITORS_FILE) as f:
+                data = json.load(f)
+                logger.info("Loaded active monitors", count=len(data))
+                return data
+        except Exception as e:
+            logger.error("Failed to load active monitors", error=str(e))
+    return []
 
 
 def load_trigger_times() -> dict[str, float]:
@@ -416,6 +450,9 @@ async def _monitored(symbol: str, level: float, level_side: str,
     m_atr_ratio = atr_ratio
     m_vol_ratio = vol_ratio
 
+    # Save monitors state on start
+    save_active_monitors()
+
     try:
         monitor_result = await start_monitor(
             symbol, level, level_side, stop_event,
@@ -491,6 +528,9 @@ async def _monitored(symbol: str, level: float, level_side: str,
         # Update phase
         if not state.has_active_tasks():
             state.phase = "idle"
+
+        # Save monitors state after change
+        save_active_monitors()
 
 
 
@@ -796,7 +836,51 @@ async def _startup_monitoring():
 
     client = await AsyncClient.create()
     try:
+        # --- Step 1: Restore previously active monitors from file ---
+        saved_monitors = load_active_monitors()
+        restored_symbols: set[str] = set()
+
+        if saved_monitors:
+            logger.info("Restoring saved monitors", count=len(saved_monitors))
+            for entry in saved_monitors:
+                sym = entry.get("symbol")
+                level = entry.get("level")
+                if not sym or not level or sym not in tokens:
+                    continue
+                try:
+                    # Load candles if not already loaded
+                    if sym not in candles_1m or not candles_1m[sym]:
+                        raw_15m = await client.futures_klines(symbol=sym, interval="15m", limit=500)
+                        raw_1m  = await client.futures_klines(symbol=sym, interval="1m",  limit=300)
+                        candles_15m[sym] = [_parse_kline(k) for k in raw_15m]
+                        candles_1m[sym]  = [_parse_kline(k) for k in raw_1m]
+
+                    sym_state = state_manager.get_state(sym)
+                    task_key = sym_state.make_task_key(level)
+                    if task_key not in sym_state.tasks:
+                        task = asyncio.create_task(
+                            _monitored(sym, level, "support")
+                        )
+                        sym_state.add_task(level, task)
+                        sym_state.phase = "phase2"
+                        restored_symbols.add(sym)
+                        logger.info("Monitor restored", symbol=sym, level=level)
+                except Exception as e:
+                    logger.exception("Failed to restore monitor", symbol=sym, level=level, error=str(e))
+
+            if restored_symbols:
+                await send_message(
+                    f"♻️ Восстановлены мониторинги после рестарта:\n" +
+                    "\n".join(f"   {s}" for s in sorted(restored_symbols))
+                )
+
+        # --- Step 2: For symbols without restored monitors — build fresh ---
         for symbol in tokens:
+            if symbol in restored_symbols:
+                continue  # already restored
+            sym_state = state_manager.get_state(symbol)
+            if sym_state.has_active_tasks():
+                continue  # already monitoring
             try:
                 raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=500)
                 raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=300)

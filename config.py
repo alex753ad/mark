@@ -16,6 +16,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 TOKENS_FILE = "tokens.json"
 TRIGGER_TIMES_FILE = "trigger_times.json"
 HISTORY_DB_FILE = "history.db"
+ACTIVE_MONITORS_FILE = "active_monitors.json"
 
 
 class TokenRegistry:
