@@ -57,6 +57,7 @@ async def start_monitor(
     sweep_sent = False
     engulf_sent = False
     level_broken_sent = False
+    classify_sent = False  # prevent duplicate _classify_and_log_level_event calls
     iteration = 0
     delta_stream_task = None
     delta_signal_sent = False
@@ -196,10 +197,12 @@ async def start_monitor(
 
             # Classify touch event after 5 x 1M candles
             if touched and touch_classify_at > 0 and len(c1m) >= touch_classify_at and not rebound_sent:
-                asyncio.create_task(_classify_and_log_level_event(
-                    symbol, level, c1m, candles_15m.get(symbol, []),
-                    min_price_during or level, touch_c1m_idx
-                ))
+                if not classify_sent:
+                    asyncio.create_task(_classify_and_log_level_event(
+                        symbol, level, c1m, candles_15m.get(symbol, []),
+                        min_price_during or level, touch_c1m_idx
+                    ))
+                    classify_sent = True
                 touch_classify_at = 0  # reset so we don't classify again
 
             # Delta signal: buy pressure absorbing sells at support
@@ -226,16 +229,16 @@ async def start_monitor(
             if level_side == "support" and touched and body_close > body_open and body_close > level:
                 avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
                 if not rebound_sent:
-                    # Always log the touch event
-                    asyncio.create_task(_classify_and_log_level_event(
-                        symbol, level, c1m, candles_15m.get(symbol, []),
-                        min_price_during or level, touch_c1m_idx
-                    ))
+                    if not classify_sent:
+                        asyncio.create_task(_classify_and_log_level_event(
+                            symbol, level, c1m, candles_15m.get(symbol, []),
+                            min_price_during or level, touch_c1m_idx
+                        ))
+                        classify_sent = True
                     rebound_sent = True
                     touched = False
                     delta_signal_sent = False
                     stop_delta_tracking(symbol)
-                    # Send message only if volume confirms
                     if last["volume"] > avg_vol:
                         await send_message(
                             f"✅ {symbol} отбой от {level} подтверждён — цена выкупается"
@@ -244,10 +247,12 @@ async def start_monitor(
             if level_side == "resistance" and touched and body_close < body_open and body_close < level:
                 avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
                 if not rebound_sent:
-                    asyncio.create_task(_classify_and_log_level_event(
-                        symbol, level, c1m, candles_15m.get(symbol, []),
-                        max_price_during or level, touch_c1m_idx
-                    ))
+                    if not classify_sent:
+                        asyncio.create_task(_classify_and_log_level_event(
+                            symbol, level, c1m, candles_15m.get(symbol, []),
+                            max_price_during or level, touch_c1m_idx
+                        ))
+                        classify_sent = True
                     rebound_sent = True
                     touched = False
                     delta_signal_sent = False
@@ -262,22 +267,25 @@ async def start_monitor(
                 distance = abs(current_price - level)
                 if distance > atr * DISTANCE_RESET_ATR_MULTIPLIER:
                     # If touched but price moved away without confirmed rebound — classify
-                    if touched and not rebound_sent:
+                    if touched and not rebound_sent and not classify_sent:
                         asyncio.create_task(_classify_and_log_level_event(
                             symbol, level, c1m, candles_15m.get(symbol, []),
                             min_price_during or level, touch_c1m_idx
                         ))
+                        classify_sent = True
                     # Check near_miss: came within 0.5% but never touched
-                    elif not touched and min_price_during is not None:
+                    elif not touched and min_price_during is not None and not classify_sent:
                         dist_pct = (level - min_price_during) / level * 100 if level > min_price_during else 0
                         if 0 < dist_pct <= 0.5:
                             asyncio.create_task(_classify_and_log_level_event(
                                 symbol, level, c1m, candles_15m.get(symbol, []),
                                 min_price_during, touch_c1m_idx
                             ))
+                            classify_sent = True
                     rebound_sent = False
                     approach_warned = False
                     touched = False
+                    classify_sent = False  # reset for next touch
                     engulf_sent = False
                     level_broken_sent = False
                     delta_signal_sent = False
