@@ -301,10 +301,33 @@ async def _run_phase1(symbol: str):
 
     _building_levels.add(symbol)
     try:
-        levels = await get_approaching_levels(symbol, use_claude=False)
+        from analysis.level_builder import build_levels
+        from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
 
         c1m = candles_1m.get(symbol, [])
         current_price = c1m[-1]["close"] if c1m else 0
+        if not current_price:
+            state.phase = "phase2" if state.has_active_tasks() else "idle"
+            return
+
+        atr = calculate_atr(symbol)
+        range_limit = current_price * 0.20
+
+        all_levels = build_levels(symbol)
+        levels = [
+            lvl for lvl in all_levels
+            if lvl["level"] < current_price
+            and (current_price - lvl["level"]) <= range_limit
+            and (atr == 0 or (current_price - lvl["level"]) >= atr * 1.5)
+        ]
+
+        for lvl in levels:
+            lvl["symbol"] = symbol
+            lvl["level_side"] = "support"
+            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr) if atr > 0 else 0
+            if atr > 0:
+                lvl.update(get_level_history(symbol, lvl["level"], atr))
+            calculate_strength(lvl)
 
         # --- Stop stale monitors (levels now outside -20% range) ---
         if was_in_phase2 and current_price > 0:
@@ -344,10 +367,6 @@ async def _run_phase1(symbol: str):
             state.phase = "phase2" if state.has_active_tasks() else "idle"
             return
 
-        for lvl in levels:
-            lvl["symbol"] = symbol
-            lvl["level_side"] = "support" if current_price > lvl["level"] else "resistance"
-
         # Filter out already analyzed levels
         new_levels = [
             lvl for lvl in levels
@@ -359,11 +378,7 @@ async def _run_phase1(symbol: str):
             state.phase = "phase2" if state.has_active_tasks() else "idle"
             return
 
-        # Calculate strength with Python only
-        for lvl in new_levels:
-            calculate_strength(lvl)
-
-        # Filter weak levels
+        # Filter by strength >= 3 (includes weak levels)
         strong = [lvl for lvl in new_levels if lvl["strength"] >= 3]
 
         # Mark all as analyzed
@@ -390,20 +405,21 @@ async def _run_phase1(symbol: str):
 
         zone_approaches = nearest.get("zone_approaches", 0)
         atr_pct = nearest.get("atr_pct", 0)
-        stars = "⭐️" * nearest["strength"]
+        stars = "⭐️" * nearest["strength"] if nearest["strength"] > 0 else "☆"
+        dist_pct = (current_price - nearest["level"]) / current_price * 100
 
         if was_in_phase2:
             text = (
                 f"📋 {symbol} новый уровень после пампа\n"
-                f"   {stars} {nearest['level']} — {nearest.get('type', '')}\n"
+                f"   {stars} {nearest['level']} — {nearest.get('type', '')} ({dist_pct:.1f}%)\n"
             )
         else:
             text = (
                 f"📋 {symbol} коррекция началась\n"
-                f"   Уровень {nearest['level']} — {nearest.get('type', '')} {stars}\n"
+                f"   {stars} {nearest['level']} — {nearest.get('type', '')} ({dist_pct:.1f}%)\n"
             )
         if zone_approaches >= 1:
-            text += f"   ⚠️ Зона тестировалась {zone_approaches} раз(а) в радиусе {atr_pct:.2f}%\n"
+            text += f"   ⚠️ Зона тестировалась {zone_approaches} раз(а)\n"
         text += f"\n   Жду цену на {nearest['level']}..."
 
         await send_message(text)
