@@ -952,7 +952,7 @@ async def _do_check(message: Message, symbol: str, level: float):
 
     await message.answer(text, reply_markup=get_main_keyboard())
 
-    if r.get("strength", 0) >= 4:
+    if r.get("strength", 0) >= 3:
         from models import state_manager
         from main import _monitored
         current_price = c1m[-1]["close"]
