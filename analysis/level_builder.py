@@ -278,7 +278,10 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
                 min_distance  = distance
                 closest_level = lvl
 
-        if closest_level and min_distance <= cluster_radius:
+        # Allow POC to snap to nearest level within 2x cluster_radius.
+        # Strict cluster_radius was too tight — POC at 0.0213 couldn't align
+        # with a level at 0.0208 even though they're the same zone.
+        if closest_level and min_distance <= cluster_radius * 2:
             closest_level["poc_aligned"] = True
             logger.info("POC aligned to level",
                        symbol=symbol,
@@ -286,12 +289,14 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
                        level=closest_level["level"],
                        distance=round(min_distance, 6))
         elif support_range_low <= poc_price <= support_range_high:
+            # Use cluster_radius (15M-based) — atr*0.3 (1M) was ~0.00005,
+            # too tight to find any candles near the POC price.
             candles_at_poc = [
                 c for c in c15m
-                if (abs(c["close"] - poc_price) <= atr * 0.3 or
-                    abs(c["open"]  - poc_price) <= atr * 0.3 or
-                    abs(c["low"]   - poc_price) <= atr * 0.3 or
-                    abs(c["high"]  - poc_price) <= atr * 0.3)
+                if (abs(c["close"] - poc_price) <= cluster_radius or
+                    abs(c["open"]  - poc_price) <= cluster_radius or
+                    abs(c["low"]   - poc_price) <= cluster_radius or
+                    abs(c["high"]  - poc_price) <= cluster_radius)
             ]
             if len(candles_at_poc) >= 2:
                 total_volume = sum(c["volume"] for c in candles_at_poc)
