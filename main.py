@@ -128,7 +128,10 @@ async def _auto_screener_loop():
                             ext_c15m = candles_15m[sym]
                             all_levels = build_levels(sym, c1m_override=ext_c1m, c15m_override=ext_c15m)
 
+                            await log_event(sym, "added_screener", f"chg={chg:+.1f}% natr={natr:.1f}%")
+
                             if not all_levels:
+                                await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Уровни не найдены, мониторинг не запущен")
                                 continue
 
                             current_price = ext_c1m[-1]["close"]
@@ -143,6 +146,7 @@ async def _auto_screener_loop():
                             ]
 
                             if not supports:
+                                await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Нет уровней в диапазоне 20%, мониторинг не запущен")
                                 continue
 
                             for lvl in supports:
@@ -163,41 +167,36 @@ async def _auto_screener_loop():
 
                             strong = [l for l in supports if l["strength"] >= 4]
                             if not strong:
+                                await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Нет сильных уровней (strength < 4), мониторинг не запущен")
                                 continue
 
+                            # Monitor only the nearest strong level
+                            nearest = min(strong, key=lambda l: abs(current_price - l["level"]))
                             sym_state = state_manager.get_state(sym)
-                            started = []
-                            for lvl in strong:
-                                task_key = sym_state.make_task_key(lvl["level"])
-                                if task_key not in sym_state.tasks:
-                                    task = asyncio.create_task(
-                                        _monitored(sym, lvl["level"], "support",
-                                                  level_type=lvl["type"],
-                                                  strength=lvl["strength"])
-                                    )
-                                    sym_state.add_task(lvl["level"], task)
-                                    sym_state.phase = "phase2"
-                                    started.append(lvl)
+                            task_key = sym_state.make_task_key(nearest["level"])
+                            if task_key not in sym_state.tasks:
+                                task = asyncio.create_task(
+                                    _monitored(sym, nearest["level"], "support",
+                                              level_type=nearest["type"],
+                                              strength=nearest["strength"])
+                                )
+                                sym_state.add_task(nearest["level"], task)
+                                sym_state.phase = "phase2"
 
-                            if started:
-                                lines = [f"🆕 {sym} добавлен автоматически",
-                                         f"   {chg:+.1f}% | NATR {natr:.1f}%\n"]
-                                for lvl in started:
-                                    stars = "⭐️" * lvl["strength"]
-                                    reason = lvl.get("claude_reason", "")
-                                    lines.append(f"   {stars} {lvl['level']} — {lvl['type']}")
-                                    if reason:
-                                        lines.append(f"   💭 {reason}")
-                                lines.append(f"\n👁 Мониторинг запущен ({len(started)} ур.)")
-                                await send_message("\n".join(lines))
+                                stars = "⭐️" * nearest["strength"]
+                                reason = nearest.get("claude_reason", "")
+                                msg = (f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n"
+                                       f"   {stars} {nearest['level']} — {nearest['type']}\n")
+                                if reason:
+                                    msg += f"   💭 {reason}\n"
+                                msg += "👁 Мониторинг запущен"
+                                await send_message(msg)
 
-                                await log_event(sym, "added_screener", f"chg={chg:+.1f}% natr={natr:.1f}%")
-                                levels_info = [{"level": l["level"], "type": l["type"], "strength": l["strength"]} for l in started]
+                                levels_info = [{"level": l["level"], "type": l["type"], "strength": l["strength"]} for l in strong]
                                 await log_event(sym, "levels_built", _json.dumps(levels_info))
-                                for lvl in started:
-                                    await log_event(sym, "monitoring_start",
-                                                   f"level={lvl['level']} strength={lvl['strength']} type={lvl['type']}")
-                                logger.info("Auto monitoring started", symbol=sym, levels=len(started))
+                                await log_event(sym, "monitoring_start",
+                                               f"level={nearest['level']} strength={nearest['strength']} type={nearest['type']}")
+                                logger.info("Auto monitoring started", symbol=sym, level=nearest["level"])
 
                         except Exception as e:
                             logger.exception("Error setting up new symbol", symbol=sym, error=str(e))

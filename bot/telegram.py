@@ -474,7 +474,24 @@ async def cmd_add(message: Message):
     token_registry.add(symbol)
     from data.history import log_event
     await log_event(symbol, "added_manual")
-    await message.answer(f"✅ {symbol} добавлен", reply_markup=get_main_keyboard())
+
+    # Immediately load candle data so the symbol is ready for analysis
+    await message.answer(f"✅ {symbol} добавлен — загружаю данные...", reply_markup=get_main_keyboard())
+    try:
+        from binance import AsyncClient
+        from data.collector import _parse_kline, candles_1m, candles_15m
+        client = await AsyncClient.create()
+        try:
+            raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=500)
+            raw_1m  = await client.futures_klines(symbol=symbol, interval="1m",  limit=300)
+            candles_15m[symbol] = [_parse_kline(k) for k in raw_15m]
+            candles_1m[symbol]  = [_parse_kline(k) for k in raw_1m]
+        finally:
+            await client.close_connection()
+        await message.answer(f"✅ {symbol} готов к анализу", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.exception("Failed to load candles for added symbol", symbol=symbol, error=str(e))
+        await message.answer(f"⚠️ {symbol} добавлен, но данные не загрузились: {e}", reply_markup=get_main_keyboard())
 
 
 @router.message(Command("remove"))
