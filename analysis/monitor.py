@@ -325,6 +325,10 @@ async def start_monitor(
         delta_stream_task.cancel()
 
 
+# Dedup guard: prevent multiple classify calls for the same touch event
+_classify_last_sent: dict[str, float] = {}  # key: "symbol:level" -> timestamp
+
+
 async def _classify_and_log_level_event(
     symbol: str,
     level: float,
@@ -335,7 +339,7 @@ async def _classify_and_log_level_event(
 ):
     """
     Classify what happened at the level and log to history + send message.
-    
+
     Categories:
     - near_miss: price came within 0.5% but didn't touch
     - bounce: touched and returned above on 1M
@@ -343,6 +347,12 @@ async def _classify_and_log_level_event(
     - zakol_deep: pierced >1%, check retest within 5 x 1M
     - breakout: 15M candle closed below OR price moved to next level
     """
+    import time as _time
+    dedup_key = f"{symbol}:{level}"
+    now = _time.time()
+    if now - _classify_last_sent.get(dedup_key, 0) < 60:  # 60s cooldown per level
+        return
+    _classify_last_sent[dedup_key] = now
     from data.history import log_event
 
     if not c1m or level == 0:
