@@ -16,13 +16,14 @@ class SymbolState:
     last_trigger_time: float = 0.0
     proximity_notified: dict[str, float] = field(default_factory=dict)
     analyzed_levels: set[str] = field(default_factory=set)
+    level_strengths: dict[str, int] = field(default_factory=dict)  # task_key -> strength
     
     def make_task_key(self, level: float) -> str:
         """Generate unique task key for symbol-level pair."""
         from analysis.level_builder import _round_level
         return f"{self.symbol}_{_round_level(level)}"
     
-    def add_task(self, level: float, task: asyncio.Task) -> str:
+    def add_task(self, level: float, task: asyncio.Task, strength: int = 0) -> str:
         """Add monitoring task for a level. Cancels existing tasks on nearby levels."""
         key = self.make_task_key(level)
 
@@ -40,18 +41,21 @@ class SymbolState:
                                 stop.set()
                             del self.tasks[existing_key]
                             self.stop_flags.pop(existing_key, None)
+                            self.level_strengths.pop(existing_key, None)
                     except ValueError:
                         pass
 
         self.tasks[key] = task
         self.stop_flags[key] = asyncio.Event()
+        self.level_strengths[key] = strength
         return key
-    
+
     def remove_task(self, task_key: str):
         """Remove monitoring task."""
         self.tasks.pop(task_key, None)
         self.stop_flags.pop(task_key, None)
         self.proximity_notified.pop(task_key, None)
+        self.level_strengths.pop(task_key, None)
     
     def cancel_all_tasks(self):
         """Cancel all monitoring tasks for this symbol."""

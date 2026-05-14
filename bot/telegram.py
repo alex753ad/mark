@@ -205,7 +205,9 @@ async def btn_monitors(message: Message):
         current_price = c1m[-1]["close"]
         if level != 0:
             distance_pct = (current_price - level) / level * 100
-            lines.append(f"  {sym} @ {level} — цена {current_price} ({distance_pct:+.2f}%)")
+            strength = state_manager.get_state(sym).level_strengths.get(task_key, 0)
+            stars = "⭐️" * strength if strength > 0 else "☆"
+            lines.append(f"  {sym} @ {level} {stars} — цена {current_price} ({distance_pct:+.2f}%)")
         else:
             lines.append(f"  {sym} @ {level} — цена {current_price}")
 

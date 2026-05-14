@@ -214,7 +214,7 @@ async def _auto_screener_loop():
                                               level_type=nearest["type"],
                                               strength=nearest["strength"])
                                 )
-                                sym_state.add_task(nearest["level"], task)
+                                sym_state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
                                 sym_state.phase = "phase2"
 
                                 stars = "⭐️" * nearest["strength"]
@@ -472,7 +472,7 @@ async def _run_phase1(symbol: str):
                        level_type=nearest["type"],
                        strength=nearest["strength"])
         )
-        state.add_task(nearest["level"], task)
+        state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
         state.phase = "phase2"
 
     except asyncio.CancelledError:
@@ -653,7 +653,7 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
                            level_type=nearest["type"],
                            strength=nearest["strength"])
             )
-            state.add_task(nearest["level"], task)
+            state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
             state.phase = "phase2"
             stars = "⭐️" * nearest["strength"]
             await send_message(
@@ -1015,7 +1015,7 @@ async def _startup_monitoring():
                                   level_type=nearest["type"],
                                   strength=nearest["strength"])
                     )
-                    sym_state.add_task(nearest["level"], task)
+                    sym_state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
                     sym_state.phase = "phase2"
                     await log_event(symbol, "monitoring_start",
                                    f"level={nearest['level']} strength={nearest['strength']} type={nearest['type']} (startup)")
