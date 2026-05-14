@@ -13,7 +13,7 @@ LEVEL_REAL_CLUSTER_SHIFT_THRESHOLD = 0.3  # 30% смещения медианы 
 # Monitoring
 PROXIMITY_ALERT_DISTANCE_PCT = 0.004  # 0.4% от уровня для proximity alert
 PROXIMITY_ALERT_COOLDOWN_SECONDS = 600  # 10 минут между proximity alerts
-WEAK_BREAKOUT_COOLDOWN_SECONDS = 300  # 5 минут между сообщениями о слабом пробое
+WEAK_BREAKOUT_COOLDOWN_SECONDS = 3600  # 1 час — фактически однократно за сессию мониторинга
 
 # Volume thresholds
 VOLUME_BREAKOUT_RATIO = 2.0  # Объём ×2 для подтверждения пробоя

@@ -377,21 +377,14 @@ async def _classify_and_log_level_event(
         if 0 < dist_pct <= 0.5:
             details = f"level={level} min_price={min_price:.6f} dist={dist_pct:.2f}%"
             await log_event(symbol, "near_miss", details)
-            await send_message(
-                f"⚠️ {symbol} не дошёл до уровня {level}\n"
-                f"   Минимум {min_price:.6f} — в {dist_pct:.2f}% от уровня\n"
-                f"   Уровень возможно некорректный"
-            )
         return
 
     # --- ZAKOL or BOUNCE ---
-    # Check if price returned above level within 1M candles after touch
     returned_above = any(c["close"] > level for c in post_touch[:5])
 
     if returned_above:
         if fill_depth_pct >= 1.0:
-            # Deep zakol — check retest within 5 x 1M
-            retest_candles = post_touch[1:6]  # next 5 candles after return
+            retest_candles = post_touch[1:6]
             retest = any(
                 abs(c["low"] - level) / level * 100 <= 0.3
                 for c in retest_candles
@@ -399,30 +392,13 @@ async def _classify_and_log_level_event(
             if retest:
                 details = f"level={level} depth={fill_depth_pct:.2f}% retest=yes"
                 await log_event(symbol, "zakol_deep_retest", details)
-                await send_message(
-                    f"🟡 {symbol} глубокий закол у {level}\n"
-                    f"   Глубина -{fill_depth_pct:.2f}% | Ретест снизу подтверждён\n"
-                    f"   Уровень держится — вход актуален"
-                )
             else:
                 details = f"level={level} depth={fill_depth_pct:.2f}% retest=no"
                 await log_event(symbol, "zakol_deep", details)
-                await send_message(
-                    f"🟡 {symbol} глубокий закол у {level}\n"
-                    f"   Глубина -{fill_depth_pct:.2f}% | Ретест не подтверждён\n"
-                    f"   Уровень ослаблен"
-                )
         else:
-            # Regular zakol
             details = f"level={level} depth={fill_depth_pct:.2f}%"
             await log_event(symbol, "zakol", details)
-            await send_message(
-                f"🟢 {symbol} закол у {level}\n"
-                f"   Глубина -{fill_depth_pct:.2f}% | Возврат выше уровня\n"
-                f"   Уровень держится"
-            )
     else:
-        # Bounce — only log, main loop sends the message
         details = f"level={level} fill_depth={fill_depth_pct:.2f}%"
         await log_event(symbol, "bounce", details)
 
