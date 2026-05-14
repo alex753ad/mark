@@ -276,6 +276,7 @@ async def _run_phase1(symbol: str):
         # --- Stop stale monitors (levels now outside -20% range) ---
         if was_in_phase2 and current_price > 0:
             range_low = current_price * 0.80
+            stale_levels = []
             for task_key in list(state.tasks.keys()):
                 parts = task_key.rsplit("_", 1)
                 if len(parts) != 2:
@@ -292,12 +293,16 @@ async def _run_phase1(symbol: str):
                     if task:
                         task.cancel()
                     state.remove_task(task_key)
+                    stale_levels.append(monitored_level)
                     logger.info("Stale monitor stopped (out of range)",
                                symbol=symbol, level=monitored_level,
                                current_price=current_price)
-                    await send_message(
-                        f"🔄 {symbol} уровень {monitored_level} вышел из диапазона — мониторинг снят"
-                    )
+            if stale_levels:
+                levels_str = ", ".join(str(l) for l in sorted(stale_levels))
+                await send_message(
+                    f"🔄 {symbol} уровни вышли из диапазона — мониторинг снят\n"
+                    f"   {levels_str}"
+                )
             # Clear analyzed cache so new pump levels aren't blocked by old entries
             state.clear_analyzed_levels()
 
