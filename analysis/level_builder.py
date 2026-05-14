@@ -196,7 +196,12 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     support_range_low  = current_price * 0.80 if current_price > 0 else pump_low
     support_range_high = current_price * 1.05 if current_price > 0 else pump_high
 
-    poc_price = _calculate_poc_simple(c15m, support_range_low, support_range_high, atr)
+    # POC range: from the most recent leg's low to support_range_high.
+    # Using full support_range_low (20% down) pulls POC into old history;
+    # the most recent pump leg low is the correct lower bound for active volume.
+    last_leg_low  = max(leg[0] for leg in pump_legs)
+    poc_range_low = min(last_leg_low, current_price * 0.92)
+    poc_price = _calculate_poc_simple(c15m, poc_range_low, support_range_high, atr)
 
     if poc_price:
         logger.info("POC calculated", symbol=symbol, poc=_round_level(poc_price))
@@ -576,15 +581,14 @@ def _find_body_levels_simple(
             )
         }
 
-        # FIX Bug-6: post-pump filter — no fallback to pre-pump count.
-        # A level with 0 post-pump touches is weak; inflating it with
-        # pre-pump history gives false strength.
+        # Post-pump filter: prefer post-pump touch count, but fall back to
+        # total touches for origin/base zones where all candles are pre-pump.
         if pump_peak_time > 0:
             post_pump_touch_idxs = {
                 idx for idx in touch_idxs
                 if c15m[idx]["open_time"] >= pump_peak_time
             }
-            candle_count = len(post_pump_touch_idxs)
+            candle_count = len(post_pump_touch_idxs) if post_pump_touch_idxs else len(touch_idxs)
         else:
             candle_count = len(touch_idxs)
 
