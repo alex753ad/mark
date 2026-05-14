@@ -440,14 +440,6 @@ def _check_complications(symbol: str, level: float, level_side: str, approach_wa
         if vol_trend:
             return vol_trend, "pressure"
 
-    if not engulf_sent:
-        if _check_engulfing(c15m):
-            return (
-                f"🔴 {symbol} осложнение\n"
-                f"   15М свеча поглощает памп-свечу\n"
-                f"   → быстрый выход, не держать"
-            ), "engulf"
-
     if not level_broken_sent and not weak_breakout_active:
         broken = _check_level_broken(c1m, level)
         if broken:
