@@ -21,7 +21,9 @@ def _round_level(price: float) -> float:
 
 
 def _calc_atr_1m(c1m: list[dict]) -> float:
-    """Calculate ATR from 1M candles."""
+    """Calculate ATR from 1M candles.
+    Note: duplicates trigger.calculate_atr to avoid circular import.
+    """
     if len(c1m) < ATR_PERIOD:
         return 0.0
     recent = c1m[-ATR_PERIOD:]
