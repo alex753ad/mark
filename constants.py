@@ -45,7 +45,7 @@ SCREENER_MIN_VOLUME_USD = 40_000_000  # Минимальный объём для
 SCREENER_MIN_GROWTH_PCT = 10.0  # Минимальный рост для скринера
 SCREENER_MIN_NATR = 2.0  # Минимальный NATR для скринера
 SCREENER_DELAY_SECONDS = 15  # Задержка перед запуском скринера
-SCREENER_AUTO_INTERVAL_SECONDS = 1800  # Интервал автоскринера (30 минут)
+SCREENER_AUTO_INTERVAL_SECONDS = 600  # Интервал автоскринера (10 минут)
 
 # API limits
 CLAUDE_MAX_CONCURRENT_REQUESTS = 2  # Максимум параллельных запросов к Claude API
