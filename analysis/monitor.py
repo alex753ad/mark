@@ -96,9 +96,12 @@ async def start_monitor(
             "vol_ratio_at_touch": vol_ratio,
         }
 
+    _monitor_result = None
+
     while True:
         if stop_event and stop_event.is_set():
-            return _make_result(None, touched)
+            _monitor_result = _make_result(None, touched)
+            break
 
         iteration += 1
         if iteration % 60 == 0:
@@ -127,7 +130,8 @@ async def start_monitor(
                     await send_message(
                         f"💥 {symbol} пробой {level} с объёмом ×{breakout_vol_ratio:.1f} — настоящий, выход"
                     )
-                    return _make_result("breakout", touched)
+                    _monitor_result = _make_result("breakout", touched)
+                    break
                 elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_below:
                     # High volume but only 1 candle below — possible zakol, wait for confirmation
                     now = time.time()
@@ -156,7 +160,8 @@ async def start_monitor(
                     await send_message(
                         f"💥 {symbol} пробой {level} с объёмом ×{breakout_vol_ratio:.1f} — настоящий, выход"
                     )
-                    return _make_result("breakout", touched)
+                    _monitor_result = _make_result("breakout", touched)
+                    break
                 elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_above:
                     now = time.time()
                     if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
@@ -291,8 +296,8 @@ async def start_monitor(
                     delta_signal_sent = False
                     stop_delta_tracking(symbol)
                 elif distance > atr * DISTANCE_PARTIAL_RESET_ATR_MULTIPLIER:
-                    # Don't reset rebound_sent here — prevents spam
                     touched = False
+                    rebound_sent = False
 
             avg_vol_20 = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
             if volume_spike_notified and avg_vol_20 > 0 and last["volume"] / avg_vol_20 < VOLUME_SPIKE_RESET_RATIO:
@@ -323,6 +328,8 @@ async def start_monitor(
     stop_delta_tracking(symbol)
     if delta_stream_task and not delta_stream_task.done():
         delta_stream_task.cancel()
+
+    return _monitor_result
 
 
 # Dedup guard: prevent multiple classify calls for the same touch event
@@ -433,6 +440,23 @@ def _check_complications(symbol: str, level: float, level_side: str, approach_wa
         if vol_trend:
             return vol_trend, "pressure"
 
+    if not volume_spike_notified:
+        spike = _check_volume_spike(c1m)
+        if spike:
+            return (
+                f"🔴 {symbol} осложнение\n"
+                f"   Объём при падении вырос ×{spike} от нормы\n"
+                f"   → сильный продавец, пробой вероятен"
+            ), "volume_spike"
+
+    if not engulf_sent:
+        if _check_engulfing(c15m):
+            return (
+                f"🔴 {symbol} осложнение\n"
+                f"   15М свеча поглощает памп-свечу\n"
+                f"   → быстрый выход, не держать"
+            ), "engulf"
+
     if not level_broken_sent and not weak_breakout_active:
         broken = _check_level_broken(c1m, level)
         if broken:
@@ -441,10 +465,6 @@ def _check_complications(symbol: str, level: float, level_side: str, approach_wa
                 f"   Промежуточный уровень пробит без отскока\n"
                 f"   → импульс сильный, твой уровень под угрозой"
             ), "level_broken"
-
-    sweep = _check_sweep_reclaim(c1m, level, level_side)
-    if sweep:
-        return None, None
 
     return None, None
 

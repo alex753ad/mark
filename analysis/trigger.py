@@ -34,8 +34,8 @@ def find_real_level(symbol: str, level: float) -> tuple[float, int]:
 
     zone_radius = atr * 0.3  # Fixed radius: 0.3 ATR
 
-    # Find pump peak time - count touches only after pump
-    pump_high = max(c["high"] for c in c15m)
+    # Find pump peak time - count touches only after pump (use recent candles, not all-time)
+    pump_high = max(c["high"] for c in c15m[-50:])
     pump_peak_time = next((c["open_time"] for c in c15m if c["high"] >= pump_high * 0.999), None)
 
     touches = []
@@ -67,9 +67,10 @@ def find_real_level(symbol: str, level: float) -> tuple[float, int]:
     return level, len(touches)
 
 
-def calculate_atr(symbol: str) -> float:
+def calculate_atr(symbol: str, c1m: list[dict] = None) -> float:
     """Calculate Average True Range for symbol."""
-    c1m = candles_1m.get(symbol, [])
+    if c1m is None:
+        c1m = candles_1m.get(symbol, [])
     if len(c1m) < ATR_PERIOD:
         return 0.0
     recent = c1m[-ATR_PERIOD:]
@@ -251,7 +252,14 @@ def _count_approaches(symbol: str, level: float, atr: float) -> int:
 def get_level_history(symbol: str, level: float, atr: float) -> dict:
     """Get historical behavior of a level."""
     c1m = candles_1m.get(symbol, [])
+    c15m = candles_15m.get(symbol, [])
     threshold = atr * LEVEL_APPROACH_THRESHOLD
+
+    # Filter: only consider candles after pump peak
+    pump_high_time = None
+    if c15m:
+        pump_high = max(c["high"] for c in c15m[-50:])
+        pump_high_time = next((c["open_time"] for c in c15m if c["high"] >= pump_high * 0.999), None)
 
     was_broken = False
     sweep_reclaimed = False
@@ -259,6 +267,8 @@ def get_level_history(symbol: str, level: float, atr: float) -> dict:
     max_vol_on_approach = 0.0
 
     for c in c1m:
+        if pump_high_time and c["open_time"] < pump_high_time:
+            continue
         if price_min is None or c["low"] < price_min:
             price_min = c["low"]
 

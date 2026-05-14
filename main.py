@@ -88,9 +88,8 @@ async def _auto_screener_loop():
     from datetime import datetime, timezone
     await asyncio.sleep(SCREENER_AUTO_INTERVAL_SECONDS)  # skip first run
 
-    known_symbols: set[str] = set(token_registry.get_all())
-
     while True:
+        known_symbols = set(token_registry.get_all())
         try:
             rows = await _run_screener()
             if not rows:
@@ -108,98 +107,102 @@ async def _auto_screener_loop():
                     logger.info("Auto-added new symbol from screener", symbol=sym)
 
             # For each new symbol: fetch data, build levels, start monitoring
-            for ticker, chg, natr, vol, sym in new_symbols:
+            if new_symbols:
+                from binance import AsyncClient
+                from data.collector import _parse_kline, candles_1m, candles_15m
+                from analysis.level_builder import build_levels
+                from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
+                from analysis.claude_strength import calculate_strength_with_claude
+                import json as _json
+
+                client = await AsyncClient.create()
                 try:
-                    from binance import AsyncClient
-                    from data.collector import _parse_kline, candles_1m, candles_15m
-                    client = await AsyncClient.create()
-                    try:
-                        raw_15m = await client.futures_klines(symbol=sym, interval="15m", limit=500)
-                        raw_1m = await client.futures_klines(symbol=sym, interval="1m", limit=300)
-                        candles_15m[sym] = [_parse_kline(k) for k in raw_15m]
-                        candles_1m[sym] = [_parse_kline(k) for k in raw_1m]
-                    finally:
-                        await client.close_connection()
+                    for ticker, chg, natr, vol, sym in new_symbols:
+                        try:
+                            raw_15m = await client.futures_klines(symbol=sym, interval="15m", limit=500)
+                            raw_1m = await client.futures_klines(symbol=sym, interval="1m", limit=300)
+                            candles_15m[sym] = [_parse_kline(k) for k in raw_15m]
+                            candles_1m[sym] = [_parse_kline(k) for k in raw_1m]
 
-                    from analysis.level_builder import build_levels
-                    from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
-                    from analysis.claude_strength import calculate_strength_with_claude
+                            ext_c1m = candles_1m[sym]
+                            ext_c15m = candles_15m[sym]
+                            all_levels = build_levels(sym, c1m_override=ext_c1m, c15m_override=ext_c15m)
 
-                    ext_c1m = candles_1m[sym]
-                    ext_c15m = candles_15m[sym]
-                    all_levels = build_levels(sym, c1m_override=ext_c1m, c15m_override=ext_c15m)
+                            if not all_levels:
+                                continue
 
-                    if not all_levels:
-                        continue
+                            current_price = ext_c1m[-1]["close"]
+                            atr = calculate_atr(sym)
+                            range_limit = current_price * 0.20
 
-                    current_price = ext_c1m[-1]["close"]
-                    atr = calculate_atr(sym)
-                    range_limit = current_price * 0.20
+                            supports = [
+                                lvl for lvl in all_levels
+                                if lvl["level"] < current_price
+                                and (current_price - lvl["level"]) <= range_limit
+                                and (current_price - lvl["level"]) >= atr * 1.5
+                            ]
 
-                    supports = [
-                        lvl for lvl in all_levels
-                        if lvl["level"] < current_price
-                        and (current_price - lvl["level"]) <= range_limit
-                        and (current_price - lvl["level"]) >= atr * 1.5
-                    ]
+                            if not supports:
+                                continue
 
-                    if not supports:
-                        continue
+                            for lvl in supports:
+                                lvl["symbol"] = sym
+                                lvl["approach"] = _count_approaches(sym, lvl["level"], atr) if atr > 0 else 0
+                                if atr > 0:
+                                    lvl.update(get_level_history(sym, lvl["level"], atr))
+                                calculate_strength(lvl)
+                                lvl["python_strength"] = lvl["strength"]
 
-                    for lvl in supports:
-                        lvl["symbol"] = sym
-                        lvl["approach"] = _count_approaches(sym, lvl["level"], atr) if atr > 0 else 0
-                        if atr > 0:
-                            lvl.update(get_level_history(sym, lvl["level"], atr))
-                        calculate_strength(lvl)
-                        lvl["python_strength"] = lvl["strength"]
+                            poc_price = next((l["level"] for l in supports if l.get("poc_aligned")), None)
+                            supports = await calculate_strength_with_claude(sym, ext_c15m, supports, poc_price)
 
-                    poc_price = next((l["level"] for l in supports if l.get("poc_aligned")), None)
-                    supports = await calculate_strength_with_claude(sym, ext_c15m, supports, poc_price)
+                            for lvl in supports:
+                                py = lvl.get("python_strength", lvl["strength"])
+                                if lvl.get("approach", 0) >= 2 or (lvl.get("was_broken") and not lvl.get("sweep_reclaimed")):
+                                    lvl["strength"] = min(lvl["strength"], py)
 
-                    for lvl in supports:
-                        py = lvl.get("python_strength", lvl["strength"])
-                        if lvl.get("approach", 0) >= 2 or (lvl.get("was_broken") and not lvl.get("sweep_reclaimed")):
-                            lvl["strength"] = min(lvl["strength"], py)
+                            strong = [l for l in supports if l["strength"] >= 4]
+                            if not strong:
+                                continue
 
-                    strong = [l for l in supports if l["strength"] >= 4]
-                    if not strong:
-                        continue
+                            sym_state = state_manager.get_state(sym)
+                            started = []
+                            for lvl in strong:
+                                task_key = sym_state.make_task_key(lvl["level"])
+                                if task_key not in sym_state.tasks:
+                                    task = asyncio.create_task(
+                                        _monitored(sym, lvl["level"], "support",
+                                                  level_type=lvl["type"],
+                                                  strength=lvl["strength"])
+                                    )
+                                    sym_state.add_task(lvl["level"], task)
+                                    sym_state.phase = "phase2"
+                                    started.append(lvl)
 
-                    nearest = min(strong, key=lambda l: abs(current_price - l["level"]))
-                    sym_state = state_manager.get_state(sym)
-                    task_key = sym_state.make_task_key(nearest["level"])
+                            if started:
+                                lines = [f"🆕 {sym} добавлен автоматически",
+                                         f"   {chg:+.1f}% | NATR {natr:.1f}%\n"]
+                                for lvl in started:
+                                    stars = "⭐️" * lvl["strength"]
+                                    reason = lvl.get("claude_reason", "")
+                                    lines.append(f"   {stars} {lvl['level']} — {lvl['type']}")
+                                    if reason:
+                                        lines.append(f"   💭 {reason}")
+                                lines.append(f"\n👁 Мониторинг запущен ({len(started)} ур.)")
+                                await send_message("\n".join(lines))
 
-                    if task_key not in sym_state.tasks:
-                        task = asyncio.create_task(
-                            _monitored(sym, nearest["level"], "support",
-                                      level_type=nearest["type"],
-                                      strength=nearest["strength"])
-                        )
-                        sym_state.add_task(nearest["level"], task)
-                        sym_state.phase = "phase2"
+                                await log_event(sym, "added_screener", f"chg={chg:+.1f}% natr={natr:.1f}%")
+                                levels_info = [{"level": l["level"], "type": l["type"], "strength": l["strength"]} for l in started]
+                                await log_event(sym, "levels_built", _json.dumps(levels_info))
+                                for lvl in started:
+                                    await log_event(sym, "monitoring_start",
+                                                   f"level={lvl['level']} strength={lvl['strength']} type={lvl['type']}")
+                                logger.info("Auto monitoring started", symbol=sym, levels=len(started))
 
-                        stars = "⭐️" * nearest["strength"]
-                        reason = nearest.get("claude_reason", "")
-                        await send_message(
-                            f"🆕 {sym} добавлен автоматически\n"
-                            f"   {chg:+.1f}% | NATR {natr:.1f}%\n\n"
-                            f"   {stars} {nearest['level']} — {nearest['type']}\n"
-                            f"   💭 {reason}\n\n"
-                            f"👁 Мониторинг запущен"
-                        )
-                        logger.info("Auto monitoring started", symbol=sym, level=nearest["level"])
-
-                        # Log full lifecycle events
-                        import json as _json
-                        await log_event(sym, "added_screener", f"chg={chg:+.1f}% natr={natr:.1f}%")
-                        levels_info = [{"level": l["level"], "type": l["type"], "strength": l["strength"]} for l in strong]
-                        await log_event(sym, "levels_built", _json.dumps(levels_info))
-                        await log_event(sym, "monitoring_start",
-                                       f"level={nearest['level']} strength={nearest['strength']} type={nearest['type']}")
-
-                except Exception as e:
-                    logger.exception("Error setting up new symbol", symbol=sym, error=str(e))
+                        except Exception as e:
+                            logger.exception("Error setting up new symbol", symbol=sym, error=str(e))
+                finally:
+                    await client.close_connection()
 
             logger.info("Auto screener completed", total=len(rows), new=len(new_symbols))
 
@@ -235,6 +238,7 @@ async def _trigger_loop():
 
                 # Check trigger condition
                 if check_trigger(symbol):
+                    _building_levels.add(symbol)
                     trigger_times[symbol] = time.time()
                     save_trigger_times(trigger_times)
                     logger.info("Trigger activated", symbol=symbol)
@@ -757,11 +761,9 @@ async def shutdown():
     """Graceful shutdown of all bot components."""
     logger.info("Shutting down gracefully...")
     
-    # Cancel all monitoring tasks
-    state_manager.cancel_all_tasks()
-    
-    # Wait for tasks to complete
+    # Save tasks before cancelling, then wait for them
     all_tasks = state_manager.get_all_active_tasks()
+    state_manager.cancel_all_tasks()
     if all_tasks:
         await asyncio.gather(*all_tasks.values(), return_exceptions=True)
     
@@ -784,83 +786,81 @@ async def _startup_monitoring():
 
     logger.info("Starting monitoring for existing symbols", count=len(tokens))
 
-    for symbol in tokens:
-        try:
-            from binance import AsyncClient
-            from data.collector import _parse_kline, candles_1m, candles_15m
-            client = await AsyncClient.create()
+    from binance import AsyncClient
+    from data.collector import _parse_kline, candles_1m, candles_15m
+    from analysis.level_builder import build_levels
+    from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
+    import json as _json
+
+    client = await AsyncClient.create()
+    try:
+        for symbol in tokens:
             try:
                 raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=500)
                 raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=300)
                 candles_15m[symbol] = [_parse_kline(k) for k in raw_15m]
                 candles_1m[symbol] = [_parse_kline(k) for k in raw_1m]
-            finally:
-                await client.close_connection()
 
-            from analysis.level_builder import build_levels
-            from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
-            from analysis.claude_strength import calculate_strength_with_claude
+                ext_c1m = candles_1m[symbol]
+                ext_c15m = candles_15m[symbol]
+                all_levels = build_levels(symbol, c1m_override=ext_c1m, c15m_override=ext_c15m)
 
-            ext_c1m = candles_1m[symbol]
-            ext_c15m = candles_15m[symbol]
-            all_levels = build_levels(symbol, c1m_override=ext_c1m, c15m_override=ext_c15m)
+                if not all_levels:
+                    logger.debug("No levels on startup", symbol=symbol)
+                    continue
 
-            if not all_levels:
-                logger.debug("No levels on startup", symbol=symbol)
-                continue
+                current_price = ext_c1m[-1]["close"]
+                atr = calculate_atr(symbol)
+                range_limit = current_price * 0.20
 
-            current_price = ext_c1m[-1]["close"]
-            atr = calculate_atr(symbol)
-            range_limit = current_price * 0.20
+                supports = [
+                    lvl for lvl in all_levels
+                    if lvl["level"] < current_price
+                    and (current_price - lvl["level"]) <= range_limit
+                    and (current_price - lvl["level"]) >= atr * 1.5
+                ]
 
-            supports = [
-                lvl for lvl in all_levels
-                if lvl["level"] < current_price
-                and (current_price - lvl["level"]) <= range_limit
-                and (current_price - lvl["level"]) >= atr * 1.5
-            ]
+                if not supports:
+                    continue
 
-            if not supports:
-                continue
+                for lvl in supports:
+                    lvl["symbol"] = symbol
+                    lvl["approach"] = _count_approaches(symbol, lvl["level"], atr) if atr > 0 else 0
+                    if atr > 0:
+                        lvl.update(get_level_history(symbol, lvl["level"], atr))
+                    calculate_strength(lvl)
+                    lvl["python_strength"] = lvl["strength"]
 
-            for lvl in supports:
-                lvl["symbol"] = symbol
-                lvl["approach"] = _count_approaches(symbol, lvl["level"], atr) if atr > 0 else 0
-                if atr > 0:
-                    lvl.update(get_level_history(symbol, lvl["level"], atr))
-                calculate_strength(lvl)
-                lvl["python_strength"] = lvl["strength"]
+                # Startup: use Python only, no Claude (save tokens)
+                strong = [l for l in supports if l["strength"] >= 4]
+                if not strong:
+                    logger.debug("No strong levels on startup", symbol=symbol)
+                    continue
 
-            # Startup: use Python only, no Claude (save tokens)
-            strong = [l for l in supports if l["strength"] >= 4]
-            if not strong:
-                logger.debug("No strong levels on startup", symbol=symbol)
-                continue
+                # Log levels built
+                levels_info = [{"level": l["level"], "type": l["type"], "strength": l["strength"]} for l in strong]
+                await log_event(symbol, "levels_built", _json.dumps(levels_info))
 
-            # Log levels built
-            import json as _json
-            levels_info = [{"level": l["level"], "type": l["type"], "strength": l["strength"]} for l in strong]
-            await log_event(symbol, "levels_built", _json.dumps(levels_info))
+                sym_state = state_manager.get_state(symbol)
+                for lvl in strong:
+                    task_key = sym_state.make_task_key(lvl["level"])
+                    if task_key not in sym_state.tasks:
+                        task = asyncio.create_task(
+                            _monitored(symbol, lvl["level"], "support",
+                                      level_type=lvl["type"],
+                                      strength=lvl["strength"])
+                        )
+                        sym_state.add_task(lvl["level"], task)
+                        sym_state.phase = "phase2"
+                        await log_event(symbol, "monitoring_start",
+                                       f"level={lvl['level']} strength={lvl['strength']} type={lvl['type']} (startup)")
+                        logger.info("Startup monitoring started", symbol=symbol, level=lvl["level"])
 
-            nearest = min(strong, key=lambda l: abs(current_price - l["level"]))
-            sym_state = state_manager.get_state(symbol)
-            task_key = sym_state.make_task_key(nearest["level"])
-
-            if task_key not in sym_state.tasks:
-                task = asyncio.create_task(
-                    _monitored(symbol, nearest["level"], "support",
-                              level_type=nearest["type"],
-                              strength=nearest["strength"])
-                )
-                sym_state.add_task(nearest["level"], task)
-                sym_state.phase = "phase2"
-                await log_event(symbol, "monitoring_start",
-                               f"level={nearest['level']} strength={nearest['strength']} type={nearest['type']} (startup)")
-                logger.info("Startup monitoring started", symbol=symbol, level=nearest["level"])
-
-        except Exception as e:
-            logger.exception("Error starting monitoring for symbol on startup",
-                           symbol=symbol, error=str(e))
+            except Exception as e:
+                logger.exception("Error starting monitoring for symbol on startup",
+                               symbol=symbol, error=str(e))
+    finally:
+        await client.close_connection()
 
 
 async def main():

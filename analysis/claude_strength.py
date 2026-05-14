@@ -1,13 +1,29 @@
 """Claude-based strength calculation for levels."""
 
+import asyncio
 import json
 import anthropic
 from config import CLAUDE_API_KEY
-from constants import CLAUDE_MODEL, CLAUDE_MAX_TOKENS
+from constants import CLAUDE_MODEL, CLAUDE_MAX_TOKENS, CLAUDE_MAX_CONCURRENT_REQUESTS
 from analysis.chart_ascii import generate_ascii_chart, generate_levels_summary
 from logger import logger
 
-client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+_client: anthropic.AsyncAnthropic | None = None
+_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_client() -> anthropic.AsyncAnthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+    return _client
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(CLAUDE_MAX_CONCURRENT_REQUESTS)
+    return _semaphore
 
 
 async def calculate_strength_with_claude(symbol: str, c15m: list[dict], levels: list[dict], poc_price: float = None) -> list[dict]:
@@ -109,11 +125,12 @@ async def calculate_strength_with_claude(symbol: str, c15m: list[dict], levels: 
                     symbol=symbol,
                     levels_count=len(levels))
         
-        response = await client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=CLAUDE_MAX_TOKENS,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        async with _get_semaphore():
+            response = await _get_client().messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=CLAUDE_MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
         
         response_text = response.content[0].text
         
@@ -160,6 +177,10 @@ async def calculate_strength_with_claude(symbol: str, c15m: list[dict], levels: 
                            reason=claude_data["reason"])
             else:
                 # Fallback to default
+                logger.warning("Claude level not matched",
+                              symbol=symbol,
+                              level_price=price,
+                              claude_prices=list(claude_levels.keys()))
                 lvl["strength"] = 3
                 lvl["claude_reason"] = "Не проанализирован Claude"
                 lvl["verdict"] = "hold"
