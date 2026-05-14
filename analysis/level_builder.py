@@ -196,12 +196,13 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     support_range_low  = current_price * 0.80 if current_price > 0 else pump_low
     support_range_high = current_price * 1.05 if current_price > 0 else pump_high
 
-    # POC range: from the most recent leg's low to support_range_high.
-    # Using full support_range_low (20% down) pulls POC into old history;
-    # the most recent pump leg low is the correct lower bound for active volume.
+    # POC: only candles from pump start onward — pre-pump accumulation
+    # (hundreds of low-volume candles) otherwise drowns out the actual
+    # high-volume zone that TradingView Volume Profile shows.
+    poc_candles   = c15m[pump_start_idx:]
     last_leg_low  = max(leg[0] for leg in pump_legs)
     poc_range_low = min(last_leg_low, current_price * 0.92)
-    poc_price = _calculate_poc_simple(c15m, poc_range_low, support_range_high, atr)
+    poc_price = _calculate_poc_simple(poc_candles, poc_range_low, support_range_high, atr)
 
     if poc_price:
         logger.info("POC calculated", symbol=symbol, poc=_round_level(poc_price))
