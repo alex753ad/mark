@@ -413,16 +413,9 @@ async def btn_market(message: Message):
 
     try:
         from datetime import datetime, timezone
-        from main import _run_screener
+        from analysis.screener import run_screener, _format_vol
 
-        def _format_vol(v: float) -> str:
-            if v >= 1_000_000_000:
-                return f"{v/1_000_000_000:.1f}B"
-            if v >= 1_000_000:
-                return f"{v/1_000_000:.0f}M"
-            return f"{v/1_000:.0f}K"
-
-        rows = await _run_screener()
+        rows = await run_screener()
         if not rows:
             await message.answer("Нет монет, прошедших фильтр", reply_markup=get_main_keyboard())
             return
