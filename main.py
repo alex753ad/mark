@@ -342,50 +342,48 @@ async def _run_phase1(symbol: str):
             state.phase = "phase2" if state.has_active_tasks() else "idle"
             return
 
-        # Send notifications and start monitoring (no Claude)
-        added = 0
-        for r in strong:
-            level_side = r.get("level_side", "support")
-            task_key = state.make_task_key(r["level"])
+        # Send notifications and start monitoring — only the NEAREST strong level
+        # Others will be picked up after breakout via _start_next_level_after_breakout
+        strong_sorted = sorted(strong, key=lambda l: abs(current_price - l["level"]))
+        nearest = strong_sorted[0]
 
-            # Skip if already monitoring this level
-            if task_key in state.tasks:
-                continue
+        level_side = nearest.get("level_side", "support")
+        task_key = state.make_task_key(nearest["level"])
 
-            zone_approaches = r.get("zone_approaches", 0)
-            atr_pct = r.get("atr_pct", 0)
-            stars = "⭐️" * r["strength"]
+        if task_key in state.tasks:
+            logger.debug("Nearest level already monitored", symbol=symbol)
+            state.phase = "phase2"
+            return
 
-            if was_in_phase2:
-                text = (
-                    f"📋 {symbol} новый уровень после пампа\n"
-                    f"   {stars} {r['level']} — {r.get('type', '')}\n"
-                )
-            else:
-                text = (
-                    f"📋 {symbol} коррекция началась\n"
-                    f"   Уровень {r['level']} — {r.get('type', '')} {stars}\n"
-                )
-            if zone_approaches >= 1:
-                text += f"   ⚠️ Зона тестировалась {zone_approaches} раз(а) в радиусе {atr_pct:.2f}%\n"
+        zone_approaches = nearest.get("zone_approaches", 0)
+        atr_pct = nearest.get("atr_pct", 0)
+        stars = "⭐️" * nearest["strength"]
 
-            text += f"\n   Жду цену на {r['level']}..."
-
-            await send_message(text)
-            logger.info("Level monitoring started",
-                       symbol=symbol, level=r['level'], strength=r['strength'])
-
-            task = asyncio.create_task(
-                _monitored(symbol, r["level"], level_side,
-                           level_type=r["type"],
-                           strength=r["strength"])
+        if was_in_phase2:
+            text = (
+                f"📋 {symbol} новый уровень после пампа\n"
+                f"   {stars} {nearest['level']} — {nearest.get('type', '')}\n"
             )
-            state.add_task(r["level"], task)
-            added += 1
+        else:
+            text = (
+                f"📋 {symbol} коррекция началась\n"
+                f"   Уровень {nearest['level']} — {nearest.get('type', '')} {stars}\n"
+            )
+        if zone_approaches >= 1:
+            text += f"   ⚠️ Зона тестировалась {zone_approaches} раз(а) в радиусе {atr_pct:.2f}%\n"
+        text += f"\n   Жду цену на {nearest['level']}..."
 
+        await send_message(text)
+        logger.info("Level monitoring started",
+                   symbol=symbol, level=nearest['level'], strength=nearest['strength'])
+
+        task = asyncio.create_task(
+            _monitored(symbol, nearest["level"], level_side,
+                       level_type=nearest["type"],
+                       strength=nearest["strength"])
+        )
+        state.add_task(nearest["level"], task)
         state.phase = "phase2"
-        if added == 0:
-            logger.debug("All strong levels already monitored", symbol=symbol)
 
     except asyncio.CancelledError:
         raise
@@ -842,24 +840,26 @@ async def _startup_monitoring():
                     logger.debug("No strong levels on startup", symbol=symbol)
                     continue
 
+                # Monitor only the nearest level — others picked up after breakout
+                nearest = min(strong, key=lambda l: abs(current_price - l["level"]))
+
                 # Log levels built
                 levels_info = [{"level": l["level"], "type": l["type"], "strength": l["strength"]} for l in strong]
                 await log_event(symbol, "levels_built", _json.dumps(levels_info))
 
                 sym_state = state_manager.get_state(symbol)
-                for lvl in strong:
-                    task_key = sym_state.make_task_key(lvl["level"])
-                    if task_key not in sym_state.tasks:
-                        task = asyncio.create_task(
-                            _monitored(symbol, lvl["level"], "support",
-                                      level_type=lvl["type"],
-                                      strength=lvl["strength"])
-                        )
-                        sym_state.add_task(lvl["level"], task)
-                        sym_state.phase = "phase2"
-                        await log_event(symbol, "monitoring_start",
-                                       f"level={lvl['level']} strength={lvl['strength']} type={lvl['type']} (startup)")
-                        logger.info("Startup monitoring started", symbol=symbol, level=lvl["level"])
+                task_key = sym_state.make_task_key(nearest["level"])
+                if task_key not in sym_state.tasks:
+                    task = asyncio.create_task(
+                        _monitored(symbol, nearest["level"], "support",
+                                  level_type=nearest["type"],
+                                  strength=nearest["strength"])
+                    )
+                    sym_state.add_task(nearest["level"], task)
+                    sym_state.phase = "phase2"
+                    await log_event(symbol, "monitoring_start",
+                                   f"level={nearest['level']} strength={nearest['strength']} type={nearest['type']} (startup)")
+                    logger.info("Startup monitoring started", symbol=symbol, level=nearest["level"])
 
             except Exception as e:
                 logger.exception("Error starting monitoring for symbol on startup",
