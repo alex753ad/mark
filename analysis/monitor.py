@@ -420,7 +420,7 @@ def _check_complications(symbol: str, level: float, level_side: str, approach_wa
     if len(c1m) < 10 or len(c15m) < 2:
         return None, None
 
-    if not approach_warned:
+    if not approach_warned and not weak_breakout_active:
         vol_trend = _check_volume_trend_approach(symbol, level, level_side)
         if vol_trend:
             return vol_trend, "pressure"
