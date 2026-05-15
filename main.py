@@ -475,6 +475,13 @@ async def _run_phase1(symbol: str):
         state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
         state.phase = "phase2"
 
+        # Update analysis cache so breakout chain can find next levels
+        from bot.telegram import _last_analysis_cache
+        _last_analysis_cache[symbol] = [
+            {"level": l["level"], "strength": l["strength"], "type": l["type"]}
+            for l in sorted(levels, key=lambda x: x["level"])
+        ]
+
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -706,6 +713,21 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
     # --- No level found ---
     if not next_started:
         try:
+            from bot.telegram import _last_analysis_cache
+            # Don't remove if there are known levels below in cache
+            cached = _last_analysis_cache.get(symbol, [])
+            has_cached_below = any(
+                l["level"] < broken_level
+                and (current_price - l["level"]) <= current_price * 0.20
+                for l in cached
+            )
+            if has_cached_below:
+                await log_event(symbol, "breakout",
+                               f"level={broken_level} — no next level started but cache has candidates")
+                logger.info("No next level started but cache has candidates, keeping symbol",
+                           symbol=symbol)
+                return
+
             rows = await _run_screener()
             screener_symbols = {sym for _, _, _, _, sym in rows}
             if symbol not in screener_symbols:
