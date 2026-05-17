@@ -531,6 +531,39 @@ async def cmd_list(message: Message):
     await message.answer("Активные монеты:\n" + "\n".join(tokens), reply_markup=get_main_keyboard())
 
 
+@router.message(Command("export_db"))
+async def cmd_export_db(message: Message):
+    """Send history.db file to Telegram."""
+    if not _authorized(message):
+        return
+    import os
+    from aiogram.types import BufferedInputFile
+    from config import HISTORY_DB_FILE
+
+    # Try volume path first, then local
+    db_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "")
+    if db_path:
+        db_path = os.path.join(db_path, "history.db")
+    else:
+        db_path = HISTORY_DB_FILE
+
+    if not os.path.exists(db_path):
+        await message.answer("❌ history.db не найден", reply_markup=get_main_keyboard())
+        return
+
+    try:
+        with open(db_path, "rb") as f:
+            data = f.read()
+        size_kb = len(data) / 1024
+        await message.answer_document(
+            BufferedInputFile(data, filename="history.db"),
+            caption=f"📦 history.db ({size_kb:.1f} KB)"
+        )
+    except Exception as e:
+        logger.exception("Failed to export db", error=str(e))
+        await message.answer(f"❌ Ошибка: {e}", reply_markup=get_main_keyboard())
+
+
 @router.message(Command("analyze"))
 async def cmd_analyze(message: Message):
     if not _authorized(message):
