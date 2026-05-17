@@ -154,7 +154,7 @@ async def start_monitor(
                         weak_breakout_sent = True
                         weak_breakout_time = now
             elif level_side == "support" and body_close >= level:
-                weak_breakout_sent = False
+                pass  # don't reset — prevents spam on repeated dips
 
             if level_side == "resistance" and body_close > level:
                 avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
@@ -183,7 +183,7 @@ async def start_monitor(
                         weak_breakout_sent = True
                         weak_breakout_time = now
             elif level_side == "resistance" and body_close <= level:
-                weak_breakout_sent = False
+                pass  # don't reset — prevents spam on repeated pops
 
             if level_side == "support" and last["low"] <= level * 1.002:
                 if not touched:
