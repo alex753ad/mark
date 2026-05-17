@@ -40,6 +40,8 @@ async def start_monitor(
     approach_style: str = None,
     atr_ratio: float = None,
     vol_ratio: float = None,
+    level_type: str = "body_level",
+    strength: int = 0,
 ) -> str | None:
     """Monitor a level until body of 1M candle breaks it.
     level_side: 'support' or 'resistance'
@@ -67,6 +69,8 @@ async def start_monitor(
     # Track min price during monitoring for fill_depth_pct
     min_price_during = None
     max_price_during = None
+    touch_start_time: float = 0.0
+    vol_ratio_captured: float = 1.0  # vol_ratio captured at moment of first touch
 
     def _make_result(reason, _touched=False):
         """Build result dict with outcome info."""
@@ -150,7 +154,7 @@ async def start_monitor(
                         weak_breakout_sent = True
                         weak_breakout_time = now
             elif level_side == "support" and body_close >= level:
-                pass  # don't reset — prevents spam on repeated dips below level
+                weak_breakout_sent = False
 
             if level_side == "resistance" and body_close > level:
                 avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
@@ -179,7 +183,7 @@ async def start_monitor(
                         weak_breakout_sent = True
                         weak_breakout_time = now
             elif level_side == "resistance" and body_close <= level:
-                pass  # don't reset — prevents spam on repeated pops above level
+                weak_breakout_sent = False
 
             if level_side == "support" and last["low"] <= level * 1.002:
                 if not touched:
@@ -189,6 +193,9 @@ async def start_monitor(
                         delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
                     touch_c1m_idx = len(c1m) - 1
                     touch_classify_at = touch_c1m_idx + 5  # classify after 5 x 1M candles
+                    touch_start_time = time.time()
+                    avg_vol = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
+                    vol_ratio_captured = round(last["volume"] / avg_vol, 2) if avg_vol > 0 else 1.0
                     logger.debug("Delta tracking started on touch", symbol=symbol, level=level)
                 touched = True
             if level_side == "resistance" and last["high"] >= level * 0.998:
@@ -198,6 +205,9 @@ async def start_monitor(
                         delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
                     touch_c1m_idx = len(c1m) - 1
                     touch_classify_at = touch_c1m_idx + 5
+                    touch_start_time = time.time()
+                    avg_vol = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
+                    vol_ratio_captured = round(last["volume"] / avg_vol, 2) if avg_vol > 0 else 1.0
                 touched = True
 
             # Classify touch event after 5 x 1M candles
@@ -205,7 +215,11 @@ async def start_monitor(
                 if not classify_sent:
                     asyncio.create_task(_classify_and_log_level_event(
                         symbol, level, c1m, candles_15m.get(symbol, []),
-                        min_price_during or level, touch_c1m_idx
+                        min_price_during or level, touch_c1m_idx,
+                        level_type=level_type, strength=strength,
+                        approach_style=approach_style, atr_ratio=atr_ratio,
+                        touch_start_time=touch_start_time,
+                        vol_ratio_at_touch=vol_ratio_captured,
                     ))
                     classify_sent = True
                 touch_classify_at = 0  # reset so we don't classify again
@@ -237,7 +251,11 @@ async def start_monitor(
                     if not classify_sent:
                         asyncio.create_task(_classify_and_log_level_event(
                             symbol, level, c1m, candles_15m.get(symbol, []),
-                            min_price_during or level, touch_c1m_idx
+                            min_price_during or level, touch_c1m_idx,
+                            level_type=level_type, strength=strength,
+                            approach_style=approach_style, atr_ratio=atr_ratio,
+                            touch_start_time=touch_start_time,
+                        vol_ratio_at_touch=vol_ratio_captured,
                         ))
                         classify_sent = True
                     rebound_sent = True
@@ -258,7 +276,11 @@ async def start_monitor(
                     if not classify_sent:
                         asyncio.create_task(_classify_and_log_level_event(
                             symbol, level, c1m, candles_15m.get(symbol, []),
-                            max_price_during or level, touch_c1m_idx
+                            max_price_during or level, touch_c1m_idx,
+                            level_type=level_type, strength=strength,
+                            approach_style=approach_style, atr_ratio=atr_ratio,
+                            touch_start_time=touch_start_time,
+                        vol_ratio_at_touch=vol_ratio_captured,
                         ))
                         classify_sent = True
                     rebound_sent = True
@@ -281,7 +303,11 @@ async def start_monitor(
                     if touched and not rebound_sent and not classify_sent:
                         asyncio.create_task(_classify_and_log_level_event(
                             symbol, level, c1m, candles_15m.get(symbol, []),
-                            min_price_during or level, touch_c1m_idx
+                            min_price_during or level, touch_c1m_idx,
+                            level_type=level_type, strength=strength,
+                            approach_style=approach_style, atr_ratio=atr_ratio,
+                            touch_start_time=touch_start_time,
+                        vol_ratio_at_touch=vol_ratio_captured,
                         ))
                         classify_sent = True
                     # Check near_miss: came within 0.5% but never touched
@@ -290,7 +316,11 @@ async def start_monitor(
                         if 0 < dist_pct <= 0.5:
                             asyncio.create_task(_classify_and_log_level_event(
                                 symbol, level, c1m, candles_15m.get(symbol, []),
-                                min_price_during, touch_c1m_idx
+                                min_price_during, touch_c1m_idx,
+                                level_type=level_type, strength=strength,
+                                approach_style=approach_style, atr_ratio=atr_ratio,
+                                touch_start_time=touch_start_time,
+                        vol_ratio_at_touch=vol_ratio_captured,
                             ))
                             classify_sent = True
                     rebound_sent = False
@@ -352,6 +382,12 @@ async def _classify_and_log_level_event(
     c15m: list[dict],
     min_price: float,
     touch_time_idx: int,  # index in c1m when touch happened
+    level_type: str = "body_level",
+    strength: int = 0,
+    approach_style: str = None,
+    atr_ratio: float = None,
+    touch_start_time: float = 0.0,
+    vol_ratio_at_touch: float = 1.0,
 ):
     """
     Classify what happened at the level and log to history + send message.
@@ -369,13 +405,15 @@ async def _classify_and_log_level_event(
     if now - _classify_last_sent.get(dedup_key, 0) < 60:  # 60s cooldown per level
         return
     _classify_last_sent[dedup_key] = now
-    from data.history import log_event
+    from data.history import log_event, save_level_outcome
 
     if not c1m or level == 0:
         return
 
     current_price = c1m[-1]["close"]
     fill_depth_pct = (level - min_price) / level * 100 if min_price < level else 0.0
+
+    duration_minutes = int((now - touch_start_time) / 60) if touch_start_time > 0 else 0
 
     # Get candles after touch
     post_touch = c1m[touch_time_idx:touch_time_idx + 20] if touch_time_idx < len(c1m) else []
@@ -391,6 +429,10 @@ async def _classify_and_log_level_event(
     # --- ZAKOL or BOUNCE ---
     returned_above = any(c["close"] > level for c in post_touch[:5])
 
+    outcome = None
+    event_type = None
+    details = None
+
     if returned_above:
         if fill_depth_pct >= 1.0:
             retest_candles = post_touch[1:6]
@@ -399,17 +441,41 @@ async def _classify_and_log_level_event(
                 for c in retest_candles
             )
             if retest:
+                event_type = "zakol_deep_retest"
+                outcome = "bounce"
                 details = f"level={level} depth={fill_depth_pct:.2f}% retest=yes"
-                await log_event(symbol, "zakol_deep_retest", details)
             else:
+                event_type = "zakol_deep"
+                outcome = "bounce"
                 details = f"level={level} depth={fill_depth_pct:.2f}% retest=no"
-                await log_event(symbol, "zakol_deep", details)
         else:
+            event_type = "zakol"
+            outcome = "bounce"
             details = f"level={level} depth={fill_depth_pct:.2f}%"
-            await log_event(symbol, "zakol", details)
     else:
+        event_type = "bounce"
+        outcome = "bounce"
         details = f"level={level} fill_depth={fill_depth_pct:.2f}%"
-        await log_event(symbol, "bounce", details)
+
+    await log_event(symbol, event_type, details)
+
+    # Also write to level_outcomes so ML has the data
+    await save_level_outcome(
+        symbol=symbol,
+        level=level,
+        level_type=level_type,
+        strength=strength,
+        approach_type="support",
+        vol_ratio=vol_ratio_at_touch,
+        touches=1,
+        result="отбой",
+        duration=duration_minutes,
+        outcome=outcome,
+        approach_style=approach_style,
+        vol_ratio_at_touch=vol_ratio_at_touch,
+        atr_ratio=atr_ratio,
+        fill_depth_pct=round(fill_depth_pct, 4),
+    )
 
 
 def _check_complications(symbol: str, level: float, level_side: str, approach_warned: bool = False, volume_spike_notified: bool = False, engulf_sent: bool = False, level_broken_sent: bool = False, weak_breakout_active: bool = False) -> tuple[str | None, str | None]:

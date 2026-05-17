@@ -510,6 +510,11 @@ async def _monitored(symbol: str, level: float, level_side: str,
     reason = None  # ensure defined for finally block
     outcome = None
     fill_depth_pct = 0.0
+    # Compute approach metrics now (at monitoring start) if not provided by caller
+    if approach_style is None:
+        approach_style = detect_approach_style(symbol)
+    if atr_ratio is None:
+        atr_ratio = calculate_atr_ratio(symbol, level)
     m_approach_style = approach_style
     m_atr_ratio = atr_ratio
     m_vol_ratio = vol_ratio
@@ -523,6 +528,8 @@ async def _monitored(symbol: str, level: float, level_side: str,
             approach_style=approach_style,
             atr_ratio=atr_ratio,
             vol_ratio=vol_ratio,
+            level_type=level_type,
+            strength=strength,
         )
         duration = int((time.time() - start_time) / 60)
 
