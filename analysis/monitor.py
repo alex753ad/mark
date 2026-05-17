@@ -257,7 +257,16 @@ async def start_monitor(
                             touch_start_time=touch_start_time,
                         vol_ratio_at_touch=vol_ratio_captured,
                         ))
-                        classify_sent = True
+                    else:
+                        # classify already ran (5-candle timer) but bounce happened later — log it now
+                        asyncio.create_task(_log_bounce_outcome(
+                            symbol, level, min_price_during or level,
+                            level_type=level_type, strength=strength,
+                            approach_style=approach_style, atr_ratio=atr_ratio,
+                            touch_start_time=touch_start_time,
+                            vol_ratio_at_touch=vol_ratio_captured,
+                        ))
+                    classify_sent = True
                     rebound_sent = True
                     touched = False
                     delta_signal_sent = False
@@ -282,7 +291,15 @@ async def start_monitor(
                             touch_start_time=touch_start_time,
                         vol_ratio_at_touch=vol_ratio_captured,
                         ))
-                        classify_sent = True
+                    else:
+                        asyncio.create_task(_log_bounce_outcome(
+                            symbol, level, max_price_during or level,
+                            level_type=level_type, strength=strength,
+                            approach_style=approach_style, atr_ratio=atr_ratio,
+                            touch_start_time=touch_start_time,
+                            vol_ratio_at_touch=vol_ratio_captured,
+                        ))
+                    classify_sent = True
                     rebound_sent = True
                     touched = False
                     delta_signal_sent = False
@@ -334,6 +351,11 @@ async def start_monitor(
                 elif distance > atr * DISTANCE_PARTIAL_RESET_ATR_MULTIPLIER:
                     touched = False
                     rebound_sent = False
+                    classify_sent = False
+                    touch_start_time = 0.0
+                    vol_ratio_captured = 1.0
+                    min_price_during = None
+                    max_price_during = None
 
             avg_vol_20 = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
             if volume_spike_notified and avg_vol_20 > 0 and last["volume"] / avg_vol_20 < VOLUME_SPIKE_RESET_RATIO:
@@ -373,6 +395,46 @@ _classify_last_sent: dict[str, float] = {}  # key: "symbol:level" -> timestamp
 
 # Dedup guard: prevent duplicate rebound messages per symbol
 _rebound_last_sent: dict[str, float] = {}  # key: "symbol" -> timestamp
+
+
+async def _log_bounce_outcome(
+    symbol: str,
+    level: float,
+    min_price: float,
+    level_type: str = "body_level",
+    strength: int = 0,
+    approach_style: str = None,
+    atr_ratio: float = None,
+    touch_start_time: float = 0.0,
+    vol_ratio_at_touch: float = 1.0,
+):
+    """Log a confirmed bounce directly to level_outcomes (used when classify already ran)."""
+    import time as _time
+    from data.history import log_event, save_level_outcome
+
+    fill_depth_pct = (level - min_price) / level * 100 if min_price < level else 0.0
+    now = _time.time()
+    duration_minutes = int((now - touch_start_time) / 60) if touch_start_time > 0 else 0
+
+    event_type = "zakol" if fill_depth_pct >= 0.1 else "bounce"
+    await log_event(symbol, event_type,
+                    f"level={level} depth={fill_depth_pct:.2f}% (late confirm)")
+    await save_level_outcome(
+        symbol=symbol,
+        level=level,
+        level_type=level_type,
+        strength=strength,
+        approach_type="support",
+        vol_ratio=vol_ratio_at_touch,
+        touches=1,
+        result="отбой",
+        duration=duration_minutes,
+        outcome="bounce",
+        approach_style=approach_style,
+        vol_ratio_at_touch=vol_ratio_at_touch,
+        atr_ratio=atr_ratio,
+        fill_depth_pct=round(fill_depth_pct, 4),
+    )
 
 
 async def _classify_and_log_level_event(
@@ -434,6 +496,7 @@ async def _classify_and_log_level_event(
     details = None
 
     if returned_above:
+        # Price pierced level but came back — zakol
         if fill_depth_pct >= 1.0:
             retest_candles = post_touch[1:6]
             retest = any(
@@ -453,8 +516,9 @@ async def _classify_and_log_level_event(
             outcome = "bounce"
             details = f"level={level} depth={fill_depth_pct:.2f}%"
     else:
-        event_type = "bounce"
-        outcome = "bounce"
+        # Price went below level and didn't return in 5 candles — not a bounce
+        event_type = "no_return"
+        outcome = "partial"
         details = f"level={level} fill_depth={fill_depth_pct:.2f}%"
 
     await log_event(symbol, event_type, details)
