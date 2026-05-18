@@ -20,6 +20,10 @@ from constants import (
 )
 from logger import logger
 
+# Global cooldown tracking for pressure alerts
+_pressure_alert_sent: dict[str, float] = {}  # key: "SYMBOL_LEVEL" -> timestamp
+PRESSURE_ALERT_COOLDOWN = 3600  # 1 hour cooldown for pressure alerts
+
 
 async def _handle_sweep(symbol: str, level: float, level_side: str, c1m: list[dict]):
     reclaim_vol = c1m[-1]["volume"]
@@ -365,12 +369,11 @@ async def start_monitor(
             if is_sweep and not sweep_sent:
                 await _handle_sweep(symbol, level, level_side, c1m)
                 sweep_sent = True
-            elif not is_sweep:
-                sweep_sent = False
+                # Don't reset sweep_sent - it should only be sent once per monitoring session
 
         alert, alert_type = _check_complications(symbol, level, level_side, approach_warned, volume_spike_notified, engulf_sent, level_broken_sent, weak_breakout_sent)
         if alert:
-            await send_message(alert)
+            # Set flag BEFORE sending message to prevent race condition
             if alert_type == "pressure":
                 approach_warned = True
             elif alert_type == "volume_spike":
@@ -379,6 +382,9 @@ async def start_monitor(
                 engulf_sent = True
             elif alert_type == "level_broken":
                 level_broken_sent = True
+            
+            # Now send the message
+            await send_message(alert)
 
         await asyncio.sleep(COLLECTOR_UPDATE_INTERVAL_SECONDS)
 
@@ -551,9 +557,16 @@ def _check_complications(symbol: str, level: float, level_side: str, approach_wa
         return None, None
 
     if not approach_warned and not weak_breakout_active:
-        vol_trend = _check_volume_trend_approach(symbol, level, level_side)
-        if vol_trend:
-            return vol_trend, "pressure"
+        # Check cooldown for pressure alert
+        pressure_key = f"{symbol}_{level}"
+        now = time.time()
+        last_sent = _pressure_alert_sent.get(pressure_key, 0)
+        
+        if (now - last_sent) > PRESSURE_ALERT_COOLDOWN:
+            vol_trend = _check_volume_trend_approach(symbol, level, level_side)
+            if vol_trend:
+                _pressure_alert_sent[pressure_key] = now
+                return vol_trend, "pressure"
 
     if not level_broken_sent and not weak_breakout_active:
         broken = _check_level_broken(c1m, level)
@@ -651,12 +664,21 @@ def _check_volume_trend_approach(symbol: str, level: float, level_side: str = "s
         return None
 
     volumes = [c["volume"] for c in directional_candles]
+    
+    # Check if volumes are growing - need at least 2 consecutive increases
+    if len(volumes) < 3:
+        return None
+    
     growing = all(volumes[i] < volumes[i + 1] for i in range(len(volumes) - 1))
     if not growing:
         return None
 
     avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
     last_vol_ratio = round(volumes[-1] / avg_vol, 1) if avg_vol > 0 else 1.0
+    
+    # Only alert if volume ratio is significant (> 1.5x)
+    if last_vol_ratio < 1.5:
+        return None
 
     last_15m = c15m[-1]
     avg_15m = sum(c["volume"] for c in c15m[-20:]) / min(len(c15m), 20)

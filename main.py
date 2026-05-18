@@ -809,8 +809,15 @@ async def _proximity_loop():
                 # and hasn't already bounced (price still near or below level)
                 approaching = current_price > level  # price above support = approaching
                 cooldown_ok = (now - last_sent) > PROXIMITY_ALERT_COOLDOWN_SECONDS
+                
+                # Check if we're in proximity zone
+                in_proximity_zone = distance_pct <= PROXIMITY_ALERT_DISTANCE_PCT * 100
 
-                if distance_pct <= PROXIMITY_ALERT_DISTANCE_PCT * 100 and approaching and cooldown_ok:
+                # Only send alert if:
+                # 1. In proximity zone
+                # 2. Approaching from above
+                # 3. Cooldown passed OR never sent before
+                if in_proximity_zone and approaching and cooldown_ok:
                     await send_message(
                         f"🎯 {symbol} цена в {distance_pct:.2f}% от уровня {level} — готовь ордер"
                     )
@@ -819,6 +826,17 @@ async def _proximity_loop():
                                symbol=symbol, 
                                level=level, 
                                distance_pct=distance_pct)
+                
+                # Reset cooldown if price moved far away (> 5% from level)
+                # This allows re-alerting if price comes back after leaving
+                if distance_pct > 5.0 and task_key in state.proximity_notified:
+                    # Only reset if enough time passed (at least 1 hour)
+                    if (now - last_sent) > 3600:
+                        del state.proximity_notified[task_key]
+                        logger.debug("Proximity cooldown reset - price moved away",
+                                   symbol=symbol,
+                                   level=level,
+                                   distance_pct=distance_pct)
 
             # Track touches on weak (unmonitored) levels from cache
             from bot.telegram import _last_analysis_cache

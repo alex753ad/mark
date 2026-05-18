@@ -5,10 +5,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import asyncio
 
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, token_registry
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_PROXY, token_registry
 from logger import logger
 
-bot = Bot(token=TELEGRAM_TOKEN)
+# Bot will be initialized in start_bot() function
+bot = None
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -1073,7 +1074,44 @@ async def send_message(text: str):
 
 
 async def start_bot():
+    global bot
     from aiogram.types import BotCommand
+    
+    # Initialize bot with proxy support if configured
+    if TELEGRAM_PROXY:
+        logger.info("Using proxy for Telegram", proxy=TELEGRAM_PROXY)
+        
+        # For SOCKS5 proxy, we need aiohttp-socks
+        if TELEGRAM_PROXY.startswith("socks5://"):
+            try:
+                from aiohttp_socks import ProxyConnector
+                from aiogram.client.session.aiohttp import AiohttpSession
+                import aiohttp
+                
+                # Create connector with proxy inside async context
+                connector = ProxyConnector.from_url(TELEGRAM_PROXY)
+                
+                # Create custom session with connector
+                class ProxySession(AiohttpSession):
+                    def __init__(self):
+                        super().__init__()
+                        self._connector = connector
+                    
+                    async def create_session(self) -> aiohttp.ClientSession:
+                        return aiohttp.ClientSession(connector=self._connector)
+                
+                bot = Bot(token=TELEGRAM_TOKEN, session=ProxySession())
+                logger.info("SOCKS5 proxy configured successfully")
+            except ImportError:
+                logger.error("aiohttp-socks not installed. Install it: pip install aiohttp-socks")
+                bot = Bot(token=TELEGRAM_TOKEN)
+        else:
+            # For HTTP proxy, aiogram supports it natively
+            from aiogram.client.session.aiohttp import AiohttpSession
+            session = AiohttpSession(proxy=TELEGRAM_PROXY)
+            bot = Bot(token=TELEGRAM_TOKEN, session=session)
+    else:
+        bot = Bot(token=TELEGRAM_TOKEN)
 
     await bot.set_my_commands([
         BotCommand(command="add", description="Добавить монету — /add SYMBOL"),
@@ -1087,3 +1125,4 @@ async def start_bot():
 
     await bot.send_message(TELEGRAM_CHAT_ID, "Бот запущен", reply_markup=get_main_keyboard())
     await dp.start_polling(bot)
+

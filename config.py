@@ -11,6 +11,7 @@ load_dotenv()
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY")  # Optional proxy URL
 
 # File paths
 TOKENS_FILE = "tokens.json"
