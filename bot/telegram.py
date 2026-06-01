@@ -578,16 +578,31 @@ async def cmd_analyze(message: Message):
 
 
 async def _do_analyze(message: Message, symbol: str):
-    from data.collector import candles_1m
-    from data.collector import _parse_kline
+    from data.collector import candles_1m, candles_15m, _parse_kline
     from analysis.level_builder import build_levels
     from analysis.trigger import calculate_atr, _count_approaches, calculate_strength
     from binance import AsyncClient
 
     c1m = candles_1m.get(symbol)
     if not c1m:
-        await message.answer(f"{symbol} нет в коллекторе. Сначала /add {symbol} и подожди 10 сек", reply_markup=get_main_keyboard())
-        return
+        # Load on demand — don't make user wait and retry
+        loading_msg = await message.answer(f"⏳ Загружаю данные {symbol}...", reply_markup=get_main_keyboard())
+        try:
+            client = await AsyncClient.create()
+            try:
+                raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=500)
+                raw_1m  = await client.futures_klines(symbol=symbol, interval="1m",  limit=300)
+                candles_15m[symbol] = [_parse_kline(k) for k in raw_15m]
+                candles_1m[symbol]  = [_parse_kline(k) for k in raw_1m]
+                c1m = candles_1m[symbol]
+                logger.info("Candles loaded on-demand for analyze", symbol=symbol)
+            finally:
+                await client.close_connection()
+        except Exception as e:
+            await loading_msg.delete()
+            await message.answer(f"{symbol} — не удалось загрузить данные: {e}", reply_markup=get_main_keyboard())
+            return
+        await loading_msg.delete()
 
     current_price = c1m[-1]["close"]
     atr = calculate_atr(symbol)
@@ -595,12 +610,12 @@ async def _do_analyze(message: Message, symbol: str):
         await message.answer(f"{symbol} — недостаточно данных для ATR", reply_markup=get_main_keyboard())
         return
 
-    # Подгружаем расширенную историю для покрытия диапазона 20%
+    # Подгружаем расширенную историю для покрытия диапазона 40%
     try:
         client = await AsyncClient.create()
         try:
-            raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=1000)
-            raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=500)
+            raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=1500)
+            raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=1000)
             ext_c1m = [_parse_kline(k) for k in raw_1m]
             ext_c15m = [_parse_kline(k) for k in raw_15m]
         finally:
@@ -614,7 +629,7 @@ async def _do_analyze(message: Message, symbol: str):
         await message.answer(f"{symbol} — уровни не найдены", reply_markup=get_main_keyboard())
         return
 
-    range_limit = current_price * 0.20
+    range_limit = current_price * 0.40
     supports = [
         lvl for lvl in all_levels
         if lvl["level"] < current_price and (current_price - lvl["level"]) <= range_limit
@@ -633,7 +648,7 @@ async def _do_analyze(message: Message, symbol: str):
             lvl["verdict"] = lvl_copy["verdict"]
         broken_strong = [lvl for lvl in broken_levels if lvl["strength"] >= 4]
 
-        text = f"{symbol} — нет поддержек в диапазоне 20% от цены"
+        text = f"{symbol} — нет поддержек в диапазоне 40% от цены"
         if broken_strong:
             from analysis.trigger import get_breakout_info
             text += "\n\nПробитые уровни:"
@@ -724,36 +739,62 @@ async def _do_analyze(message: Message, symbol: str):
         for lvl in filtered:
             calculate_strength(lvl)
 
+    # ML scoring
+    try:
+        from analysis.ml_score import apply_ml_to_level
+        for lvl in filtered:
+            apply_ml_to_level(lvl)
+    except Exception as e:
+        logger.warning("ml_score failed in analyze: %s", e)
+
     strong = [lvl for lvl in filtered if lvl["strength"] >= 4]
-    weak = [lvl for lvl in filtered if lvl["strength"] < 4]
+    average = [lvl for lvl in filtered if lvl["strength"] == 3]
+    weak = [lvl for lvl in filtered if lvl["strength"] < 3]
 
     strong_sorted = sorted(strong, key=lambda l: l["strength"], reverse=True)
+    average_sorted = sorted(average, key=lambda l: l["level"], reverse=True)
 
     atr_pct = (atr / current_price) * 100
     header = (
-        f"🔍 {symbol} — поддержки в диапазоне 20%\n"
+        f"🔍 {symbol} — поддержки в диапазоне 40%\n"
         f"   Цена: {current_price} | ATR: {atr_pct:.2f}%\n"
     )
 
     lines = []
+    # Show Strong levels
     for lvl in strong_sorted:
         stars = "⭐️" * lvl["strength"]
         distance = current_price - lvl["level"]
         close_mark = "  (близко)" if distance < atr * 3 else ""
-        
-        # Main level line
-        level_info = f"{stars} {lvl['level']} — {lvl['type']}, {lvl.get('position', '?')}, подход {lvl.get('approach', 1)}{close_mark}"
-        lines.append(level_info)
-        
-        # Add Claude's reasoning if available
+        lines.append(f"{stars} {lvl['level']} — {lvl['type']}, {lvl.get('position', '?')}, подход {lvl.get('approach', 1)}{close_mark}")
         if lvl.get("claude_reason"):
             lines.append(f"   💭 {lvl['claude_reason']}")
+        p_b = lvl.get("p_bounce")
+        e_d = lvl.get("expected_depth")
+        if p_b is not None:
+            depth_str = f" | прокол ~{e_d:.1f}%" if e_d is not None else ""
+            ml_delta = lvl.get("ml_delta", 0)
+            delta_str = f" | ML: {ml_delta:+d}" if ml_delta != 0 else ""
+            lines.append(f"   🤖 P(отбой): {p_b:.0%}{depth_str}{delta_str}")
+
+    # Show Average levels if there are no strong ones or just to provide more info
+    if average_sorted:
+        if lines:
+            lines.append("\n⚖️ Средние уровни:")
+        else:
+            lines.append("⚖️ Средние уровни (4-5⭐️ не найдены):")
+            
+        for lvl in average_sorted:
+            stars = "⭐️" * 3
+            lines.append(f"{stars} {lvl['level']} — {lvl['type']}, подход {lvl.get('approach', 1)}")
+            if lvl.get("claude_reason"):
+                lines.append(f"   💭 {lvl['claude_reason']}")
 
     text = header + "\n".join(lines)
 
     if weak:
         weak_str = ", ".join(str(lvl["level"]) for lvl in weak)
-        text += f"\n——————————\nСлабые: {weak_str}"
+        text += f"\n——————————\nСлабые (1-2⭐️): {weak_str}"
 
     # Save all levels (strong + weak) to cache for quick check access
     _last_analysis_cache[symbol] = [
@@ -766,7 +807,9 @@ async def _do_analyze(message: Message, symbol: str):
     try:
         from analysis.chart import generate_chart
         from aiogram.types import BufferedInputFile
-        chart_bytes = generate_chart(symbol, strong_sorted, c15m_override=ext_c15m)
+        # Pass both strong and average levels to be drawn on chart
+        chart_levels = strong_sorted + average_sorted
+        chart_bytes = generate_chart(symbol, chart_levels, c15m_override=ext_c15m)
         if chart_bytes:
             await message.answer_photo(BufferedInputFile(chart_bytes, filename=f"{symbol}.png"))
     except Exception:
@@ -783,9 +826,20 @@ async def _do_analyze(message: Message, symbol: str):
         # Find nearest strong level to current price
         nearest = min(strong, key=lambda l: abs(current_price - l["level"]))
         level_side = "support" if current_price > nearest["level"] else "resistance"
-        task_key = sym_state.make_task_key(nearest["level"])
+        
+        # Check if we already have a monitor for this symbol near this price (within 1.5 ATR)
+        already_monitored = False
+        threshold = atr * 1.5
+        for task_key in sym_state.tasks:
+            try:
+                monitored_level = float(task_key.split("_")[-1])
+                if abs(monitored_level - nearest["level"]) <= threshold:
+                    already_monitored = True
+                    break
+            except Exception:
+                continue
 
-        if task_key not in sym_state.tasks:
+        if not already_monitored:
             task = asyncio.create_task(
                 _monitored(symbol, nearest["level"], level_side,
                            level_type=nearest["type"],
@@ -800,8 +854,18 @@ async def _do_analyze(message: Message, symbol: str):
             logger.info("Auto-monitoring started from analyze",
                        symbol=symbol, level=nearest["level"])
         else:
+            # Find the actual level being monitored for the message
+            m_level = nearest["level"]
+            for task_key in sym_state.tasks:
+                try:
+                    lvl = float(task_key.split("_")[-1])
+                    if abs(lvl - nearest["level"]) <= threshold:
+                        m_level = lvl
+                        break
+                except Exception: continue
+                
             await message.answer(
-                f"👁 Мониторинг уже активен: {symbol} @ {nearest['level']}",
+                f"👁 Мониторинг уже активен: {symbol} @ {m_level}",
                 reply_markup=get_main_keyboard()
             )
 
@@ -828,13 +892,25 @@ async def _do_check(message: Message, symbol: str, level: float):
 
     from analysis.trigger import calculate_atr, calculate_atr_pct, _calc_vol_ratio, _count_approaches, get_level_history, find_real_level, calculate_strength
     from analysis.level_builder import build_levels
-    from data.collector import candles_1m, candles_15m
+    from data.collector import candles_1m, candles_15m, _parse_kline
     from ai.claude_client import analyze_levels
 
     c1m = candles_1m.get(symbol)
     if not c1m:
-        await message.answer(f"{symbol} нет в коллекторе. Сначала /add {symbol} и подожди 10 сек", reply_markup=get_main_keyboard())
-        return
+        try:
+            from binance import AsyncClient
+            client = await AsyncClient.create()
+            try:
+                raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=500)
+                raw_1m  = await client.futures_klines(symbol=symbol, interval="1m",  limit=300)
+                candles_15m[symbol] = [_parse_kline(k) for k in raw_15m]
+                candles_1m[symbol]  = [_parse_kline(k) for k in raw_1m]
+                c1m = candles_1m[symbol]
+            finally:
+                await client.close_connection()
+        except Exception as e:
+            await message.answer(f"{symbol} — не удалось загрузить данные: {e}", reply_markup=get_main_keyboard())
+            return
 
     original_level = level
     real_level, touch_count = find_real_level(symbol, level)
@@ -908,7 +984,6 @@ async def _do_check(message: Message, symbol: str, level: float):
     # Claude strength (same system as /analyze)
     from constants import CLAUDE_STRENGTH_ENABLED
     from analysis.claude_strength import calculate_strength_with_claude
-
     c15m_data = candles_15m.get(symbol, [])
     poc_price = next((l["level"] for l in all_levels if l.get("poc_aligned")), None)
 
@@ -922,6 +997,13 @@ async def _do_check(message: Message, symbol: str, level: float):
                 lvl_data["strength"] = min(lvl_data["strength"], py)
         except Exception as e:
             logger.error("Claude failed in check", error=str(e))
+
+    # ML scoring
+    try:
+        from analysis.ml_score import apply_ml_to_level
+        apply_ml_to_level(lvl_data)
+    except Exception as e:
+        logger.warning("ml_score failed in check: %s", e)
 
     # Get profile context for reason/grid_advice/confidence
     from analysis.trigger import detect_approach_style, calculate_atr_ratio, get_vol_ratio_current
@@ -959,12 +1041,22 @@ async def _do_check(message: Message, symbol: str, level: float):
     elif touch_count == 0:
         header += f"\n   🔍 Кластер касаний не найден — оцениваю как указано"
 
+    p_bounce = r.get("p_bounce")
+    expected_depth = r.get("expected_depth")
+    ml_line = ""
+    if p_bounce is not None:
+        depth_str = f" | прокол ~{expected_depth:.1f}%" if expected_depth is not None else ""
+        ml_delta = r.get("ml_delta", 0)
+        delta_str = f" | ML: {ml_delta:+d}" if ml_delta != 0 else ""
+        ml_line = f"\n   🤖 P(отбой): {p_bounce:.0%}{depth_str}{delta_str}"
+
     text = (
         f"{header}\n"
         f"   Сила: {r.get('strength', '?')} {stars}\n"
         f"   Вердикт: {r.get('verdict', '?')}\n"
         f"   Причина: {r.get('reason', '?')}\n"
         f"   Подход: {approach} | Vol ratio: {vol_ratio}"
+        f"{ml_line}"
     )
     if zone_approaches >= 1:
         text += f"\n   Зона: {zone_approaches} подходов в радиусе {atr_pct:.2f}%"
@@ -994,14 +1086,44 @@ async def _do_check(message: Message, symbol: str, level: float):
         current_price = c1m[-1]["close"]
         level_side = "support" if current_price > level else "resistance"
         sym_state = state_manager.get_state(symbol)
-        task_key = sym_state.make_task_key(level)
-        if task_key in sym_state.tasks:
-            await message.answer(f"⚠️ Мониторинг {symbol} @ {level} уже активен")
+        
+        # Check if we already have a monitor for this symbol near this price (within 1.5 ATR)
+        already_monitored = False
+        threshold = atr * 1.5
+        for task_key in sym_state.tasks:
+            try:
+                monitored_level = float(task_key.split("_")[-1])
+                if abs(monitored_level - level) <= threshold:
+                    already_monitored = True
+                    break
+            except Exception:
+                continue
+
+        if already_monitored:
+            # Find the actual level being monitored for the message
+            m_level = level
+            for task_key in sym_state.tasks:
+                try:
+                    lvl = float(task_key.split("_")[-1])
+                    if abs(lvl - level) <= threshold:
+                        m_level = lvl
+                        break
+                except Exception: continue
+            await message.answer(f"⚠️ Мониторинг {symbol} @ {m_level} уже активен")
         else:
-            task = asyncio.create_task(_monitored(symbol, level, level_side,
-                                                   strength=r.get("strength", 0)))
+            task = asyncio.create_task(
+                _monitored(symbol, level, level_side,
+                           level_type=match["type"],
+                           strength=r.get("strength", 0))
+            )
             sym_state.add_task(level, task)
-            await message.answer(f"👁 Мониторинг {symbol} @ {level} запущен")
+            sym_state.phase = "phase2"
+            await message.answer(
+                f"👁 Мониторинг запущен: {symbol} @ {level}",
+                reply_markup=get_main_keyboard()
+            )
+            logger.info("Monitoring started from check",
+                       symbol=symbol, level=level)
 
 
 @router.message(Command("monitors"))

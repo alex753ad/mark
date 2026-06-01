@@ -25,6 +25,8 @@
    - [analysis/monitor.py](#analysismonitorpy)
    - [analysis/chart.py](#analysischartpy)
    - [analysis/chart_ascii.py](#analysischart_asciipy)
+   - [analysis/screener.py](#analysisscreenerpy)
+   - [analysis/ml_score.py](#analysisml_scorepy)
    - [analysis/claude_strength.py](#analysisclaude_strengthpy)
    - [ai/claude_client.py](#aiclaude_clientpy)
    - [bot/telegram.py](#bottelegrampy)
@@ -69,7 +71,13 @@ trading_bot/
 │   ├── screener.py               # Скринер рынка: run_screener() + _format_vol()
 │   ├── chart.py                  # PNG-график: свечи + VWAP + Volume Profile + уровни
 │   ├── chart_ascii.py            # ASCII-график для промпта Claude
-│   └── claude_strength.py        # Claude Haiku: оценка силы уровней по ASCII-графику
+│   ├── ml_score.py               # ML-оценка: p_bounce, expected_depth, ml_delta (±1 к strength)
+│   ├── claude_strength.py        # Claude Haiku: оценка силы уровней по ASCII-графику
+│   └── ml/                       # Обученные sklearn-модели (pickle)
+│       ├── clf.pkl               # RandomForest классификатор (bounce/breakout)
+│       ├── reg.pkl               # Регрессор глубины пробоя (expected_depth %)
+│       ├── label_encoder.pkl     # LabelEncoder классов исхода
+│       └── level_type_map.pkl    # Маппинг типов уровней → int
 │
 ├── ai/
 │   └── claude_client.py          # Claude Haiku: reason + grid_advice + confidence
@@ -95,6 +103,9 @@ trading_bot/
 | `loguru` | — | Структурированный логгинг |
 | `numpy` | — | Расчёты для графиков |
 | `matplotlib` | — | Генерация PNG-графиков |
+| `pillow` | — | Работа с изображениями |
+| `aiohttp` + `aiohttp-socks` | — | HTTP/SOCKS5 для WebSocket и proxy |
+| `scikit-learn` | — | ML-модели (pickle): RandomForest + LabelEncoder для `ml_score` |
 
 Всё работает на **asyncio** — один event loop для всех компонентов.
 
@@ -108,13 +119,14 @@ trading_bot/
 CLAUDE_API_KEY=sk-ant-...    # Ключ Anthropic API
 TELEGRAM_TOKEN=...           # Telegram Bot Token
 TELEGRAM_CHAT_ID=...         # Chat ID для авторизации (int)
+TELEGRAM_PROXY=socks5://...  # Опциональный прокси (SOCKS5 или HTTP)
 ```
 
 ### config.py
 
 - Загружает `.env` через `python-dotenv`
-- Экспортирует: `CLAUDE_API_KEY`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`
-- Пути к файлам: `TOKENS_FILE`, `TRIGGER_TIMES_FILE`, `HISTORY_DB_FILE`
+- Экспортирует: `CLAUDE_API_KEY`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_PROXY`
+- Пути к файлам: `TOKENS_FILE`, `TRIGGER_TIMES_FILE`, `HISTORY_DB_FILE`, `ACTIVE_MONITORS_FILE`
 - `TokenRegistry` — singleton для CRUD над `tokens.json`:
   - `get_all()` → `list[str]`
   - `add(symbol)` — добавляет и сохраняет
@@ -374,9 +386,11 @@ Singleton: `state_manager = StateManager()`
 | `CLAUDE_API_KEY` | Из `.env` |
 | `TELEGRAM_TOKEN` | Из `.env` |
 | `TELEGRAM_CHAT_ID` | Из `.env`, приводится к `int` |
+| `TELEGRAM_PROXY` | Из `.env`, опционально (SOCKS5/HTTP для Claude + Telegram клиентов) |
 | `TOKENS_FILE` | `"tokens.json"` |
 | `TRIGGER_TIMES_FILE` | `"trigger_times.json"` |
 | `HISTORY_DB_FILE` | `"history.db"` |
+| `ACTIVE_MONITORS_FILE` | `"active_monitors.json"` |
 | `TokenRegistry` | Класс: `_load()`, `_save()`, `get_all()`, `add()`, `remove()`, `contains()` |
 | `token_registry` | Глобальный singleton `TokenRegistry()` |
 | `validate_config()` | Проверяет наличие всех ключей, возвращает `bool` |
@@ -803,6 +817,83 @@ Clamp: strength = max(1, min(5, strength))
 
 ---
 
+### analysis/screener.py
+
+**Назначение:** сканирование всех фьючерсов Binance по критериям роста и волатильности.
+
+**Функции:**
+
+| Функция | Описание |
+|---------|----------|
+| `run_screener() -> list[tuple]` | Async. Запрашивает 24h-тикеры Binance, фильтрует, считает NATR(5M). Возвращает `list[(ticker, chg, natr, vol, symbol)]`, сортировка по росту |
+| `_format_vol(v: float) -> str` | Форматирует объём: `40123456 → "40M"`, `1234567890 → "1.2B"` |
+
+**Логика фильтрации:**
+
+```python
+# 1. symbol.endswith("USDT")
+# 2. quoteVolume > SCREENER_MIN_VOLUME_USD   (40M по умолчанию)
+# 3. priceChangePercent > SCREENER_MIN_GROWTH_PCT  (10%)
+# 4. NATR(5M, 14 свечей) > SCREENER_MIN_NATR  (2.0)
+# Сортировка: по росту descending
+```
+
+**Используется из:**
+- `main.py` — `_send_startup_screener()`, `_auto_screener_loop()`
+- `bot/telegram.py` — кнопка 📊 Рынок
+
+---
+
+### analysis/ml_score.py
+
+**Назначение:** ML-слой оценки поддержек. Дополняет `calculate_strength()` статистической поправкой на основе обученных моделей из исторических исходов.
+
+**Модели** (файлы `analysis/ml/`):
+
+| Файл | Содержимое |
+|------|-----------|
+| `clf.pkl` | Классификатор (RandomForest) — предсказывает исход: `bounce` / `breakout` / другое |
+| `reg.pkl` | Регрессор — предсказывает глубину пробоя в % (`expected_depth`) |
+| `label_encoder.pkl` | `LabelEncoder` для классов исхода |
+| `level_type_map.pkl` | Словарь `{level_type_str: int}` для энкодинга типа уровня |
+
+**Признаки модели:**
+
+| Признак | Описание |
+|---------|----------|
+| `strength` | Python-сила уровня (1-5) |
+| `ltype_enc` | Тип уровня (закодированный) |
+| `vol` | `vol_ratio` (обрезается до 20) |
+| `touches` | Число касаний / подходов |
+| `atr_ratio` | Расстояние до уровня в ATR (обрезается до 20) |
+
+**Функции:**
+
+| Функция | Описание |
+|---------|----------|
+| `ml_score(lvl: dict) -> dict` | Считает `{p_bounce, expected_depth, ml_delta}`. При недоступных моделях возвращает нейтраль `{p_bounce=0.5, expected_depth=1.5, ml_delta=0}` |
+| `apply_ml_to_level(lvl: dict) -> None` | Вызывается после `calculate_strength(lvl)`. Применяет `ml_delta` к `strength`, добавляет `p_bounce`, `expected_depth`, `strength_pre_ml` |
+| `_load() -> bool` | Lazy-загрузка pickle-файлов. Повторные вызовы — no-op. |
+
+**`ml_delta` логика:**
+
+```python
+if p_bounce >= 0.72:   ml_delta = +1
+elif p_bounce <= 0.40: ml_delta = -1
+else:                  ml_delta =  0
+
+strength = max(1, min(5, strength + ml_delta))
+```
+
+**Пример вызова (в trigger.py / main.py):**
+
+```python
+calculate_strength(lvl)
+apply_ml_to_level(lvl)  # мутирует lvl на месте
+```
+
+---
+
 ### analysis/claude_strength.py
 
 **`calculate_strength_with_claude(symbol, c15m, levels, poc_price=None) -> list[dict]`**
@@ -956,6 +1047,7 @@ Telegram-бот на **aiogram v3** с FSM, inline-кнопками и Reply-к�
 |------------|-----|----------|
 | `claude_semaphore` | `Semaphore(2)` | Лимит параллельных запросов к Claude |
 | `_building_levels` | `set[str]` | Символы, для которых сейчас строятся уровни |
+| `_previous_levels` | `dict[str, float]` | При замене монитора более близким уровнем сохраняет старый. После пробоя нового — старый становится следующим кандидатом для `_start_next_level_after_breakout`. |
 
 **Запуск (`asyncio.gather`):**
 
@@ -1029,6 +1121,8 @@ async def main():
 |---------|----------|
 | `load_trigger_times()` | Читает `trigger_times.json` |
 | `save_trigger_times(data)` | Пишет `trigger_times.json` |
+| `save_active_monitors()` | Сериализует активные мониторы (`state_manager`) в `active_monitors.json` |
+| `load_active_monitors()` | Читает `active_monitors.json` → `list[{symbol, level}]` для восстановления после рестарта |
 | `_format_vol(v)` | `1234567 → "1M"`, `1234567890 → "1.2B"` |
 | `_run_screener()` | Сканирование рынка → list[(ticker, chg, natr, vol, symbol)] |
 | `cancel_tasks_for_symbol(symbol)` | Отменяет все задачи символа |
@@ -1039,7 +1133,7 @@ async def main():
 
 ## Система оценки силы уровней
 
-Два независимых метода оценки:
+Три метода оценки, применяемых последовательно:
 
 ### 1. Python (`trigger.py :: calculate_strength`)
 
@@ -1049,7 +1143,18 @@ async def main():
 - Стартовом мониторинге (_startup_monitoring)
 - Fallback при ошибке Claude
 
-### 2. Claude Haiku (`claude_strength.py :: calculate_strength_with_claude`)
+### 2. ML-модель (`ml_score.py :: apply_ml_to_level`)
+
+Статистическая поправка на основе обученных моделей из исторических исходов.
+Применяется **после** `calculate_strength()` и **до** Claude.
+Используется при:
+- Автоматических триггерах (_run_phase1)
+- Auto-screener (_auto_screener_loop)
+- `/analyze SYMBOL` (ручной анализ)
+
+Добавляет в уровень: `p_bounce`, `expected_depth`, `strength_pre_ml`, корректирует `strength` на ±1.
+
+### 3. Claude Haiku (`claude_strength.py :: calculate_strength_with_claude`)
 
 Анализ ASCII-графика и метаданных уровней.
 Используется при:
@@ -1057,7 +1162,7 @@ async def main():
 - `/check SYMBOL LEVEL` (ручная проверка)
 - Auto-screener (новые символы)
 
-### Взаимодействие Python и Claude
+### Взаимодействие Python → ML → Claude
 
 ```
 Python calculate_strength()
@@ -1066,6 +1171,12 @@ Python calculate_strength()
     python_strength (сохраняется)
           │
           ▼
+apply_ml_to_level()   ← p_bounce, expected_depth, ml_delta (±1)
+          │
+          ▼
+    strength после ML
+          │
+          ▼ (только при ручном анализе / screener)
 Claude calculate_strength_with_claude()
           │
           ▼
@@ -1076,7 +1187,7 @@ Claude calculate_strength_with_claude()
          strength = min(claude_strength, python_strength)
 ```
 
-Python выступает как **верхняя граница** для проблемных уровней — Claude не может завысить оценку, если уровень уже тестировался или был пробит.
+Python выступает как **верхняя граница** для проблемных уровней — Claude не может завысить оценку, если уровень уже тестировался или был пробит. ML работает всегда и не имеет ограничений по cap.
 
 ---
 
@@ -1377,6 +1488,11 @@ python main.py
 | `tokens.json` | Активные монеты: `["BUSDT", "TRUTHUSDT", ...]` |
 | `history.db` | SQLite: outcomes, profiles, events |
 | `debug_gtc.py` | Отладочный скрипт |
+| `check_bot_status.py` | Скрипт проверки состояния бота |
 | `test_claude_strength.py` | Тест Claude strength |
 | `analysis/level_builder_backup.py` | Бэкап старого level_builder |
 | `analysis/level_builder_simple.py` | Упрощённая версия level_builder |
+| `analysis/ml/clf.pkl` | Обученный классификатор (bounce/breakout) |
+| `analysis/ml/reg.pkl` | Обученный регрессор (expected_depth) |
+| `analysis/ml/label_encoder.pkl` | Энкодер классов исхода |
+| `analysis/ml/level_type_map.pkl` | Маппинг типов уровней → int |

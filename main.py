@@ -199,6 +199,13 @@ async def _auto_screener_loop():
                                 if lvl.get("approach", 0) >= 2 or (lvl.get("was_broken") and not lvl.get("sweep_reclaimed")):
                                     lvl["strength"] = min(lvl["strength"], py)
 
+                            try:
+                                from analysis.ml_score import apply_ml_to_level
+                                for lvl in supports:
+                                    apply_ml_to_level(lvl)
+                            except Exception as _e:
+                                logger.warning("ml_score failed in screener: %s", _e)
+
                             strong = [l for l in supports if l["strength"] >= 3]
                             if not strong:
                                 await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Нет сильных уровней (strength < 4), мониторинг не запущен")
@@ -333,6 +340,13 @@ async def _run_phase1(symbol: str):
                 lvl.update(get_level_history(symbol, lvl["level"], atr))
             calculate_strength(lvl)
 
+        try:
+            from analysis.ml_score import apply_ml_to_level
+            for lvl in levels:
+                apply_ml_to_level(lvl)
+        except Exception as _e:
+            logger.warning("ml_score failed in phase loop: %s", _e)
+
         # --- Stop stale monitors (levels now outside -20% range) ---
         if was_in_phase2 and current_price > 0:
             range_low = current_price * 0.80
@@ -449,6 +463,17 @@ async def _run_phase1(symbol: str):
         stars = "⭐️" * nearest["strength"] if nearest["strength"] > 0 else "☆"
         dist_pct = (current_price - nearest["level"]) / current_price * 100
 
+        # Пересчитываем ML с реальными значениями прямо перед отправкой
+        try:
+            real_atr_ratio = calculate_atr_ratio(symbol, nearest["level"])
+            real_vol_ratio = get_vol_ratio_current(symbol)
+            nearest["atr_ratio"] = real_atr_ratio
+            nearest["vol_ratio"] = real_vol_ratio
+            from analysis.ml_score import apply_ml_to_level
+            apply_ml_to_level(nearest)
+        except Exception as _e:
+            logger.warning("ml_score pre-message recalc failed: %s", _e)
+
         if was_in_phase2:
             text = (
                 f"📋 {symbol} новый уровень после пампа\n"
@@ -461,6 +486,11 @@ async def _run_phase1(symbol: str):
             )
         if zone_approaches >= 1:
             text += f"   ⚠️ Зона тестировалась {zone_approaches} раз(а)\n"
+        p_b = nearest.get("p_bounce")
+        e_d = nearest.get("expected_depth")
+        if p_b is not None:
+            depth_str = f" | прокол ~{e_d:.1f}%" if e_d is not None else ""
+            text += f"   🤖 P(отбой): {p_b:.0%}{depth_str}\n"
         text += f"\n   Жду цену на {nearest['level']}..."
 
         await send_message(text)
@@ -589,12 +619,24 @@ async def _monitored(symbol: str, level: float, level_side: str,
     finally:
         state.remove_task(task_key)
 
-        # On breakout — immediately look for next level below, regardless of other active monitors
-        if reason == "breakout" and token_registry.contains(symbol):
+        # Route to next monitor based on direction and outcome
+        if token_registry.contains(symbol):
             try:
-                await _start_next_level_after_breakout(symbol, level)
+                if reason == "breakout" and level_side == "support":
+                    # Support broken → next support below
+                    await _start_next_level_after_breakout(symbol, level)
+                elif reason == "breakout" and level_side == "resistance":
+                    # Resistance broken → next resistance above
+                    await _start_resistance_after_bounce(symbol, level)
+                elif outcome == "bounce" and level_side == "support":
+                    # Bounced up from support → monitor resistance above
+                    await _start_resistance_after_bounce(symbol, level)
+                elif outcome == "bounce" and level_side == "resistance":
+                    # Rejected at resistance → back to support below
+                    await _start_next_level_after_breakout(symbol, level)
             except Exception as e:
-                logger.exception("Error finding next level after breakout", symbol=symbol, error=str(e))
+                logger.exception("Error routing next monitor", symbol=symbol,
+                                 level=level, reason=reason, level_side=level_side)
 
         # Update phase
         if not state.has_active_tasks():
@@ -694,6 +736,13 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
                 lvl.update(get_level_history(symbol, lvl["level"], atr))
             calculate_strength(lvl)
 
+        try:
+            from analysis.ml_score import apply_ml_to_level
+            for lvl in rebuild_candidates:
+                apply_ml_to_level(lvl)
+        except Exception as _e:
+            logger.warning("ml_score failed in rebuild: %s", _e)
+
         strong = [l for l in rebuild_candidates if l["strength"] >= 3]
         if strong:
             nearest = min(strong, key=lambda l: abs(current_price - l["level"]))
@@ -752,6 +801,98 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
             logger.error("Failed to check screener after breakout", symbol=symbol, error=str(e))
 
 
+def _find_resistance_above(symbol: str, current_price: float, atr: float) -> dict | None:
+    """Find nearest resistance level above current price.
+
+    Sources (in priority order):
+    1. Cached levels from last /analyze that are above current price
+    2. 1M wick highs above current price (clustered)
+    """
+    from data.collector import candles_1m as _c1m
+    from bot.telegram import _last_analysis_cache
+
+    zone_high = current_price * 1.20
+    radius    = max(atr * 2, current_price * 0.005)
+    candidates: list[dict] = []
+
+    # 1. Cache (levels shown by /analyze — may include POC above price)
+    for lvl in _last_analysis_cache.get(symbol, []):
+        price = lvl["level"]
+        if current_price < price <= zone_high:
+            candidates.append({
+                "level":    price,
+                "type":     lvl.get("type", "body_level"),
+                "strength": lvl.get("strength", 3),
+            })
+
+    # 2. 1M wick highs
+    c1m = _c1m.get(symbol, [])
+    if c1m:
+        highs = [c["high"] for c in c1m[-300:] if current_price < c["high"] <= zone_high]
+        used: set[int] = set()
+        for i, h in enumerate(highs):
+            if i in used:
+                continue
+            cluster = [h]
+            for j, h2 in enumerate(highs):
+                if j != i and j not in used and abs(h2 - h) <= radius:
+                    cluster.append(h2)
+                    used.add(j)
+            used.add(i)
+            if len(cluster) >= 2:
+                avg = sum(cluster) / len(cluster)
+                candidates.append({"level": avg, "type": "wick_level", "strength": 3})
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: c["level"] - current_price)
+
+
+async def _start_resistance_after_bounce(symbol: str, support_level: float) -> None:
+    """After a bounce from support (or breakout of resistance), monitor the nearest resistance above."""
+    from data.collector import candles_1m as _c1m
+    from analysis.trigger import calculate_atr
+
+    if not token_registry.contains(symbol):
+        return
+
+    state = state_manager.get_state(symbol)
+    c1m   = _c1m.get(symbol, [])
+    if not c1m:
+        return
+
+    current_price = c1m[-1]["close"]
+    atr           = calculate_atr(symbol)
+    resistance    = _find_resistance_above(symbol, current_price, atr)
+
+    if not resistance:
+        logger.info("No resistance found after bounce", symbol=symbol, support=support_level)
+        return
+
+    task_key = state.make_task_key(resistance["level"])
+    if task_key in state.tasks:
+        return
+
+    task = asyncio.create_task(
+        _monitored(symbol, resistance["level"], "resistance",
+                   level_type=resistance["type"],
+                   strength=resistance.get("strength", 3))
+    )
+    state.add_task(resistance["level"], task)
+    state.phase = "phase2"
+
+    stars = "⭐️" * resistance.get("strength", 3)
+    await send_message(
+        f"🔺 {symbol} сопротивление после отскока\n"
+        f"   {stars} {resistance['level']} — {resistance['type']}\n"
+        f"👁 Мониторинг запущен"
+    )
+    await log_event(symbol, "monitoring_start",
+                    f"level={resistance['level']} side=resistance (after bounce from {support_level})")
+    logger.info("Resistance monitor started", symbol=symbol,
+                resistance=resistance["level"], from_support=support_level)
+
+
 def cancel_tasks_for_symbol(symbol: str):
     """Cancel all monitoring tasks for a symbol."""
     state = state_manager.get_state(symbol)
@@ -764,6 +905,68 @@ def clear_analysis_cache(symbol: str):
     state = state_manager.get_state(symbol)
     state.clear_analyzed_levels()
     logger.info("Analysis cache cleared", symbol=symbol)
+
+
+async def _stale_monitor_loop() -> None:
+    """Every 5 minutes: cancel monitors that drifted >10% from price and rebuild levels.
+
+    Handles the case where price pumped far away from an old support level but
+    no new trigger fired, so _run_phase1 was never called to find a closer level.
+    """
+    STALE_PCT   = 10.0   # cancel if level is more than 10% from current price
+    INTERVAL    = 300    # check every 5 minutes
+
+    await asyncio.sleep(90)  # let startup settle first
+    while True:
+        try:
+            stale_symbols: set[str] = set()
+            all_tasks = state_manager.get_all_active_tasks()
+
+            for task_key, task in list(all_tasks.items()):
+                parts = task_key.rsplit("_", 1)
+                if len(parts) != 2:
+                    continue
+                symbol, level_str = parts
+                try:
+                    level = float(level_str)
+                except ValueError:
+                    continue
+
+                c1m = candles_1m.get(symbol, [])
+                if not c1m or level == 0:
+                    continue
+
+                current_price = c1m[-1]["close"]
+                if current_price == 0:
+                    continue
+
+                distance_pct = abs(current_price - level) / level * 100
+                if distance_pct <= STALE_PCT:
+                    continue
+
+                # Cancel stale monitor
+                state   = state_manager.get_state(symbol)
+                stop_ev = state.stop_flags.get(task_key)
+                if stop_ev:
+                    stop_ev.set()
+                if not task.done():
+                    task.cancel()
+                state.remove_task(task_key)
+                stale_symbols.add(symbol)
+                logger.info("Stale monitor cancelled — rebuilding",
+                            symbol=symbol, level=level,
+                            current=current_price, distance_pct=round(distance_pct, 1))
+
+            # Trigger level rebuild for each affected symbol
+            for symbol in stale_symbols:
+                if symbol not in _building_levels and token_registry.contains(symbol):
+                    await asyncio.sleep(0.3)
+                    asyncio.create_task(_run_phase1(symbol))
+
+        except Exception:
+            logger.exception("Error in stale monitor loop")
+
+        await asyncio.sleep(INTERVAL)
 
 
 async def _proximity_loop():
@@ -966,31 +1169,42 @@ async def _startup_monitoring():
 
         if saved_monitors:
             logger.info("Restoring saved monitors", count=len(saved_monitors))
+
+            # Group by symbol — only restore the nearest level to current price
+            from collections import defaultdict
+            by_symbol: dict[str, list[float]] = defaultdict(list)
             for entry in saved_monitors:
-                sym = entry.get("symbol")
+                sym   = entry.get("symbol")
                 level = entry.get("level")
-                if not sym or not level or sym not in tokens:
-                    continue
+                if sym and level and sym in tokens:
+                    by_symbol[sym].append(float(level))
+
+            for sym, levels in by_symbol.items():
                 try:
-                    # Load candles if not already loaded
                     if sym not in candles_1m or not candles_1m[sym]:
                         raw_15m = await client.futures_klines(symbol=sym, interval="15m", limit=500)
                         raw_1m  = await client.futures_klines(symbol=sym, interval="1m",  limit=300)
                         candles_15m[sym] = [_parse_kline(k) for k in raw_15m]
                         candles_1m[sym]  = [_parse_kline(k) for k in raw_1m]
 
+                    c1m = candles_1m.get(sym, [])
+                    current_price = c1m[-1]["close"] if c1m else 0
+                    nearest_level = min(levels, key=lambda l: abs(current_price - l)) if current_price > 0 else levels[0]
+
                     sym_state = state_manager.get_state(sym)
-                    task_key = sym_state.make_task_key(level)
+                    task_key  = sym_state.make_task_key(nearest_level)
                     if task_key not in sym_state.tasks:
-                        task = asyncio.create_task(
-                            _monitored(sym, level, "support")
-                        )
-                        sym_state.add_task(level, task)
+                        task = asyncio.create_task(_monitored(sym, nearest_level, "support"))
+                        sym_state.add_task(nearest_level, task)
                         sym_state.phase = "phase2"
                         restored_symbols.add(sym)
-                        logger.info("Monitor restored", symbol=sym, level=level)
+                        if len(levels) > 1:
+                            logger.info("Restored nearest of multiple saved monitors",
+                                        symbol=sym, chosen=nearest_level, discarded=[l for l in levels if l != nearest_level])
+                        else:
+                            logger.info("Monitor restored", symbol=sym, level=nearest_level)
                 except Exception as e:
-                    logger.exception("Failed to restore monitor", symbol=sym, level=level, error=str(e))
+                    logger.exception("Failed to restore monitor", symbol=sym, error=str(e))
 
             if restored_symbols:
                 await send_message(
@@ -1040,6 +1254,13 @@ async def _startup_monitoring():
                         lvl.update(get_level_history(symbol, lvl["level"], atr))
                     calculate_strength(lvl)
                     lvl["python_strength"] = lvl["strength"]
+
+                try:
+                    from analysis.ml_score import apply_ml_to_level
+                    for lvl in supports:
+                        apply_ml_to_level(lvl)
+                except Exception as _e:
+                    logger.warning("ml_score failed in startup: %s", _e)
 
                 # Startup: use Python only, no Claude (save tokens)
                 strong = [l for l in supports if l["strength"] >= 3]
@@ -1106,6 +1327,7 @@ async def main():
         _proximity_loop(),
         _auto_screener_loop(),
         _startup_monitoring(),
+        _stale_monitor_loop(),
     )
 
 

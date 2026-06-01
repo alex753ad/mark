@@ -4,10 +4,20 @@ import anthropic
 import json
 import re
 from logger import logger
-from config import CLAUDE_API_KEY
+from config import CLAUDE_API_KEY, TELEGRAM_PROXY
 from constants import CLAUDE_MODEL, CLAUDE_MAX_TOKENS
 
-client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+# Create client with proxy support if configured
+if TELEGRAM_PROXY:
+    import httpx
+    # Convert socks5:// to http proxy for httpx (or use as-is for http)
+    _proxy_url = TELEGRAM_PROXY
+    client = anthropic.AsyncAnthropic(
+        api_key=CLAUDE_API_KEY,
+        http_client=httpx.AsyncClient(proxy=_proxy_url),
+    )
+else:
+    client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
 
 SYSTEM_PROMPT = [
     {
