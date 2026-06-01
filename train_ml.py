@@ -50,7 +50,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from analysis.ml_score import STYLE_MAP
 
-FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc", "age_capped"]
+FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc"]
 
 
 def load_data(db_path: str) -> pd.DataFrame:
@@ -101,7 +101,6 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     df["vol_capped"] = df["vol_ratio_at_touch"].clip(upper=20).fillna(1.0)
     df["atr_capped"] = df["atr_ratio"].clip(upper=20).fillna(1.0)
     df["touches"]    = df["touches_count"].fillna(0).clip(upper=5).astype(float)
-    df["age_capped"] = df["monitoring_age_minutes"].clip(upper=300).fillna(0.0)
 
     X = df[FEATURES].copy()
 
@@ -202,7 +201,7 @@ def train(db_path: str, out_dir: str) -> None:
     body_enc = level_type_map.get("body_level", 0)
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 1, 2.0, style_code, 0.0]],
+            [[4, body_enc, 1.5, 1, 2.0, style_code]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -216,7 +215,7 @@ def train(db_path: str, out_dir: str) -> None:
     pump_enc = level_type_map.get("pump_base", 1)
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[5, pump_enc, 1.0, 1, 2.0, style_code, 0.0]],
+            [[5, pump_enc, 1.0, 1, 2.0, style_code]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -229,7 +228,7 @@ def train(db_path: str, out_dir: str) -> None:
     print("Smoke-тест 3: touches=3 → ожидается ml_delta=-1 для всех:")
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 3, 2.0, style_code, 0.0]],
+            [[4, body_enc, 1.5, 3, 2.0, style_code]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -239,18 +238,6 @@ def train(db_path: str, out_dir: str) -> None:
         print(f"  {style_name:<10} p_bounce={p_b:.3f}  ml_delta={delta} {ok}")
     print()
 
-    # Тест 4: возраст уровня — bounce (age=0) vs breakout (age=120)
-    print("Smoke-тест 4: body_level, touches=1, strength=4 — age=0 vs age=120:")
-    for age in [0.0, 30.0, 120.0]:
-        x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 1, 2.0, STYLE_MAP["unknown"], age]],
-            columns=FEATURES,
-        )
-        proba  = clf.predict_proba(x_test)[0]
-        p_b    = proba[bounce_idx]
-        delta  = "+1" if p_b >= p75 else ("-1" if p_b <= p25 else " 0")
-        print(f"  age={age:<5.0f} p_bounce={p_b:.3f}  ml_delta={delta}")
-    print()
 
     # ── Сохранение ─────────────────────────────────────────────────────
     pickle.dump(clf,            open(os.path.join(out_dir, "clf.pkl"),            "wb"))
