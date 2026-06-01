@@ -49,7 +49,7 @@ SCREENER_AUTO_INTERVAL_SECONDS = 600  # Интервал автоскринер�
 
 # API limits
 CLAUDE_MAX_CONCURRENT_REQUESTS = 2  # Максимум параллельных запросов к Claude API
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"  # Модель Claude для анализа
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"  # Исправленный ID модели Haiku
 CLAUDE_MAX_TOKENS = 1024  # Максимум токенов в ответе Claude
 CLAUDE_STRENGTH_ENABLED = True  # Использовать Claude для определения силы уровней
 

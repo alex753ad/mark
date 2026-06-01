@@ -46,9 +46,10 @@
 ```
 trading_bot/
 ├── .env                          # API ключи (Binance, Claude, Telegram)
-├── .env.example                  # Шаблон: CLAUDE_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+├── .env.example                  # Шаблон: CLAUDE_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_PROXY
 ├── tokens.json                   # ["BUSDT", "TRUTHUSDT", ...] — список активных монет
 ├── trigger_times.json            # {symbol: unix_timestamp} — cooldown триггеров
+├── active_monitors.json          # [{symbol, level}, ...] — активные мониторы для восстановления после рестарта
 ├── history.db                    # SQLite — исходы уровней, профили, события
 │
 ├── config.py                     # Загрузка .env, TokenRegistry (CRUD tokens.json)
@@ -65,6 +66,7 @@ trading_bot/
 │   ├── level_builder.py          # Построение уровней (pump_base, body, wick, order_block)
 │   ├── trigger.py                # Триггер коррекции + calculate_strength (Python)
 │   ├── monitor.py                # Мониторинг уровня: пробой/отскок/sweep/давление
+│   ├── screener.py               # Скринер рынка: run_screener() + _format_vol()
 │   ├── chart.py                  # PNG-график: свечи + VWAP + Volume Profile + уровни
 │   ├── chart_ascii.py            # ASCII-график для промпта Claude
 │   └── claude_strength.py        # Claude Haiku: оценка силы уровней по ASCII-графику
@@ -73,7 +75,7 @@ trading_bot/
 │   └── claude_client.py          # Claude Haiku: reason + grid_advice + confidence
 │
 ├── bot/
-│   └── telegram.py               # Telegram-бот (aiogram v3): команды, кнопки, FSM
+│   └── telegram.py               # Telegram-бот (aiogram v3): команды, кнопки, FSM, proxy
 │
 └── logs/
     └── bot_YYYY-MM-DD.log        # Дневные логи (ротация 1 день, хранение 7 дней)
