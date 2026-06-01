@@ -3,7 +3,7 @@
 import asyncio
 import json
 import anthropic
-from config import CLAUDE_API_KEY
+from config import CLAUDE_API_KEY, TELEGRAM_PROXY
 from constants import CLAUDE_MODEL, CLAUDE_MAX_TOKENS, CLAUDE_MAX_CONCURRENT_REQUESTS
 from analysis.chart_ascii import generate_ascii_chart, generate_levels_summary
 from logger import logger
@@ -15,7 +15,14 @@ _semaphore: asyncio.Semaphore | None = None
 def _get_client() -> anthropic.AsyncAnthropic:
     global _client
     if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        if TELEGRAM_PROXY:
+            import httpx
+            _client = anthropic.AsyncAnthropic(
+                api_key=CLAUDE_API_KEY,
+                http_client=httpx.AsyncClient(proxy=TELEGRAM_PROXY),
+            )
+        else:
+            _client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
     return _client
 
 
@@ -65,27 +72,28 @@ async def calculate_strength_with_claude(symbol: str, c15m: list[dict], levels: 
 КРИТЕРИИ СИЛЫ (1-5 звезд):
 ⭐⭐⭐⭐⭐ (5 звезд) - ОЧЕНЬ СИЛЬНЫЙ:
 - Выравнивание с POC (максимальный объем) - ЭТО САМЫЙ ВАЖНЫЙ ФАКТОР
-- Много касаний (5+)
+- Много касаний (4+)
 - Открытие на 4h (редкое событие)
 - Близко к круглому числу
 - У начала пампа
 
 ⭐⭐⭐⭐ (4 звезды) - СИЛЬНЫЙ:
 - Хорошие касания (3-4)
-- Есть выравнивание по таймфрейму
-- Приличный объем
+- Есть выравнивание по таймфрейму (1h/4h)
+- Приличный объем (выше среднего)
 
 ⭐⭐⭐ (3 звезды) - СРЕДНИЙ:
-- Мало касаний (2-3)
-- Нет особых признаков
+- Касания (2-3)
+- Средний объем
+- Обычный уровень без особых бонусов
 
 ⭐⭐ (2 звезды) - СЛАБЫЙ:
-- Очень мало касаний (1-2)
-- Далеко от ключевых уровней
+- Только 1-2 касания
+- Низкий объем
+- Далеко от ключевых зон
 
 ⭐ (1 звезда) - ОЧЕНЬ СЛАБЫЙ:
-- Одно касание
-- Нет подтверждения
+- Одно касание, нет подтверждения объемом
 
 ВАЖНЫЕ ПРАВИЛА:
 1. POC (Point of Control) - САМЫЙ ВАЖНЫЙ уровень с максимальным объемом
@@ -126,11 +134,16 @@ async def calculate_strength_with_claude(symbol: str, c15m: list[dict], levels: 
                     levels_count=len(levels))
         
         async with _get_semaphore():
-            response = await _get_client().messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=CLAUDE_MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            try:
+                logger.debug("Requesting Claude Haiku", model=CLAUDE_MODEL)
+                response = await _get_client().messages.create(
+                    model=CLAUDE_MODEL,
+                    max_tokens=CLAUDE_MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            except Exception as e:
+                logger.error("Claude request failed", model=CLAUDE_MODEL, error=str(e))
+                raise  # don't retry with deprecated model — let outer except handle fallback
         
         response_text = response.content[0].text
         

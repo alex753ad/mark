@@ -208,6 +208,14 @@ async def get_approaching_levels(symbol: str, use_claude: bool = True) -> list[d
         for lvl in approaching:
             calculate_strength(lvl)
 
+    # ML scoring: adjust strength and add p_bounce / expected_depth
+    try:
+        from analysis.ml_score import apply_ml_to_level
+        for lvl in approaching:
+            apply_ml_to_level(lvl)
+    except Exception as e:
+        logger.warning("ml_score failed in get_approaching_levels: %s", e)
+
     logger.debug("Approaching levels found", 
                 symbol=symbol, 
                 count=len(approaching), 
@@ -461,6 +469,8 @@ def calculate_strength(lvl: dict) -> dict:
     # Base strength by level type
     if level_type == "pump_base":
         strength = 5
+    elif level_type == "breakout_level":
+        strength = 5  # consolidation ceiling = launch point = most important post-pump support
     elif level_type == "consolidation_base":
         strength = 4
     elif level_type == "body_level":
@@ -468,6 +478,8 @@ def calculate_strength(lvl: dict) -> dict:
     elif level_type == "order_block":
         strength = 4
     elif level_type == "consolidation":
+        strength = 3
+    elif level_type == "wick_level":
         strength = 3
     else:
         strength = 2
@@ -491,12 +503,13 @@ def calculate_strength(lvl: dict) -> dict:
         logger.debug("Round number bonus", level=lvl.get("level"), bonus=round_number_bonus)
 
     # Candle count bonus (more touches = more reliable, but capped)
-    if 5 <= candle_count <= 15:
+    if 4 <= candle_count <= 15:
         strength += 1
     elif candle_count > 15:
         strength += 0  # Too many = just a wide consolidation zone, no extra bonus
-    elif candle_count <= 2:
-        strength -= 1  # Too few candles = weak level
+    elif candle_count <= 1:
+        strength -= 1  # Only 1 candle = weak level
+    # 2-3 candles = neutral (no bonus, no penalty)
 
     # Approach count
     if approach >= STRENGTH_APPROACH_EXIT_THRESHOLD:
@@ -520,17 +533,19 @@ def calculate_strength(lvl: dict) -> dict:
         strength += 0  # Reliable, no adjustment
 
     # History penalties
-    if was_broken and not sweep_reclaimed:
+    # was_broken penalty only applies to levels broken AFTER being established as support,
+    # not to levels that were crossed during the initial pump leg (position "in_move" or "origin")
+    if was_broken and not sweep_reclaimed and position not in ("in_move", "origin"):
         strength -= 2
     if max_vol_on_approach > vol_ratio * 2:
         strength -= 1
 
-    # Zone exhaustion
-    if zone_approaches == 1:
+    # Zone exhaustion — first approach is neutral, penalty starts at 2nd
+    if zone_approaches == 2:
         strength -= 1
-    elif zone_approaches == 2:
+    elif zone_approaches == 3:
         strength -= 2
-    elif zone_approaches >= 3:
+    elif zone_approaches >= 4:
         strength -= 3
         verdict = "exit"
 

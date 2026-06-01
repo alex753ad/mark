@@ -145,6 +145,86 @@ def _calculate_poc_simple(c15m: list[dict], range_low: float, range_high: float,
     return poc_price
 
 
+def _find_breakout_level(
+    c15m: list[dict],
+    pump_start_idx: int,
+    pump_high: float,
+    atr: float,
+) -> tuple[float, int, dict] | None:
+    """Find the consolidation ceiling = top of pre-pump range = breakout support.
+
+    This is the level from which price launched the pump. After the pump, it
+    becomes the most important support — where price should hold on pullback.
+
+    Logic:
+    1. From pump_start_idx, scan forward until we hit the first explosive candle
+       (body >= 1.5x ATR) — that's where consolidation ends and pump begins.
+    2. The ceiling = highest body_top across all consolidation candles.
+    """
+    if pump_start_idx <= 0 or atr <= 0:
+        return None
+
+    # Find where consolidation ends (first big-body candle = pump launch)
+    consolidation_end = pump_start_idx
+    for i in range(pump_start_idx, min(pump_start_idx + 100, len(c15m))):
+        body = abs(c15m[i]["close"] - c15m[i]["open"])
+        if body >= atr * 1.5:
+            consolidation_end = i
+            break
+    else:
+        # No explosive candle found — pump was gradual, use full range
+        consolidation_end = min(pump_start_idx + 60, len(c15m))
+
+    consol = c15m[pump_start_idx:consolidation_end]
+    if len(consol) < 3:
+        return None
+
+    # Ceiling = max body_top of consolidation candles (not wicks — body only)
+    ceiling = max(max(c["open"], c["close"]) for c in consol)
+
+    # Sanity: ceiling must be below pump_high with some margin
+    if ceiling >= pump_high * 0.97:
+        return None
+
+    total_vol = sum(c["volume"] for c in consol)
+
+    return ceiling, len(consol), {
+        "volume_at_level":    total_vol,
+        "hourly_open_bonus":  0,
+        "round_number_bonus": _round_number_bonus(ceiling),
+    }
+
+
+def _find_consolidation_zones(c15m: list[dict], support_range_low: float, support_range_high: float, atr: float) -> list[tuple[float, int, dict]]:
+    """Find tight consolidation zones where price spent significant time."""
+    if len(c15m) < 10:
+        return []
+
+    zones = []
+    # Narrow window for finding tight consolidation
+    window = 8 
+    step = 2
+    
+    for i in range(0, len(c15m) - window, step):
+        chunk = c15m[i:i+window]
+        chunk_high = max(c["high"] for c in chunk)
+        chunk_low = min(c["low"] for c in chunk)
+        chunk_range = chunk_high - chunk_low
+        
+        # Consolidation is tight if range < 3 ATR
+        if chunk_range <= atr * 3:
+            # Level is median of the range
+            price = (chunk_high + chunk_low) / 2
+            if support_range_low <= price <= support_range_high:
+                # Count how many candles are within 1 ATR of this price
+                count = sum(1 for c in chunk if abs(c["close"] - price) <= atr)
+                if count >= 5:
+                    vol = sum(c["volume"] for c in chunk)
+                    zones.append((price, count, {"volume_at_level": vol, "type": "consolidation_base"}))
+    
+    return zones
+
+
 def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: list[dict] = None) -> list[dict]:
     """
     Build support/resistance levels with SIMPLE logic.
@@ -171,7 +251,9 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     current_price = c1m[-1]["close"] if c1m else 0
 
     pump_legs = _find_pump_legs(c15m)
+    logger.info("pump_legs result", symbol=symbol, count=len(pump_legs), legs=[(round(l[0],6), round(l[1],6)) for l in pump_legs])
     if not pump_legs:
+        logger.info("No pump legs found — levels skipped", symbol=symbol, c15m_len=len(c15m))
         return []
 
     pump_low  = min(leg[0] for leg in pump_legs)
@@ -195,7 +277,9 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
                 pump_peak_idx=pump_peak_idx,
                 move_pct=round((pump_high - pump_low) / pump_low * 100, 2))
 
-    support_range_low  = current_price * 0.80 if current_price > 0 else pump_low
+    # Expand range to 40% to capture pump bases and POC on vertical moves.
+    # Scalping usually looks at 5-10%, but analysis needs full context.
+    support_range_low  = current_price * 0.60 if current_price > 0 else pump_low
     support_range_high = current_price * 1.05 if current_price > 0 else pump_high
 
     # POC: calculated from pump PEAK onward (post-pump consolidation).
@@ -206,7 +290,8 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     if len(poc_candles) < 5:
         poc_candles = c15m[pump_start_idx:]  # fallback if just pumped
     last_leg_low  = max(leg[0] for leg in pump_legs)
-    poc_range_low = min(last_leg_low, current_price * 0.90)
+    # POC range should also be wide enough to catch the consolidation
+    poc_range_low = min(last_leg_low, current_price * 0.70)
     poc_price = _calculate_poc_simple(poc_candles, poc_range_low, support_range_high, atr)
 
     if poc_price:
@@ -233,6 +318,22 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
                 **metadata
             })
 
+    # 1b. Breakout level — consolidation ceiling (the level price launched from)
+    # This is the most important post-pump support, often missed by body/wick detection
+    for leg in pump_legs:
+        leg_start_idx = leg[2]
+        breakout = _find_breakout_level(c15m, leg_start_idx, pump_high, atr)
+        if breakout:
+            price, candle_count, metadata = breakout
+            if support_range_low <= price <= support_range_high:
+                all_levels.append({
+                    "level":        _round_level(price),
+                    "type":         "breakout_level",
+                    "candle_count": candle_count,
+                    "poc_aligned":  False,
+                    **metadata
+                })
+
     # 2. Body levels
     body_levels = _find_body_levels_simple(
         c15m, support_range_low, support_range_high, atr, cluster_radius, pump_peak_time
@@ -258,6 +359,33 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
             **metadata
         })
 
+    # 3b. Mid-impulse pauses — short stalls inside pump legs, missed by body/wick detection
+    mid_pauses = _find_mid_impulse_pauses(c15m, pump_legs, atr_15m)
+    for price, candle_count, metadata in mid_pauses:
+        if support_range_low <= price <= support_range_high:
+            all_levels.append({
+                "level":        _round_level(price),
+                "type":         "mid_impulse_pause",
+                "candle_count": candle_count,
+                "poc_aligned":  False,
+                **metadata
+            })
+    if mid_pauses:
+        logger.info("Mid-impulse pauses found", symbol=symbol, count=len(mid_pauses),
+                    prices=[_round_level(p) for p, _, _ in mid_pauses])
+
+    # 1M near-zone scan: catches pauses visible on 1M but swallowed by single 15M candles.
+    # 20% zone covers post-pump consolidation range.
+    near_zone_levels = _find_1m_near_zone_levels(c1m, current_price, near_zone_pct=0.20, atr=atr)
+    for price, candle_count, metadata in near_zone_levels:
+        all_levels.append({
+            "level":        _round_level(price),
+            "type":         "body_level",
+            "candle_count": candle_count,
+            "poc_aligned":  False,
+            **metadata
+        })
+
     # 4. Order block
     # FIX Bug-1: pass pump_start_idx from legs, not re-searched from start of c15m
     order_block = _find_order_block_simple(c15m, pump_low, pump_high, pump_start_idx)
@@ -271,30 +399,62 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
             **metadata
         })
 
-    levels = _deduplicate_simple(all_levels, cluster_radius)
+    # 5. Consolidation zones
+    consolidation_zones = _find_consolidation_zones(c15m, support_range_low, support_range_high, atr)
+    for price, candle_count, metadata in consolidation_zones:
+        all_levels.append({
+            "level": _round_level(price),
+            "type": "consolidation_base",
+            "candle_count": candle_count,
+            "poc_aligned": False,
+            **metadata
+        })
 
-    # Mark POC alignment — only the closest level
+    # Adjust cluster radius: for vertical moves (PLAY, BSB), fixed radius might be too large
+    # and swallow intermediate levels.
+    dynamic_radius = cluster_radius
+    if current_price > 0:
+        move_pct = (pump_high - pump_low) / pump_low if pump_low > 0 else 0
+        if move_pct > 0.5: # If move > 50%, reduce radius to catch intermediate zones
+            dynamic_radius = cluster_radius * 0.5
+            logger.debug("Vertical move detected, reducing cluster radius", 
+                         symbol=symbol, old=cluster_radius, new=dynamic_radius)
+
+    levels = _deduplicate_simple(all_levels, dynamic_radius)
+
+    # Mark POC alignment — allow multiple levels within tight radius
     if poc_price:
-        closest_level = None
-        min_distance  = float("inf")
-
         for lvl in levels:
             distance = abs(lvl["level"] - poc_price)
-            if distance < min_distance:
-                min_distance  = distance
-                closest_level = lvl
+            # Use cluster_radius for strict alignment
+            if distance <= cluster_radius:
+                lvl["poc_aligned"] = True
+                logger.info("POC aligned to level",
+                           symbol=symbol,
+                           poc=_round_level(poc_price),
+                           level=lvl["level"],
+                           distance=round(distance, 6))
 
-        # Allow POC to snap to nearest level within 2x cluster_radius.
-        # Strict cluster_radius was too tight — POC at 0.0213 couldn't align
-        # with a level at 0.0208 even though they're the same zone.
-        if closest_level and min_distance <= cluster_radius * 2:
-            closest_level["poc_aligned"] = True
-            logger.info("POC aligned to level",
-                       symbol=symbol,
-                       poc=_round_level(poc_price),
-                       level=closest_level["level"],
-                       distance=round(min_distance, 6))
-        elif support_range_low <= poc_price <= support_range_high:
+        # If no level aligned yet, try snap to closest within 2x radius
+        if not any(l.get("poc_aligned") for l in levels):
+            closest_level = None
+            min_dist = float("inf")
+            for lvl in levels:
+                dist = abs(lvl["level"] - poc_price)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_level = lvl
+            
+            if closest_level and min_dist <= cluster_radius * 2:
+                closest_level["poc_aligned"] = True
+                logger.info("POC snapped to closest level",
+                           symbol=symbol,
+                           poc=_round_level(poc_price),
+                           level=closest_level["level"],
+                           distance=round(min_dist, 6))
+        
+        # If still no level aligned and POC is in range, add it as separate level
+        if not any(l.get("poc_aligned") for l in levels) and support_range_low <= poc_price <= support_range_high:
             # Use cluster_radius (15M-based) — atr*0.3 (1M) was ~0.00005,
             # too tight to find any candles near the POC price.
             candles_at_poc = [
@@ -345,13 +505,20 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
             score += 10000
         if id(lvl) in priority_base_ids:
             score += 5000   # only top-2 pump_bases guaranteed
+        if lvl.get("type") == "mid_impulse_pause":
+            score += 1500   # ensure mid-impulse pauses compete for top-10 slots
+        
+        # Proximity bonus: levels closer to current price are more relevant
+        distance_pct = abs(current_price - lvl["level"]) / current_price if current_price > 0 else 1
+        score += int((1.0 - min(distance_pct, 1.0)) * 100)
+        
         score += lvl.get("candle_count", 0) * 10
         score += lvl.get("hourly_open_bonus", 0) * 5
         score += lvl.get("round_number_bonus", 0) * 3
         return score
 
     levels.sort(key=level_quality, reverse=True)
-    levels = levels[:7]
+    levels = levels[:10]  # Increased from 7 to 10 to capture more context
     levels.sort(key=lambda x: x["level"])
 
     levels = _assign_positions(levels, pump_low, pump_high)
@@ -383,7 +550,8 @@ def _find_pump_legs(c15m: list[dict]) -> list[tuple[float, float, int, int]]:
     if len(c15m) < 4:
         return []
 
-    window_size = min(50, len(c15m))
+    # 200 candles = ~50 hours on 15M — catches pumps from up to 2 days ago
+    window_size = min(200, len(c15m))
     window      = c15m[-window_size:]
     high_price  = max(c["high"] for c in window)
     high_idx    = None
@@ -394,6 +562,7 @@ def _find_pump_legs(c15m: list[dict]) -> list[tuple[float, float, int, int]]:
             break
 
     if high_idx is None:
+        logger.info("_find_pump_legs: no high_idx found", symbol="?", window=window_size, high_price=round(high_price,6))
         return []
 
     pump_start_idx = None
@@ -404,6 +573,9 @@ def _find_pump_legs(c15m: list[dict]) -> list[tuple[float, float, int, int]]:
             break
 
     if pump_start_idx is None:
+        logger.info("_find_pump_legs: no pump_start_idx — move < 5% in 60 candles before high",
+                    high_price=round(high_price,6), high_idx=high_idx,
+                    search_from=max(0, high_idx-60))
         return []
 
     pump_candles = c15m[pump_start_idx: high_idx + 1]
@@ -530,6 +702,193 @@ def _find_pump_base_simple(
                 }))
 
     return levels
+
+
+def _find_1m_near_zone_levels(
+    c1m: list[dict],
+    current_price: float,
+    near_zone_pct: float,
+    atr: float,
+) -> list[tuple[float, int, dict]]:
+    """
+    Find consolidation levels from 1M candles within near_zone_pct of current price.
+
+    Purpose: pump legs on 15M are single large-body candles, hiding 1M pauses.
+    Requires >= 2 unique candle touches within cluster radius.
+    """
+    if not c1m or current_price <= 0 or atr <= 0:
+        return []
+
+    zone_low  = current_price * (1 - near_zone_pct)
+    zone_high = current_price * (1 + near_zone_pct)
+    radius    = max(atr * 2, current_price * 0.003)
+
+    # Collect body touch points — include candle if any part of body is in zone
+    touch_points: list[tuple[float, dict]] = []
+    for c in c1m[-1000:]:
+        body_top = max(c["open"], c["close"])
+        body_bot = min(c["open"], c["close"])
+        if body_top < zone_low or body_bot > zone_high:
+            continue
+        if zone_low <= body_top <= zone_high:
+            touch_points.append((body_top, c))
+        if zone_low <= body_bot <= zone_high and body_bot != body_top:
+            touch_points.append((body_bot, c))
+
+    if not touch_points:
+        return []
+
+    levels: list[tuple[float, int, dict]] = []
+    used:   set[int] = set()
+
+    for i, (price_i, _) in enumerate(touch_points):
+        if i in used:
+            continue
+
+        # Identify all members within radius — don't mark used yet
+        members = [
+            j for j, (price_j, _) in enumerate(touch_points)
+            if j not in used and abs(price_j - price_i) <= radius
+        ]
+
+        # Count unique candles in this cluster
+        unique_candles = {id(touch_points[k][1]) for k in members}
+        if len(unique_candles) < 2:
+            used.add(i)
+            continue
+
+        # Accept — mark all members as used
+        for k in members:
+            used.add(k)
+
+        avg_price    = sum(touch_points[k][0] for k in members) / len(members)
+        candle_count = len(unique_candles)
+        avg_vol      = sum(touch_points[k][1]["volume"] for k in members) / len(members)
+
+        levels.append((avg_price, candle_count, {
+            "volume_at_level":    avg_vol,
+            "hourly_open_bonus":  0,
+            "round_number_bonus": _round_number_bonus(avg_price),
+        }))
+
+    return levels
+
+
+def _find_mid_impulse_pauses(
+    c15m: list[dict],
+    pump_legs: list[tuple[float, float, int, int]],
+    atr_15m: float,
+) -> list[tuple[float, int, dict]]:
+    """
+    Find short pauses/consolidations INSIDE impulse legs that body/wick detection misses.
+
+    These are zones where price briefly stalled mid-move (2-4 candles), visible on the
+    chart as a local plateau but swallowed into one large 15M body by standard clustering.
+
+    Logic per leg:
+      1. Scan candles between leg_low_idx and leg_high_idx.
+      2. Divide the leg into thirds. Skip bottom third (that's the base) and top 15%
+         (that's near the high — noise). Work with the middle 55% of the leg range.
+      3. Within that price band, find windows of 2-4 candles where:
+           - The candle bodies overlap heavily (max_body_top - min_body_bot < atr_15m * 1.5)
+           - At least 2 candles have closes within atr_15m * 0.5 of each other
+      4. Mark the median body price of such a window as mid_impulse_pause.
+      5. Deduplicate pauses closer than atr_15m * 0.4 — keep the one with most candles.
+    """
+    if not pump_legs or atr_15m <= 0:
+        return []
+
+    results: list[tuple[float, int, dict]] = []
+    radius = atr_15m * 0.4
+
+    for leg_low, leg_high, low_orig_idx, high_orig_idx in pump_legs:
+        leg_range = leg_high - leg_low
+        if leg_range <= 0:
+            continue
+
+        # Middle band: skip bottom 30% (base) and top 15% (near high)
+        band_low  = leg_low  + leg_range * 0.30
+        band_high = leg_high - leg_range * 0.15
+
+        if band_high <= band_low:
+            continue
+
+        leg_candles = c15m[low_orig_idx: high_orig_idx + 1]
+        if len(leg_candles) < 3:
+            continue
+
+        # Only candles whose body overlaps the middle band
+        mid_candles = []
+        for c in leg_candles:
+            body_top = max(c["open"], c["close"])
+            body_bot = min(c["open"], c["close"])
+            if body_top >= band_low and body_bot <= band_high:
+                mid_candles.append(c)
+
+        if len(mid_candles) < 2:
+            continue
+
+        # Sliding window: look for tight groups
+        window_sizes = [4, 3, 2]
+        used_indices: set[int] = set()
+
+        for win in window_sizes:
+            for i in range(len(mid_candles) - win + 1):
+                if any(k in used_indices for k in range(i, i + win)):
+                    continue
+
+                chunk = mid_candles[i: i + win]
+                body_tops = [max(c["open"], c["close"]) for c in chunk]
+                body_bots = [min(c["open"], c["close"]) for c in chunk]
+                closes    = [c["close"] for c in chunk]
+
+                # Tight if candle bodies span < 1.5 ATR
+                spread = max(body_tops) - min(body_bots)
+                if spread > atr_15m * 1.5:
+                    continue
+
+                # At least 2 closes within 0.5 ATR of each other
+                tight_closes = 0
+                for a in range(len(closes)):
+                    for b in range(a + 1, len(closes)):
+                        if abs(closes[a] - closes[b]) <= atr_15m * 0.5:
+                            tight_closes += 1
+
+                if tight_closes < 1:
+                    continue
+
+                # Pause price = median of body midpoints
+                body_mids = [(t + b) / 2 for t, b in zip(body_tops, body_bots)]
+                pause_price = statistics.median(body_mids)
+
+                # Must be within middle band
+                if not (band_low <= pause_price <= band_high):
+                    continue
+
+                total_vol    = sum(c["volume"] for c in chunk)
+                hourly_bonus = max(_timeframe_bonus(c["open_time"]) for c in chunk)
+                round_bonus  = _round_number_bonus(pause_price)
+
+                results.append((pause_price, len(chunk), {
+                    "volume_at_level":    total_vol,
+                    "hourly_open_bonus":  hourly_bonus,
+                    "round_number_bonus": round_bonus,
+                }))
+
+                for k in range(i, i + win):
+                    used_indices.add(k)
+
+    # Deduplicate across legs: keep entry with most candles
+    results.sort(key=lambda x: x[0])
+    deduped: list[tuple[float, int, dict]] = []
+    for price, count, meta in results:
+        if deduped and abs(price - deduped[-1][0]) <= radius:
+            if count > deduped[-1][1]:
+                deduped[-1] = (price, count, meta)
+        else:
+            deduped.append((price, count, meta))
+
+    return deduped
 
 
 def _find_body_levels_simple(
@@ -721,7 +1080,7 @@ def _deduplicate_simple(levels: list[dict], radius: float) -> list[dict]:
     if not levels:
         return []
 
-    TYPE_PRIORITY = {"pump_base": 3, "order_block": 2, "body_level": 1, "wick_level": 0}
+    TYPE_PRIORITY = {"pump_base": 3, "order_block": 2, "body_level": 1, "wick_level": 0, "mid_impulse_pause": 1}
 
     sorted_levels = sorted(levels, key=lambda x: x["level"])
     result = [sorted_levels[0]]
