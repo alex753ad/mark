@@ -60,8 +60,8 @@ STYLE_MAP: dict[str, int] = {
 # Откалиброваны по P25/P75 на датасете outcome IN ('bounce','breakout'),
 # strength!=0, created_at >= 2026-05-21 (partial исключён).
 # Обновлять после каждого переобучения через train_ml.py (он печатает новые значения).
-THRESHOLD_HIGH: float = 0.99   # p_bounce >= HIGH → ml_delta = +1
-THRESHOLD_LOW:  float = 0.85   # p_bounce <= LOW  → ml_delta = -1
+THRESHOLD_HIGH: float = 0.97   # p_bounce >= HIGH → ml_delta = +1
+THRESHOLD_LOW:  float = 0.60   # p_bounce <= LOW  → ml_delta = -1
 
 # Минимальное количество касаний для торговли.
 # touches >= TOUCHES_BLOCK → hard block (0% bounce из 113 случаев в истории).
