@@ -201,8 +201,16 @@ async def _auto_screener_loop():
 
                             try:
                                 from analysis.ml_score import apply_ml_to_level
+                                _style_screener = detect_approach_style(sym)
                                 for lvl in supports:
-                                    apply_ml_to_level(lvl)
+                                    lvl["approach_style"] = _style_screener
+                                    if _style_screener == "impulse" and lvl.get("strength", 0) == 0:
+                                        lvl["p_bounce"] = 0.0
+                                        lvl["ml_delta"] = -2
+                                        lvl["ml_blocked"] = True
+                                        lvl["strength_pre_ml"] = lvl.get("strength", 0)
+                                    else:
+                                        apply_ml_to_level(lvl)
                             except Exception as _e:
                                 logger.warning("ml_score failed in screener: %s", _e)
 
@@ -342,8 +350,16 @@ async def _run_phase1(symbol: str):
 
         try:
             from analysis.ml_score import apply_ml_to_level
+            _style_phase = detect_approach_style(symbol)
             for lvl in levels:
-                apply_ml_to_level(lvl)
+                lvl["approach_style"] = _style_phase
+                if _style_phase == "impulse" and lvl.get("strength", 0) == 0:
+                    lvl["p_bounce"] = 0.0
+                    lvl["ml_delta"] = -2
+                    lvl["ml_blocked"] = True
+                    lvl["strength_pre_ml"] = lvl.get("strength", 0)
+                else:
+                    apply_ml_to_level(lvl)
         except Exception as _e:
             logger.warning("ml_score failed in phase loop: %s", _e)
 
@@ -469,8 +485,14 @@ async def _run_phase1(symbol: str):
             real_vol_ratio = get_vol_ratio_current(symbol)
             nearest["atr_ratio"] = real_atr_ratio
             nearest["vol_ratio"] = real_vol_ratio
+            nearest["approach_style"] = detect_approach_style(symbol)  # 1.4: стиль до ML
             from analysis.ml_score import apply_ml_to_level
-            apply_ml_to_level(nearest)
+            if nearest.get("approach_style") == "impulse" and nearest.get("strength", 0) == 0:
+                nearest["p_bounce"] = 0.0
+                nearest["ml_delta"] = -2
+                nearest["ml_blocked"] = True
+            else:
+                apply_ml_to_level(nearest)
         except Exception as _e:
             logger.warning("ml_score pre-message recalc failed: %s", _e)
 
@@ -491,6 +513,10 @@ async def _run_phase1(symbol: str):
         if p_b is not None:
             depth_str = f" | прокол ~{e_d:.1f}%" if e_d is not None else ""
             text += f"   🤖 P(отбой): {p_b:.0%}{depth_str}\n"
+        # 2.1: метка подтверждённого bounce при vol_ratio_at_touch 2–4x (90.9% bounce в истории)
+        _vol_touch = nearest.get("vol_ratio_at_touch") or nearest.get("vol_ratio", 0)
+        if _vol_touch and 2.0 <= _vol_touch <= 4.0:
+            text += f"   🔒 Подтверждённый bounce (vol×{_vol_touch:.1f})\n"
         text += f"\n   Жду цену на {nearest['level']}..."
 
         await send_message(text)
@@ -738,8 +764,16 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
 
         try:
             from analysis.ml_score import apply_ml_to_level
+            _style_rebuild = detect_approach_style(symbol)
             for lvl in rebuild_candidates:
-                apply_ml_to_level(lvl)
+                lvl["approach_style"] = _style_rebuild
+                if _style_rebuild == "impulse" and lvl.get("strength", 0) == 0:
+                    lvl["p_bounce"] = 0.0
+                    lvl["ml_delta"] = -2
+                    lvl["ml_blocked"] = True
+                    lvl["strength_pre_ml"] = lvl.get("strength", 0)
+                else:
+                    apply_ml_to_level(lvl)
         except Exception as _e:
             logger.warning("ml_score failed in rebuild: %s", _e)
 
@@ -1257,8 +1291,16 @@ async def _startup_monitoring():
 
                 try:
                     from analysis.ml_score import apply_ml_to_level
+                    _style_startup = detect_approach_style(symbol)
                     for lvl in supports:
-                        apply_ml_to_level(lvl)
+                        lvl["approach_style"] = _style_startup
+                        if _style_startup == "impulse" and lvl.get("strength", 0) == 0:
+                            lvl["p_bounce"] = 0.0
+                            lvl["ml_delta"] = -2
+                            lvl["ml_blocked"] = True
+                            lvl["strength_pre_ml"] = lvl.get("strength", 0)
+                        else:
+                            apply_ml_to_level(lvl)
                 except Exception as _e:
                     logger.warning("ml_score failed in startup: %s", _e)
 

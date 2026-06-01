@@ -16,7 +16,7 @@ PROXIMITY_ALERT_COOLDOWN_SECONDS = 86400  # 24 часа — фактически
 WEAK_BREAKOUT_COOLDOWN_SECONDS = 3600  # 1 час — фактически однократно за сессию мониторинга
 
 # Volume thresholds
-VOLUME_BREAKOUT_RATIO = 2.0  # Объём ×2 для подтверждения пробоя
+VOLUME_BREAKOUT_RATIO = 2.4  # Объём ×2.4 для подтверждения пробоя (повышен с 2.0: vol 2-4x = защита уровня 90.9% bounce)
 VOLUME_SPIKE_RATIO = 3.0  # Объём ×3 для алерта о спайке
 VOLUME_SPIKE_RESET_RATIO = 1.5  # Объём < ×1.5 для сброса флага спайка
 VOLUME_REBOUND_MIN_RATIO = 1.0  # Минимальный объём для подтверждения отбоя
