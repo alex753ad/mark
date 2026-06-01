@@ -773,7 +773,9 @@ async def _do_analyze(message: Message, symbol: str):
         e_d = lvl.get("expected_depth")
         if p_b is not None:
             depth_str = f" | прокол ~{e_d:.1f}%" if e_d is not None else ""
-            lines.append(f"   🤖 P(отбой): {p_b:.0%}{depth_str}")
+            ml_delta = lvl.get("ml_delta", 0)
+            delta_str = f" | ML: {ml_delta:+d}" if ml_delta != 0 else ""
+            lines.append(f"   🤖 P(отбой): {p_b:.0%}{depth_str}{delta_str}")
 
     # Show Average levels if there are no strong ones or just to provide more info
     if average_sorted:
@@ -1044,7 +1046,9 @@ async def _do_check(message: Message, symbol: str, level: float):
     ml_line = ""
     if p_bounce is not None:
         depth_str = f" | прокол ~{expected_depth:.1f}%" if expected_depth is not None else ""
-        ml_line = f"\n   🤖 P(отбой): {p_bounce:.0%}{depth_str}"
+        ml_delta = r.get("ml_delta", 0)
+        delta_str = f" | ML: {ml_delta:+d}" if ml_delta != 0 else ""
+        ml_line = f"\n   🤖 P(отбой): {p_bounce:.0%}{depth_str}{delta_str}"
 
     text = (
         f"{header}\n"
