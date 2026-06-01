@@ -17,13 +17,14 @@
     touches >= 2 → 0% bounce из 113 случаев → блокируем без ML.
   В обучении touches остаётся признаком — модель учится на полном диапазоне.
 
-Признаки (6 штук, порядок должен совпадать с ml_score.py):
+Признаки (7 штук, порядок должен совпадать с ml_score.py):
     1. strength_claude  — сила уровня (1-5)
     2. ltype_enc        — тип уровня (pump_base / body_level / wick_level / order_block)
     3. vol_capped       — vol_ratio_at_touch, обрезан до 20
     4. touches          — touches_count, обрезан до 5
     5. atr_capped       — atr_ratio, обрезан до 20
     6. style_enc        — approach_style (flash=0, impulse=1, bleed=2, unknown=3)
+    7. age_capped       — monitoring_age_minutes, обрезан до 300 (bounce ~5 мин, breakout ~131 мин)
 
 Выходные файлы (перезаписывают существующие):
     analysis/ml/clf.pkl            — RandomForestClassifier (bounce/breakout)
@@ -49,7 +50,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from analysis.ml_score import STYLE_MAP
 
-FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc"]
+FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc", "age_capped"]
 
 
 def load_data(db_path: str) -> pd.DataFrame:
@@ -100,6 +101,7 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     df["vol_capped"] = df["vol_ratio_at_touch"].clip(upper=20).fillna(1.0)
     df["atr_capped"] = df["atr_ratio"].clip(upper=20).fillna(1.0)
     df["touches"]    = df["touches_count"].fillna(0).clip(upper=5).astype(float)
+    df["age_capped"] = df["monitoring_age_minutes"].clip(upper=300).fillna(0.0)
 
     X = df[FEATURES].copy()
 
@@ -196,11 +198,11 @@ def train(db_path: str, out_dir: str) -> None:
 
     # ── Smoke-тест порогов ─────────────────────────────────────────────
     # Тест 1: body_level, touches=1 (типичный первый подход)
-    print("Smoke-тест 1: body_level, touches=1 (strength=4, vol=1.5, atr=2.0):")
+    print("Smoke-тест 1: body_level, touches=1 (strength=4, vol=1.5, atr=2.0, age=0):")
     body_enc = level_type_map.get("body_level", 0)
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 1, 2.0, style_code]],
+            [[4, body_enc, 1.5, 1, 2.0, style_code, 0.0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -210,11 +212,11 @@ def train(db_path: str, out_dir: str) -> None:
     print()
 
     # Тест 2: pump_base, touches=1 (второй по частоте тип)
-    print("Smoke-тест 2: pump_base, touches=1 (strength=5, vol=1.0, atr=2.0):")
+    print("Smoke-тест 2: pump_base, touches=1 (strength=5, vol=1.0, atr=2.0, age=0):")
     pump_enc = level_type_map.get("pump_base", 1)
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[5, pump_enc, 1.0, 1, 2.0, style_code]],
+            [[5, pump_enc, 1.0, 1, 2.0, style_code, 0.0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -227,7 +229,7 @@ def train(db_path: str, out_dir: str) -> None:
     print("Smoke-тест 3: touches=3 → ожидается ml_delta=-1 для всех:")
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 3, 2.0, style_code]],
+            [[4, body_enc, 1.5, 3, 2.0, style_code, 0.0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -235,6 +237,19 @@ def train(db_path: str, out_dir: str) -> None:
         delta  = "+1" if p_b >= p75 else ("-1" if p_b <= p25 else " 0")
         ok = "✅" if delta == "-1" else "❌"
         print(f"  {style_name:<10} p_bounce={p_b:.3f}  ml_delta={delta} {ok}")
+    print()
+
+    # Тест 4: возраст уровня — bounce (age=0) vs breakout (age=120)
+    print("Smoke-тест 4: body_level, touches=1, strength=4 — age=0 vs age=120:")
+    for age in [0.0, 30.0, 120.0]:
+        x_test = pd.DataFrame(
+            [[4, body_enc, 1.5, 1, 2.0, STYLE_MAP["unknown"], age]],
+            columns=FEATURES,
+        )
+        proba  = clf.predict_proba(x_test)[0]
+        p_b    = proba[bounce_idx]
+        delta  = "+1" if p_b >= p75 else ("-1" if p_b <= p25 else " 0")
+        print(f"  age={age:<5.0f} p_bounce={p_b:.3f}  ml_delta={delta}")
     print()
 
     # ── Сохранение ─────────────────────────────────────────────────────
@@ -251,17 +266,70 @@ def train(db_path: str, out_dir: str) -> None:
     print(f"   THRESHOLD_HIGH = {p75:.2f}  # было 0.57")
     print(f"   THRESHOLD_LOW  = {p25:.2f}  # было 0.32")
 
+    return len(df)
+
+
+RETRAIN_THRESHOLD = 200   # переобучать каждые N новых записей
+_TRAIN_SIZE_FILE  = "analysis/ml/last_train_size.txt"
+
+
+def get_last_train_size() -> int:
+    """Читает количество записей на момент последнего обучения."""
+    try:
+        with open(_TRAIN_SIZE_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def save_train_size(n: int) -> None:
+    os.makedirs(os.path.dirname(_TRAIN_SIZE_FILE), exist_ok=True)
+    with open(_TRAIN_SIZE_FILE, "w") as f:
+        f.write(str(n))
+
+
+def should_retrain(db_path: str) -> bool:
+    """Возвращает True, если накопилось >= RETRAIN_THRESHOLD новых записей."""
+    try:
+        conn = sqlite3.connect(db_path)
+        cur  = conn.execute(
+            "SELECT COUNT(*) FROM level_outcomes "
+            "WHERE outcome IN ('bounce','breakout') AND strength_claude != 0"
+        )
+        current = cur.fetchone()[0]
+        conn.close()
+        last = get_last_train_size()
+        return (current - last) >= RETRAIN_THRESHOLD
+    except Exception:
+        return False
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Переобучение ML-моделей для ml_score.py")
-    parser.add_argument("--db",  default="history.db",   help="Путь к history.db")
-    parser.add_argument("--out", default="analysis/ml",  help="Папка для .pkl файлов")
+    parser.add_argument("--db",    default="history.db",  help="Путь к history.db")
+    parser.add_argument("--out",   default="analysis/ml", help="Папка для .pkl файлов")
+    parser.add_argument("--force", action="store_true",   help="Переобучить без проверки порога")
     args = parser.parse_args()
+
+    if not args.force and not should_retrain(args.db):
+        last = get_last_train_size()
+        conn = sqlite3.connect(args.db)
+        cur  = conn.execute(
+            "SELECT COUNT(*) FROM level_outcomes "
+            "WHERE outcome IN ('bounce','breakout') AND strength_claude != 0"
+        )
+        current = cur.fetchone()[0]
+        conn.close()
+        print(f"Пропуск: новых записей {current - last} < {RETRAIN_THRESHOLD}. "
+              f"Используйте --force для принудительного переобучения.")
+        return
 
     print(f"DB: {args.db}")
     print(f"Out: {args.out}")
     print()
-    train(args.db, args.out)
+    n = train(args.db, args.out)
+    if n:
+        save_train_size(n)
 
 
 if __name__ == "__main__":

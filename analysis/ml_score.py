@@ -15,7 +15,7 @@ ML scoring for support levels.
     apply_ml_to_level(lvl)
     # lvl теперь содержит: p_bounce, expected_depth, ml_delta, strength_pre_ml
 
-Признаки модели (6 штук):
+Признаки модели (7 штук):
     1. strength        — Python-сила уровня (1-5)
     2. ltype_enc       — тип уровня (из level_type_map.pkl)
     3. vol_ratio       — объём / среднее (обрезается до 20)
@@ -23,6 +23,8 @@ ML scoring for support levels.
     5. atr_ratio       — расстояние до уровня в ATR (обрезается до 20)
     6. style_enc       — стиль подхода: flash=0, impulse=1, bleed=2, unknown=3
                          Доступен только в _monitored(); в _run_phase1 = "unknown"
+    7. monitoring_age  — минут от старта монитора до первого касания (обрезается до 300)
+                         Данные: bounce mean=5.2 мин, breakout mean=131 мин
 
 Hard-filter (применяется в apply_ml_to_level ДО ML):
     touches >= 2 → ml_delta = -2, p_bounce = 0.0
@@ -101,12 +103,13 @@ def ml_score(lvl: dict) -> dict:
         return {"p_bounce": 0.5, "expected_depth": 1.5, "ml_delta": 0}
 
     try:
-        ltype     = lvl.get("type", "body_level")
-        strength  = float(lvl.get("strength", 3) or 3)
-        vol       = float(lvl.get("vol_ratio", 1.0) or 1.0)
-        touches   = min(float(lvl.get("touches_count") or lvl.get("approach", 1) or 1), 5.0)
-        atr_ratio = float(lvl.get("atr_ratio", 2.0) or 2.0)
-        style     = lvl.get("approach_style", "unknown") or "unknown"
+        ltype          = lvl.get("type", "body_level")
+        strength       = float(lvl.get("strength", 3) or 3)
+        vol            = float(lvl.get("vol_ratio", 1.0) or 1.0)
+        touches        = min(float(lvl.get("touches_count") or lvl.get("approach", 1) or 1), 5.0)
+        atr_ratio      = float(lvl.get("atr_ratio", 2.0) or 2.0)
+        style          = lvl.get("approach_style", "unknown") or "unknown"
+        monitoring_age = min(float(lvl.get("monitoring_age_minutes") or 0.0), 300.0)
 
         ltype_enc = _type_map.get(ltype, 1)
         style_enc = STYLE_MAP.get(style, 3)
@@ -118,6 +121,7 @@ def ml_score(lvl: dict) -> dict:
             touches,
             min(atr_ratio, 20.0),
             style_enc,
+            monitoring_age,
         ]])
 
         # Classifier
