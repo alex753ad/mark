@@ -740,16 +740,30 @@ async def _do_analyze(message: Message, symbol: str):
             calculate_strength(lvl)
 
     # ML scoring
+    # 1.4: approach_style должен быть выставлен ДО вызова ML
+    # 1.3: impulse + strength=0 → 0% bounce, блокируем без ML
     try:
         from analysis.ml_score import apply_ml_to_level
+        from analysis.trigger import detect_approach_style as _das
+        _approach_style_analyze = _das(symbol)
         for lvl in filtered:
+            lvl["approach_style"] = _approach_style_analyze
+            # 1.3: hard-block impulse + strength=0
+            if lvl.get("approach_style") == "impulse" and lvl.get("strength", 0) == 0:
+                lvl["p_bounce"] = 0.0
+                lvl["ml_delta"] = -2
+                lvl["ml_blocked"] = True
+                lvl["strength_pre_ml"] = lvl.get("strength", 0)
+                logger.debug("blocked impulse+strength=0 in analyze: %s @ %s", symbol, lvl.get("level"))
+                continue
             apply_ml_to_level(lvl)
     except Exception as e:
         logger.warning("ml_score failed in analyze: %s", e)
 
-    strong = [lvl for lvl in filtered if lvl["strength"] >= 4]
-    average = [lvl for lvl in filtered if lvl["strength"] == 3]
-    weak = [lvl for lvl in filtered if lvl["strength"] < 3]
+    # Исключаем ml_blocked уровни из strong/average
+    strong = [lvl for lvl in filtered if lvl["strength"] >= 4 and not lvl.get("ml_blocked")]
+    average = [lvl for lvl in filtered if lvl["strength"] == 3 and not lvl.get("ml_blocked")]
+    weak = [lvl for lvl in filtered if lvl["strength"] < 3 or lvl.get("ml_blocked")]
 
     strong_sorted = sorted(strong, key=lambda l: l["strength"], reverse=True)
     average_sorted = sorted(average, key=lambda l: l["level"], reverse=True)
@@ -998,18 +1012,30 @@ async def _do_check(message: Message, symbol: str, level: float):
         except Exception as e:
             logger.error("Claude failed in check", error=str(e))
 
+    # 1.4: approach_style выставляем ДО вызова ML (иначе ML всегда получает "unknown")
+    from analysis.trigger import detect_approach_style, calculate_atr_ratio, get_vol_ratio_current
+    p_approach_style = detect_approach_style(symbol)
+    lvl_data["approach_style"] = p_approach_style
+
     # ML scoring
     try:
         from analysis.ml_score import apply_ml_to_level
-        apply_ml_to_level(lvl_data)
+        # 1.3: hard-block impulse + strength=0 → 0% bounce из данных
+        if p_approach_style == "impulse" and lvl_data.get("strength", 0) == 0:
+            lvl_data["p_bounce"] = 0.0
+            lvl_data["ml_delta"] = -2
+            lvl_data["ml_blocked"] = True
+            lvl_data["strength_pre_ml"] = lvl_data.get("strength", 0)
+            logger.debug("blocked impulse+strength=0 in check: %s @ %s", symbol, level)
+        else:
+            apply_ml_to_level(lvl_data)
     except Exception as e:
         logger.warning("ml_score failed in check: %s", e)
 
     # Get profile context for reason/grid_advice/confidence
-    from analysis.trigger import detect_approach_style, calculate_atr_ratio, get_vol_ratio_current
     from data.history import get_outcome_probs
 
-    p_approach_style = detect_approach_style(symbol)
+    # p_approach_style уже вычислен выше (перед ML scoring)
     p_atr_ratio = calculate_atr_ratio(symbol, level)
     p_vol_ratio = get_vol_ratio_current(symbol)
     outcome_probs = await get_outcome_probs(
