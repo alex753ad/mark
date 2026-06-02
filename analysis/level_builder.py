@@ -305,7 +305,10 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     # pump_start candles include the pump itself — big bodies 0.016→0.022
     # spread volume across low bins and drown out the real consolidation zone.
     # TradingView POC at 0.021 is the post-peak congestion area, not the pump base.
-    poc_candles = c15m[pump_peak_idx:]
+    # LEVEL-03: limit POC window to last 96 candles from peak (~24h) to avoid
+    # 2-day volume noise drowning out the current consolidation cluster.
+    poc_start = max(pump_peak_idx, len(c15m) - 96)
+    poc_candles = c15m[poc_start:]
     if len(poc_candles) < 5:
         poc_candles = c15m[pump_start_idx:]  # fallback if just pumped
     last_leg_low  = max(leg[0] for leg in pump_legs)
@@ -585,16 +588,16 @@ def _find_pump_legs(c15m: list[dict]) -> list[tuple[float, float, int, int]]:
         return []
 
     pump_start_idx = None
-    for i in range(max(0, high_idx - 60), high_idx):
+    for i in range(max(0, high_idx - 100), high_idx):  # LEVEL-02: was 60, now 100 (~25h)
         low_price = c15m[i]["low"]
         if low_price > 0 and (high_price - low_price) / low_price >= 0.05:
             pump_start_idx = i
             break
 
     if pump_start_idx is None:
-        logger.info("_find_pump_legs: no pump_start_idx — move < 5% in 60 candles before high",
+        logger.info("_find_pump_legs: no pump_start_idx — move < 5% in 100 candles before high",
                     high_price=round(high_price,6), high_idx=high_idx,
-                    search_from=max(0, high_idx-60))
+                    search_from=max(0, high_idx-100))
         return []
 
     pump_candles = c15m[pump_start_idx: high_idx + 1]
@@ -923,15 +926,34 @@ def _find_body_levels_simple(
     avg_vol     = sum(c["volume"] for c in c15m) / len(c15m) if c15m else 1
     radius      = cluster_radius if cluster_radius > 0 else atr * 0.5
 
-    boundaries = []
+    # LEVEL-04: build two boundary lists:
+    #   - post_pump_boundaries: candles AFTER the pump peak (these define support quality)
+    #   - pre_pump_boundaries:  candles BEFORE the pump peak (origin/base zones only)
+    # Clustering runs on post_pump_boundaries first; pre_pump candles are only used
+    # to form a boundary when no post-pump cluster exists at that price zone.
+    # This prevents 2-week pre-pump history from inflating cluster_weight / candle_count
+    # and pushing ancient body zones into the top-ranked results.
+    post_pump_boundaries: list[tuple] = []
+    pre_pump_boundaries:  list[tuple] = []
+
     for idx, c in enumerate(c15m):
         body_top = max(c["open"], c["close"])
         body_bot = min(c["open"], c["close"])
         if body_bot >= range_low and body_top <= upper_bound:
             tf_bonus   = _timeframe_bonus(c["open_time"])
             vol_weight = 5 if c["volume"] / avg_vol >= 2.0 else 3
-            boundaries.append((body_top, idx, c["volume"], tf_bonus, vol_weight))
-            boundaries.append((body_bot, idx, c["volume"], tf_bonus, vol_weight))
+            entry = (body_top, idx, c["volume"], tf_bonus, vol_weight)
+            entry_bot = (body_bot, idx, c["volume"], tf_bonus, vol_weight)
+            if pump_peak_time > 0 and c["open_time"] < pump_peak_time:
+                pre_pump_boundaries.append(entry)
+                pre_pump_boundaries.append(entry_bot)
+            else:
+                post_pump_boundaries.append(entry)
+                post_pump_boundaries.append(entry_bot)
+
+    # Combine: post-pump first so their clusters absorb radius neighbours;
+    # pre-pump appended after so they only fill gaps left by post-pump.
+    boundaries = post_pump_boundaries + pre_pump_boundaries
 
     levels = []
     used   = set()
