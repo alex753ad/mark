@@ -245,13 +245,16 @@ def train(db_path: str, out_dir: str) -> None:
     pickle.dump(le,             open(os.path.join(out_dir, "label_encoder.pkl"),  "wb"))
     pickle.dump(level_type_map, open(os.path.join(out_dir, "level_type_map.pkl"), "wb"))
 
+    import json as _json
+    thresholds = {"THRESHOLD_HIGH": round(float(p75), 4), "THRESHOLD_LOW": round(float(p25), 4)}
+    with open(os.path.join(out_dir, "thresholds.json"), "w") as _f:
+        _json.dump(thresholds, _f, indent=2)
+
     print(f"✅ Модели сохранены в {out_dir}/")
     print(f"   Классы: {list(le.classes_)}")
     print(f"   level_type_map: {level_type_map}")
+    print(f"   Пороги: THRESHOLD_HIGH={p75:.4f}  THRESHOLD_LOW={p25:.4f}")
     print()
-    print(f"📋 Обнови пороги в ml_score.py:")
-    print(f"   THRESHOLD_HIGH = {p75:.2f}  # было 0.57")
-    print(f"   THRESHOLD_LOW  = {p25:.2f}  # было 0.32")
 
     return len(df)
 

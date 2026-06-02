@@ -15,7 +15,7 @@ ML scoring for support levels.
     apply_ml_to_level(lvl)
     # lvl теперь содержит: p_bounce, expected_depth, ml_delta, strength_pre_ml
 
-Признаки модели (7 штук):
+Признаки модели (6 штук):
     1. strength        — Python-сила уровня (1-5)
     2. ltype_enc       — тип уровня (из level_type_map.pkl)
     3. vol_ratio       — объём / среднее (обрезается до 20)
@@ -23,8 +23,6 @@ ML scoring for support levels.
     5. atr_ratio       — расстояние до уровня в ATR (обрезается до 20)
     6. style_enc       — стиль подхода: flash=0, impulse=1, bleed=2, unknown=3
                          Доступен только в _monitored(); в _run_phase1 = "unknown"
-    7. monitoring_age  — минут от старта монитора до первого касания (обрезается до 300)
-                         Данные: bounce mean=5.2 мин, breakout mean=131 мин
 
 Hard-filter (применяется в apply_ml_to_level ДО ML):
     touches >= 2 → ml_delta = -2, p_bounce = 0.0
@@ -69,7 +67,7 @@ TOUCHES_BLOCK: int = 2
 
 
 def _load() -> bool:
-    global _clf, _reg, _le, _type_map
+    global _clf, _reg, _le, _type_map, THRESHOLD_HIGH, THRESHOLD_LOW
     if _clf is not None:
         return True
     try:
@@ -81,6 +79,15 @@ def _load() -> bool:
             _le = pickle.load(f)
         with open(os.path.join(_BASE, "level_type_map.pkl"), "rb") as f:
             _type_map = pickle.load(f)
+        # Load thresholds saved by train_ml.py, if available.
+        _thr_path = os.path.join(_BASE, "thresholds.json")
+        if os.path.exists(_thr_path):
+            import json as _json
+            with open(_thr_path) as _f:
+                _thr = _json.load(_f)
+            THRESHOLD_HIGH = float(_thr.get("THRESHOLD_HIGH", THRESHOLD_HIGH))
+            THRESHOLD_LOW  = float(_thr.get("THRESHOLD_LOW",  THRESHOLD_LOW))
+            logger.debug("ml_score: thresholds loaded HIGH=%.4f LOW=%.4f", THRESHOLD_HIGH, THRESHOLD_LOW)
         return True
     except Exception as e:
         logger.warning("ml_score: models not loaded — %s", e)
@@ -103,13 +110,12 @@ def ml_score(lvl: dict) -> dict:
         return {"p_bounce": 0.5, "expected_depth": 1.5, "ml_delta": 0}
 
     try:
-        ltype          = lvl.get("type", "body_level")
-        strength       = float(lvl.get("strength", 3) or 3)
-        vol            = float(lvl.get("vol_ratio", 1.0) or 1.0)
-        touches        = min(float(lvl.get("touches_count") or lvl.get("approach", 1) or 1), 5.0)
-        atr_ratio      = float(lvl.get("atr_ratio", 2.0) or 2.0)
-        style          = lvl.get("approach_style", "unknown") or "unknown"
-        monitoring_age = min(float(lvl.get("monitoring_age_minutes") or 0.0), 300.0)
+        ltype     = lvl.get("type", "body_level")
+        strength  = float(lvl.get("strength", 3) or 3)
+        vol       = float(lvl.get("vol_ratio", 1.0) or 1.0)
+        touches   = min(float(lvl.get("touches_count") or lvl.get("approach", 1) or 1), 5.0)
+        atr_ratio = float(lvl.get("atr_ratio", 2.0) or 2.0)
+        style     = lvl.get("approach_style", "unknown") or "unknown"
 
         ltype_enc = _type_map.get(ltype, 1)
         style_enc = STYLE_MAP.get(style, 3)
@@ -121,7 +127,6 @@ def ml_score(lvl: dict) -> dict:
             touches,
             min(atr_ratio, 20.0),
             style_enc,
-            monitoring_age,
         ]])
 
         # Classifier

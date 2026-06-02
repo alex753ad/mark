@@ -21,21 +21,34 @@ def _round_level(price: float) -> float:
 
 
 def _calc_atr_1m(c1m: list[dict]) -> float:
-    """Calculate ATR from 1M candles.
+    """Calculate ATR from 1M candles (Wilder, includes gaps).
     Note: duplicates trigger.calculate_atr to avoid circular import.
     """
-    if len(c1m) < ATR_PERIOD:
+    if len(c1m) < ATR_PERIOD + 1:
         return 0.0
-    recent = c1m[-ATR_PERIOD:]
-    return sum(c["high"] - c["low"] for c in recent) / ATR_PERIOD
+    recent = c1m[-(ATR_PERIOD + 1):]
+    trs = []
+    for i in range(1, len(recent)):
+        hl = recent[i]["high"] - recent[i]["low"]
+        hc = abs(recent[i]["high"] - recent[i - 1]["close"])
+        lc = abs(recent[i]["low"]  - recent[i - 1]["close"])
+        trs.append(max(hl, hc, lc))
+    return sum(trs) / len(trs)
 
 
 def _calc_atr_15m(c15m: list[dict]) -> float:
-    """Calculate ATR from 15M candles."""
-    if not c15m:
+    """Calculate ATR from 15M candles (Wilder, includes gaps)."""
+    period = 20
+    if len(c15m) < period + 1:
         return 0.0
-    recent = c15m[-20:]
-    return sum(c["high"] - c["low"] for c in recent) / len(recent)
+    recent = c15m[-(period + 1):]
+    trs = []
+    for i in range(1, len(recent)):
+        hl = recent[i]["high"] - recent[i]["low"]
+        hc = abs(recent[i]["high"] - recent[i - 1]["close"])
+        lc = abs(recent[i]["low"]  - recent[i - 1]["close"])
+        trs.append(max(hl, hc, lc))
+    return sum(trs) / len(trs)
 
 
 def _timeframe_bonus(open_time_ms: int) -> int:
@@ -1080,7 +1093,16 @@ def _deduplicate_simple(levels: list[dict], radius: float) -> list[dict]:
     if not levels:
         return []
 
-    TYPE_PRIORITY = {"pump_base": 3, "order_block": 2, "body_level": 1, "wick_level": 0, "mid_impulse_pause": 1}
+    TYPE_PRIORITY = {
+        "pump_base":         3,
+        "breakout_level":    3,   # consolidation ceiling = launch point, same importance as pump_base
+        "order_block":       2,
+        "consolidation_base": 2,
+        "body_level":        1,
+        "mid_impulse_pause": 1,
+        "consolidation":     1,
+        "wick_level":        0,
+    }
 
     sorted_levels = sorted(levels, key=lambda x: x["level"])
     result = [sorted_levels[0]]

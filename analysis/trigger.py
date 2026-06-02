@@ -68,24 +68,27 @@ def find_real_level(symbol: str, level: float) -> tuple[float, int]:
 
 
 def calculate_atr(symbol: str, c1m: list[dict] = None) -> float:
-    """Calculate Average True Range for symbol."""
+    """Calculate Average True Range for symbol (Wilder, includes gaps)."""
     if c1m is None:
         c1m = candles_1m.get(symbol, [])
-    if len(c1m) < ATR_PERIOD:
+    if len(c1m) < ATR_PERIOD + 1:
         return 0.0
-    recent = c1m[-ATR_PERIOD:]
-    tr_sum = sum(c["high"] - c["low"] for c in recent)
-    return tr_sum / ATR_PERIOD
+    recent = c1m[-(ATR_PERIOD + 1):]
+    trs = []
+    for i in range(1, len(recent)):
+        hl = recent[i]["high"] - recent[i]["low"]
+        hc = abs(recent[i]["high"] - recent[i - 1]["close"])
+        lc = abs(recent[i]["low"]  - recent[i - 1]["close"])
+        trs.append(max(hl, hc, lc))
+    return sum(trs) / len(trs)
 
 
 def calculate_atr_pct(symbol: str) -> float:
     """Calculate ATR as percentage of current price."""
     c1m = candles_1m.get(symbol, [])
-    if len(c1m) < ATR_PERIOD:
+    atr = calculate_atr(symbol, c1m)
+    if atr == 0.0:
         return 0.0
-    recent = c1m[-ATR_PERIOD:]
-    tr_sum = sum(c["high"] - c["low"] for c in recent)
-    atr = tr_sum / ATR_PERIOD
     current_price = c1m[-1]["close"]
     if current_price == 0:
         return 0.0
@@ -229,11 +232,13 @@ def _count_approaches(symbol: str, level: float, atr: float) -> int:
     c15m = candles_15m.get(symbol, [])
     threshold = atr * LEVEL_APPROACH_THRESHOLD
 
-    # Find pump peak time from 15M candles
+    # Find pump peak time from 15M candles — limit to last 100 candles (~25h)
+    # to avoid picking up a stale pump from weeks ago.
     pump_high_time = None
     if c15m:
-        pump_high = max(c["high"] for c in c15m)
-        for c in c15m:
+        recent_c15m = c15m[-100:]
+        pump_high = max(c["high"] for c in recent_c15m)
+        for c in recent_c15m:
             if c["high"] >= pump_high * 0.999:
                 pump_high_time = c["open_time"]
                 break

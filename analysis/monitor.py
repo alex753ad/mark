@@ -90,8 +90,12 @@ async def start_monitor(
             outcome = "breakout"
         elif not _touched:
             outcome = "no_reach"
-        elif fdp < 0.3:
-            outcome = "partial"
+        elif fdp < 1.0:
+            outcome = "partial_shallow"
+        elif fdp >= 2.0:
+            outcome = "partial_deep"
+        elif fdp >= 1.0:
+            outcome = "partial_mid"
         else:
             outcome = "bounce"
 
@@ -664,11 +668,9 @@ def _check_volume_trend_approach(symbol: str, level: float, level_side: str = "s
         return None
 
     volumes = [c["volume"] for c in directional_candles]
-    
-    # Check if volumes are growing - need at least 2 consecutive increases
-    if len(volumes) < 3:
-        return None
-    
+
+    # Check that volumes are strictly growing across all directional candles.
+    # len(volumes) >= PRESSURE_MIN_DIRECTIONAL_CANDLES (3) is already guaranteed above.
     growing = all(volumes[i] < volumes[i + 1] for i in range(len(volumes) - 1))
     if not growing:
         return None

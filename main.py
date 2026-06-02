@@ -149,8 +149,9 @@ async def _auto_screener_loop():
                 from analysis.claude_strength import calculate_strength_with_claude
                 import json as _json
 
-                client = await AsyncClient.create()
+                client = None
                 try:
+                    client = await AsyncClient.create()
                     for ticker, chg, natr, vol, sym in new_symbols:
                         try:
                             raw_15m = await client.futures_klines(symbol=sym, interval="15m", limit=500)
@@ -250,7 +251,8 @@ async def _auto_screener_loop():
                         except Exception as e:
                             logger.exception("Error setting up new symbol", symbol=sym, error=str(e))
                 finally:
-                    await client.close_connection()
+                    if client is not None:
+                        await client.close_connection()
 
             logger.info("Auto screener completed", total=len(rows), new=len(new_symbols))
 
@@ -954,6 +956,7 @@ async def _stale_monitor_loop() -> None:
     while True:
         try:
             stale_symbols: set[str] = set()
+            cancelled_tasks: list[asyncio.Task] = []
             all_tasks = state_manager.get_all_active_tasks()
 
             for task_key, task in list(all_tasks.items()):
@@ -985,11 +988,17 @@ async def _stale_monitor_loop() -> None:
                     stop_ev.set()
                 if not task.done():
                     task.cancel()
+                    cancelled_tasks.append(task)
                 state.remove_task(task_key)
                 stale_symbols.add(symbol)
                 logger.info("Stale monitor cancelled — rebuilding",
                             symbol=symbol, level=level,
                             current=current_price, distance_pct=round(distance_pct, 1))
+
+            # Wait for all cancelled tasks to fully exit their finally blocks
+            # before starting _run_phase1, to avoid two monitors on the same symbol.
+            if cancelled_tasks:
+                await asyncio.gather(*cancelled_tasks, return_exceptions=True)
 
             # Trigger level rebuild for each affected symbol
             for symbol in stale_symbols:
@@ -1096,8 +1105,10 @@ async def _proximity_loop():
                     if lvl_price >= current_price:
                         continue  # only support levels below price
 
-                    touch_key = f"weak_touch_{symbol}_{lvl_price}"
-                    resolve_key = f"weak_resolve_{symbol}_{lvl_price}"
+                    touch_idx_key = f"touch_idx_{symbol}_{lvl_price}"
+                    min_price_key = f"min_price_{symbol}_{lvl_price}"
+                    resolved_key  = f"resolved_{symbol}_{lvl_price}"
+                    wts = sym_state.weak_touch_state
 
                     from analysis.trigger import calculate_atr
                     atr = calculate_atr(symbol)
@@ -1106,23 +1117,21 @@ async def _proximity_loop():
                     price_touched = current_price <= lvl_price + touch_zone
 
                     if price_touched:
-                        if touch_key not in sym_state.proximity_notified:
+                        if touch_idx_key not in wts:
                             # First touch — record candle index and min price
-                            sym_state.proximity_notified[touch_key] = len(c1m) - 1
-                            sym_state.proximity_notified[f"weak_min_{symbol}_{lvl_price}"] = c1m[-1]["low"]
+                            wts[touch_idx_key] = len(c1m) - 1
+                            wts[min_price_key] = c1m[-1]["low"]
                         else:
                             # Update min price during touch
-                            prev_min = sym_state.proximity_notified.get(f"weak_min_{symbol}_{lvl_price}", lvl_price)
-                            sym_state.proximity_notified[f"weak_min_{symbol}_{lvl_price}"] = min(prev_min, c1m[-1]["low"])
+                            wts[min_price_key] = min(wts.get(min_price_key, lvl_price), c1m[-1]["low"])
                     else:
                         # Price moved away — resolve if we had a touch
-                        touch_idx = sym_state.proximity_notified.get(touch_key)
-                        if touch_idx is not None and resolve_key not in sym_state.proximity_notified:
-                            min_price = sym_state.proximity_notified.get(f"weak_min_{symbol}_{lvl_price}", lvl_price)
+                        touch_idx = wts.get(touch_idx_key)
+                        if touch_idx is not None and resolved_key not in wts:
+                            min_price = wts.get(min_price_key, lvl_price)
                             fill_depth = (lvl_price - min_price) / lvl_price * 100 if min_price < lvl_price else 0.0
 
                             # Determine outcome: bounce or breakout
-                            # Check if price returned above level
                             post_touch = c1m[int(touch_idx):]
                             returned_above = any(c["close"] > lvl_price for c in post_touch[-10:])
                             stayed_below = all(c["close"] < lvl_price for c in post_touch[-5:]) if len(post_touch) >= 5 else False
@@ -1141,15 +1150,15 @@ async def _proximity_loop():
                                            symbol=symbol, level=lvl_price)
 
                             # Mark resolved, clean up touch state
-                            sym_state.proximity_notified[resolve_key] = time.time()
-                            sym_state.proximity_notified.pop(touch_key, None)
-                            sym_state.proximity_notified.pop(f"weak_min_{symbol}_{lvl_price}", None)
+                            wts[resolved_key] = time.time()
+                            wts.pop(touch_idx_key, None)
+                            wts.pop(min_price_key, None)
 
                         # Reset resolve flag after price moves far away (> 2 ATR)
-                        if resolve_key in sym_state.proximity_notified:
+                        if resolved_key in wts:
                             dist = current_price - lvl_price
                             if atr > 0 and dist > atr * 2:
-                                sym_state.proximity_notified.pop(resolve_key, None)
+                                wts.pop(resolved_key, None)
                     
         except asyncio.CancelledError:
             raise

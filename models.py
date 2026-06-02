@@ -15,6 +15,11 @@ class SymbolState:
     stop_flags: dict[str, asyncio.Event] = field(default_factory=dict)
     last_trigger_time: float = 0.0
     proximity_notified: dict[str, float] = field(default_factory=dict)
+    # Separate storage for weak (unmonitored) level touch state.
+    # Keys: "touch_idx_{symbol}_{level}" -> int (candle index)
+    #       "min_price_{symbol}_{level}"  -> float (min price during touch)
+    #       "resolved_{symbol}_{level}"   -> float (timestamp of resolution)
+    weak_touch_state: dict = field(default_factory=dict)
     analyzed_levels: set[str] = field(default_factory=set)
     level_strengths: dict[str, int] = field(default_factory=dict)  # task_key -> strength
     
