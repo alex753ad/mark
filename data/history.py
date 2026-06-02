@@ -2,9 +2,9 @@ import aiosqlite
 import os
 from logger import logger
 
-from config import HISTORY_DB_FILE as _HISTORY_DB_FILE
-_railway = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
-DB_PATH = os.path.join(_railway, "history.db") if _railway else _HISTORY_DB_FILE
+# On Railway, use /data volume for persistence. Locally use project root.
+_DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", os.path.join(os.path.dirname(__file__), ".."))
+DB_PATH = os.path.join(_DATA_DIR, "history.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS level_outcomes (
@@ -175,11 +175,10 @@ async def update_symbol_profile(symbol: str) -> None:
                 return
 
             total = len(rows)
-            from collections import defaultdict
-            type_counts: dict = defaultdict(lambda: [0, 0])
+            type_counts = {"pump_base": [0, 0], "body_level": [0, 0], "wick_level": [0, 0]}
 
             for level_type, result in rows:
-                if level_type:
+                if level_type in type_counts:
                     type_counts[level_type][1] += 1
                     if result == "отбой":
                         type_counts[level_type][0] += 1
@@ -188,7 +187,7 @@ async def update_symbol_profile(symbol: str) -> None:
             body_rate = type_counts["body_level"][0] / type_counts["body_level"][1] if type_counts["body_level"][1] > 0 else 0
             wick_rate = type_counts["wick_level"][0] / type_counts["wick_level"][1] if type_counts["wick_level"][1] > 0 else 0
 
-            best_type = max(type_counts.items(), key=lambda x: x[1][0] / x[1][1] if x[1][1] > 0 else 0)[0] if type_counts else "body_level"
+            best_type = max(type_counts.items(), key=lambda x: x[1][0] / x[1][1] if x[1][1] > 0 else 0)[0]
 
             await db.execute(
                 """INSERT OR REPLACE INTO symbol_profiles
@@ -243,12 +242,15 @@ async def get_outcome_probs(
 
             total = len(rows)
             counts = {"no_reach": 0, "partial": 0, "bounce": 0, "breakout": 0}
+            # All partial_* variants normalise to "partial" (BUG-29)
+            _PARTIAL_VARIANTS = {"partial", "partial_shallow", "partial_mid", "partial_deep"}
             fill_depths = []
 
             for outcome, fill_depth in rows:
-                normalized = outcome if outcome in counts else ("partial" if outcome and outcome.startswith("partial") else None)
-                if normalized:
-                    counts[normalized] += 1
+                if outcome in _PARTIAL_VARIANTS:
+                    counts["partial"] += 1
+                elif outcome in counts:
+                    counts[outcome] += 1
                 if outcome == "bounce" and fill_depth is not None:
                     fill_depths.append(fill_depth)
 
