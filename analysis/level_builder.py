@@ -214,27 +214,33 @@ def _find_consolidation_zones(c15m: list[dict], support_range_low: float, suppor
         return []
 
     zones = []
-    # Narrow window for finding tight consolidation
-    window = 8 
-    step = 2
-    
+    # Narrow window for finding tight consolidation.
+    # step = window // 2 avoids heavy overlap between consecutive chunks
+    # (previously step=2 meant each pair of adjacent chunks shared 6/8 candles,
+    # causing the same cluster to appear 3-4 times — BUG-21 fix).
+    window = 8
+    step = window // 2  # = 4
+
     for i in range(0, len(c15m) - window, step):
         chunk = c15m[i:i+window]
         chunk_high = max(c["high"] for c in chunk)
         chunk_low = min(c["low"] for c in chunk)
         chunk_range = chunk_high - chunk_low
-        
+
         # Consolidation is tight if range < 3 ATR
         if chunk_range <= atr * 3:
             # Level is median of the range
             price = (chunk_high + chunk_low) / 2
             if support_range_low <= price <= support_range_high:
+                # Skip if an equivalent level is already queued (< 1 ATR away)
+                if atr > 0 and any(abs(z[0] - price) < atr for z in zones):
+                    continue
                 # Count how many candles are within 1 ATR of this price
                 count = sum(1 for c in chunk if abs(c["close"] - price) <= atr)
                 if count >= 5:
                     vol = sum(c["volume"] for c in chunk)
                     zones.append((price, count, {"volume_at_level": vol, "type": "consolidation_base"}))
-    
+
     return zones
 
 

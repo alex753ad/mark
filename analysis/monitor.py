@@ -23,6 +23,19 @@ from logger import logger
 # Global cooldown tracking for pressure alerts
 _pressure_alert_sent: dict[str, float] = {}  # key: "SYMBOL_LEVEL" -> timestamp
 PRESSURE_ALERT_COOLDOWN = 3600  # 1 hour cooldown for pressure alerts
+_PRESSURE_ALERT_TTL = PRESSURE_ALERT_COOLDOWN * 2  # evict entries older than 2× cooldown
+
+
+def _evict_stale_pressure_alerts() -> None:
+    """Remove entries from _pressure_alert_sent that are older than TTL.
+    
+    Call periodically (e.g. before each lookup) to prevent unbounded growth
+    when the screener continuously adds new symbols (BUG-19 fix).
+    """
+    now = time.time()
+    stale = [k for k, ts in _pressure_alert_sent.items() if now - ts > _PRESSURE_ALERT_TTL]
+    for k in stale:
+        del _pressure_alert_sent[k]
 
 
 async def _handle_sweep(symbol: str, level: float, level_side: str, c1m: list[dict]):
@@ -561,11 +574,12 @@ def _check_complications(symbol: str, level: float, level_side: str, approach_wa
         return None, None
 
     if not approach_warned and not weak_breakout_active:
-        # Check cooldown for pressure alert
+        # Evict stale entries to prevent unbounded memory growth (BUG-19)
+        _evict_stale_pressure_alerts()
         pressure_key = f"{symbol}_{level}"
         now = time.time()
         last_sent = _pressure_alert_sent.get(pressure_key, 0)
-        
+
         if (now - last_sent) > PRESSURE_ALERT_COOLDOWN:
             vol_trend = _check_volume_trend_approach(symbol, level, level_side)
             if vol_trend:

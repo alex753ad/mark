@@ -24,10 +24,25 @@ class SymbolState:
     level_strengths: dict[str, int] = field(default_factory=dict)  # task_key -> strength
     
     def make_task_key(self, level: float) -> str:
-        """Generate unique task key for symbol-level pair."""
+        """Generate unique task key for symbol-level pair.
+        
+        Uses '::' separator (not '_') to avoid ambiguity with symbols
+        that contain underscores (e.g. hypothetical FOO_BAR futures).
+        """
         from analysis.level_builder import _round_level
-        return f"{self.symbol}_{_round_level(level)}"
-    
+        return f"{self.symbol}::{_round_level(level)}"
+
+    @staticmethod
+    def parse_task_key(task_key: str) -> tuple[str, float] | None:
+        """Parse task_key → (symbol, level). Returns None if key is malformed."""
+        parts = task_key.rsplit("::", 1)
+        if len(parts) != 2:
+            return None
+        try:
+            return parts[0], float(parts[1])
+        except ValueError:
+            return None
+
     def add_task(self, level: float, task: asyncio.Task, strength: int = 0) -> str:
         """Add monitoring task for a level. Cancels existing tasks on nearby levels."""
         key = self.make_task_key(level)
@@ -35,20 +50,18 @@ class SymbolState:
         # Cancel existing tasks on levels within 0.5% (duplicates)
         if level > 0:
             for existing_key in list(self.tasks.keys()):
-                parts = existing_key.rsplit("_", 1)
-                if len(parts) == 2:
-                    try:
-                        existing_level = float(parts[1])
-                        if existing_level > 0 and abs(existing_level - level) / level < 0.005:
-                            self.tasks[existing_key].cancel()
-                            stop = self.stop_flags.get(existing_key)
-                            if stop:
-                                stop.set()
-                            del self.tasks[existing_key]
-                            self.stop_flags.pop(existing_key, None)
-                            self.level_strengths.pop(existing_key, None)
-                    except ValueError:
-                        pass
+                parsed = self.parse_task_key(existing_key)
+                if parsed is None:
+                    continue
+                existing_level = parsed[1]
+                if existing_level > 0 and abs(existing_level - level) / level < 0.005:
+                    self.tasks[existing_key].cancel()
+                    stop = self.stop_flags.get(existing_key)
+                    if stop:
+                        stop.set()
+                    del self.tasks[existing_key]
+                    self.stop_flags.pop(existing_key, None)
+                    self.level_strengths.pop(existing_key, None)
 
         self.tasks[key] = task
         self.stop_flags[key] = asyncio.Event()

@@ -405,19 +405,39 @@ def get_btc_change_1m() -> float:
     return round((btc[-1]["close"] - prev_close) / prev_close * 100, 4)
 
 
+_binance_client = None  # shared singleton to avoid creating a new connection per call
+_binance_client_lock = None  # asyncio.Lock — created lazily
+
+
+async def _get_shared_binance_client():
+    """Return (and lazily create) a shared AsyncClient singleton."""
+    global _binance_client, _binance_client_lock
+    if _binance_client_lock is None:
+        _binance_client_lock = asyncio.Lock()
+    async with _binance_client_lock:
+        if _binance_client is None:
+            from binance import AsyncClient
+            _binance_client = await AsyncClient.create()
+    return _binance_client
+
+
 async def get_funding_rate(symbol: str) -> float | None:
-    """Fetch latest funding rate from Binance. Returns None on error."""
+    """Fetch latest funding rate from Binance.
+    
+    Uses a shared persistent AsyncClient (singleton) to avoid creating
+    a new HTTP connection on every call (BUG-03 fix).
+    Returns None on error.
+    """
+    global _binance_client
     try:
-        from binance import AsyncClient
-        client = await AsyncClient.create()
-        try:
-            data = await client.futures_funding_rate(symbol=symbol, limit=1)
-            if data:
-                return float(data[-1]["fundingRate"])
-        finally:
-            await client.close_connection()
+        client = await _get_shared_binance_client()
+        data = await client.futures_funding_rate(symbol=symbol, limit=1)
+        if data:
+            return float(data[-1]["fundingRate"])
     except Exception:
-        logger.debug("Failed to fetch funding rate", symbol=symbol)
+        # Connection might be stale — reset singleton so next call reconnects
+        logger.debug("Failed to fetch funding rate, resetting client", symbol=symbol)
+        _binance_client = None
     return None
 
 
@@ -516,9 +536,10 @@ def calculate_strength(lvl: dict) -> dict:
         strength -= 1  # Only 1 candle = weak level
     # 2-3 candles = neutral (no bonus, no penalty)
 
-    # Approach count
+    # Approach count — penalise worn-out levels without hard override
+    # (hard-overriding to 2 wiped all prior bonuses; use a subtraction instead)
     if approach >= STRENGTH_APPROACH_EXIT_THRESHOLD:
-        strength = 2
+        strength -= 2
         verdict = "exit"
 
     # Position bonus — only origin (pump base) gets a bonus

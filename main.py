@@ -39,15 +39,12 @@ def save_active_monitors():
     monitors = []
     for state in state_manager._states.values():
         for task_key in state.tasks:
-            parts = task_key.rsplit("_", 1)
-            if len(parts) == 2:
-                try:
-                    monitors.append({
-                        "symbol": parts[0],
-                        "level": float(parts[1]),
-                    })
-                except ValueError:
-                    pass
+            parsed = state.parse_task_key(task_key)
+            if parsed is not None:
+                monitors.append({
+                    "symbol": parsed[0],
+                    "level": parsed[1],
+                })
     try:
         with open(ACTIVE_MONITORS_FILE, "w") as f:
             json.dump(monitors, f, indent=2)
@@ -217,7 +214,7 @@ async def _auto_screener_loop():
 
                             strong = [l for l in supports if l["strength"] >= 3]
                             if not strong:
-                                await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Нет сильных уровней (strength < 4), мониторинг не запущен")
+                                await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Нет сильных уровней (strength < 3), мониторинг не запущен")
                                 continue
 
                             # Monitor only the nearest strong level
@@ -370,13 +367,10 @@ async def _run_phase1(symbol: str):
             range_low = current_price * 0.80
             stale_levels = []
             for task_key in list(state.tasks.keys()):
-                parts = task_key.rsplit("_", 1)
-                if len(parts) != 2:
+                parsed = state.parse_task_key(task_key)
+                if parsed is None:
                     continue
-                try:
-                    monitored_level = float(parts[1])
-                except ValueError:
-                    continue
+                monitored_level = parsed[1]
                 if monitored_level < range_low:
                     stop_ev = state.stop_flags.get(task_key)
                     if stop_ev:
@@ -438,14 +432,11 @@ async def _run_phase1(symbol: str):
         current_monitored_level = None
         current_task_key = None
         for tk in list(state.tasks.keys()):
-            parts = tk.rsplit("_", 1)
-            if len(parts) == 2:
-                try:
-                    current_monitored_level = float(parts[1])
-                    current_task_key = tk
-                    break
-                except ValueError:
-                    pass
+            parsed = state.parse_task_key(tk)
+            if parsed is not None:
+                current_monitored_level = parsed[1]
+                current_task_key = tk
+                break
 
         if current_task_key is not None:
             new_dist = abs(current_price - nearest["level"])
@@ -960,14 +951,11 @@ async def _stale_monitor_loop() -> None:
             all_tasks = state_manager.get_all_active_tasks()
 
             for task_key, task in list(all_tasks.items()):
-                parts = task_key.rsplit("_", 1)
-                if len(parts) != 2:
+                from models import SymbolState
+                parsed = SymbolState.parse_task_key(task_key)
+                if parsed is None:
                     continue
-                symbol, level_str = parts
-                try:
-                    level = float(level_str)
-                except ValueError:
-                    continue
+                symbol, level = parsed
 
                 c1m = candles_1m.get(symbol, [])
                 if not c1m or level == 0:
@@ -977,7 +965,7 @@ async def _stale_monitor_loop() -> None:
                 if current_price == 0:
                     continue
 
-                distance_pct = abs(current_price - level) / level * 100
+                distance_pct = abs(current_price - level) / current_price * 100
                 if distance_pct <= STALE_PCT:
                     continue
 
@@ -1019,17 +1007,13 @@ async def _proximity_loop():
             all_tasks = state_manager.get_all_active_tasks()
             
             for task_key, task in list(all_tasks.items()):
-                # Parse task_key: "SYMBOL_LEVEL"
-                parts = task_key.rsplit("_", 1)
-                if len(parts) != 2:
+                # Parse task_key: "SYMBOL::LEVEL"
+                from models import SymbolState as _SS
+                _parsed = _SS.parse_task_key(task_key)
+                if _parsed is None:
                     continue
-                    
-                symbol, level_str = parts
-                try:
-                    level = float(level_str)
-                except ValueError:
-                    continue
-                
+                symbol, level = _parsed
+
                 state = state_manager.get_state(symbol)
                 
                 # Check if task is stopped
@@ -1046,7 +1030,7 @@ async def _proximity_loop():
                 if level == 0:
                     continue
                     
-                distance_pct = abs(current_price - level) / level * 100
+                distance_pct = abs(current_price - level) / current_price * 100
 
                 now = time.time()
                 last_sent = state.proximity_notified.get(task_key, 0)
@@ -1092,7 +1076,10 @@ async def _proximity_loop():
                     continue
                 current_price = c1m[-1]["close"]
                 sym_state = state_manager.get_state(symbol)
-                monitored = {float(k.rsplit("_", 1)[1]) for k in sym_state.tasks if "_" in k}
+                monitored = {
+                    p[1] for k in sym_state.tasks
+                    if (p := sym_state.parse_task_key(k)) is not None
+                }
 
                 for lvl_info in cached_levels:
                     lvl_price = lvl_info["level"]
