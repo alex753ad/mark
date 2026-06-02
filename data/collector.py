@@ -38,7 +38,16 @@ async def _fetch_history(client: AsyncClient, symbol: str) -> bool:
         raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=MAX_CANDLES)
     except BinanceAPIException:
         invalid_symbols.add(symbol)
-        logger.warning("Invalid symbol: %s", symbol)
+        candles_15m.pop(symbol, None)
+        candles_1m.pop(symbol, None)
+        logger.warning("Symbol delisted or invalid: %s", symbol)
+        try:
+            from bot.telegram import send_message
+            asyncio.create_task(
+                send_message(f"⚠️ {symbol} недоступен (делистинг?), удалён из мониторинга")
+            )
+        except Exception:
+            pass
         return False
     except Exception:
         logger.exception("Failed to fetch history for %s", symbol)
@@ -52,10 +61,6 @@ async def _update(client: AsyncClient, symbol: str):
     try:
         raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=2)
         raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=2)
-    except BinanceAPIException:
-        invalid_symbols.add(symbol)
-        logger.warning("Symbol became invalid during update, skipping: %s", symbol)
-        return
     except Exception:
         logger.warning("Failed to update candles for %s", symbol)
         return
@@ -130,43 +135,42 @@ def get_delta(symbol: str, window_seconds: int = 30) -> dict:
 
 
 async def _stream_agg_trades(symbol: str):
-    """Stream aggTrades for a symbol and update delta buffer."""
-    from binance import AsyncClient
-    client = await AsyncClient.create()
-    try:
-        bm = client.futures_multiplex_socket([f"{symbol.lower()}@aggTrade"])
-        async with bm as stream:
-            while symbol in agg_trades:
-                msg = await stream.recv()
-                if not msg or "data" not in msg:
-                    continue
-                data = msg["data"]
-                if data.get("e") != "aggTrade":
-                    continue
-
-                # m=True means buyer is maker → sell taker
-                # m=False means seller is maker → buy taker
-                is_buy = not data["m"]
-                qty = float(data["q"])
-                ts = data["T"] / 1000  # ms to seconds
-
-                buf = agg_trades.get(symbol)
-                if buf is None:
-                    break
-
-                buf.append({"ts": ts, "qty": qty, "is_buy": is_buy})
-
-                # Trim old entries
-                cutoff = time.time() - AGG_TRADES_WINDOW
-                agg_trades[symbol] = [t for t in buf if t["ts"] >= cutoff]
-
-    except Exception as e:
-        logger.debug("aggTrades stream error", symbol=symbol, error=str(e))
-    finally:
+    """Stream aggTrades for a symbol and update delta buffer. Reconnects on error."""
+    while symbol in agg_trades:
+        client = await AsyncClient.create()
         try:
-            await client.close_connection()
-        except Exception:
-            pass
+            bm = client.futures_multiplex_socket([f"{symbol.lower()}@aggTrade"])
+            async with bm as stream:
+                while symbol in agg_trades:
+                    msg = await stream.recv()
+                    if not msg or "data" not in msg:
+                        continue
+                    data = msg["data"]
+                    if data.get("e") != "aggTrade":
+                        continue
+
+                    is_buy = not data["m"]
+                    qty = float(data["q"])
+                    ts = data["T"] / 1000
+
+                    buf = agg_trades.get(symbol)
+                    if buf is None:
+                        break
+
+                    buf.append({"ts": ts, "qty": qty, "is_buy": is_buy})
+
+                    cutoff = time.time() - AGG_TRADES_WINDOW
+                    agg_trades[symbol] = [t for t in buf if t["ts"] >= cutoff]
+
+        except Exception as e:
+            logger.debug("aggTrades stream error, reconnecting", symbol=symbol, error=str(e))
+            agg_trades[symbol] = []
+            await asyncio.sleep(1)
+        finally:
+            try:
+                await client.close_connection()
+            except Exception:
+                pass
 
 
 async def start_collector():

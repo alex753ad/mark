@@ -4,6 +4,8 @@ import asyncio
 import time
 import json
 import os
+import subprocess
+import sys
 from logger import logger
 from constants import (
     TRIGGER_COOLDOWN_SECONDS,
@@ -589,9 +591,11 @@ async def _monitored(symbol: str, level: float, level_side: str,
             m_approach_style = monitor_result.get("approach_style")
             m_atr_ratio = monitor_result.get("atr_ratio")
             m_vol_ratio = monitor_result.get("vol_ratio_at_touch")
+            outcome_already_saved = monitor_result.get("outcome_saved", False)
         else:
             reason = monitor_result
             outcome = "breakout" if reason == "breakout" else None
+            outcome_already_saved = False
 
         result = "пробой" if reason == "breakout" else "отбой"
 
@@ -607,19 +611,23 @@ async def _monitored(symbol: str, level: float, level_side: str,
             atr = calculate_atr(symbol)
             vol_ratio_old = _calc_vol_ratio(symbol)
             touches = _count_approaches(symbol, level, atr) if atr > 0 else 1
-            await save_level_outcome(
-                symbol=symbol, level=level, level_type=level_type,
-                strength=strength, approach_type=level_side,
-                vol_ratio=vol_ratio_old, touches=touches,
-                result=result, duration=duration,
-                outcome=outcome,
-                approach_style=m_approach_style,
-                vol_ratio_at_touch=m_vol_ratio,
-                atr_ratio=m_atr_ratio,
-                fill_depth_pct=fill_depth_pct,
-                btc_change_1m=btc_change,
-                funding_rate=funding,
-            )
+            if outcome_already_saved:
+                logger.debug("Outcome already saved by monitor, skipping duplicate",
+                             symbol=symbol, level=level, outcome=outcome)
+            else:
+                await save_level_outcome(
+                    symbol=symbol, level=level, level_type=level_type,
+                    strength=strength, approach_type=level_side,
+                    vol_ratio=vol_ratio_old, touches=touches,
+                    result=result, duration=duration,
+                    outcome=outcome,
+                    approach_style=m_approach_style,
+                    vol_ratio_at_touch=m_vol_ratio,
+                    atr_ratio=m_atr_ratio,
+                    fill_depth_pct=fill_depth_pct,
+                    btc_change_1m=btc_change,
+                    funding_rate=funding,
+                )
             await update_symbol_profile(symbol)
             logger.info("Level outcome saved",
                        symbol=symbol, level=level, result=result,
@@ -1343,6 +1351,34 @@ async def _startup_monitoring():
         await client.close_connection()
 
 
+async def _ml_retrain_loop():
+    """Periodically check if ML models need retraining and reload after train_ml.py finishes."""
+    await asyncio.sleep(300)  # wait 5 min after startup
+    while True:
+        try:
+            from train_ml import should_retrain
+            from data.history import DB_PATH as _db_path
+            if should_retrain(_db_path):
+                logger.info("ML retrain triggered")
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "train_ml.py", "--db", _db_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    from analysis.ml_score import reload_models
+                    await reload_models()
+                    logger.info("ML retrain complete, models reloaded")
+                else:
+                    logger.error("train_ml.py failed",
+                                 returncode=proc.returncode,
+                                 stderr=stderr.decode()[:500])
+        except Exception:
+            logger.exception("Error in ML retrain loop")
+        await asyncio.sleep(3600)  # check every hour
+
+
 async def main():
     """Main entry point."""
     # Validate configuration
@@ -1375,6 +1411,7 @@ async def main():
         _auto_screener_loop(),
         _startup_monitoring(),
         _stale_monitor_loop(),
+        _ml_retrain_loop(),
     )
 
 

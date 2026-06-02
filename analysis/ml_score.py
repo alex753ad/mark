@@ -31,6 +31,7 @@ Hard-filter (применяется в apply_ml_to_level ДО ML):
 """
 
 from __future__ import annotations
+import asyncio
 import os
 import pickle
 import logging
@@ -45,6 +46,15 @@ _clf = None
 _reg = None
 _le  = None
 _type_map = None
+
+_model_lock: asyncio.Lock | None = None
+
+
+def _get_lock() -> asyncio.Lock:
+    global _model_lock
+    if _model_lock is None:
+        _model_lock = asyncio.Lock()
+    return _model_lock
 
 # Маппинг стилей подхода — константа, используется и при обучении, и при инференсе
 STYLE_MAP: dict[str, int] = {
@@ -92,6 +102,21 @@ def _load() -> bool:
     except Exception as e:
         logger.warning("ml_score: models not loaded — %s", e)
         return False
+
+
+async def reload_models() -> None:
+    """Hot-reload models after train_ml.py finishes. Thread-safe via asyncio.Lock."""
+    async with _get_lock():
+        global _clf, _reg, _le, _type_map
+        _clf = None
+        _reg = None
+        _le = None
+        _type_map = None
+        ok = _load()
+        if ok:
+            logger.info("ml_score: models reloaded successfully")
+        else:
+            logger.warning("ml_score: reload failed, models unavailable until next retry")
 
 
 def ml_score(lvl: dict) -> dict:

@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from data.collector import candles_15m, candles_1m, start_delta_tracking, stop_delta_tracking, get_delta
+from data.collector import candles_15m, candles_1m, start_delta_tracking, stop_delta_tracking, get_delta, _stream_agg_trades
 from bot.telegram import send_message
 from constants import (
     VOLUME_BREAKOUT_RATIO,
@@ -77,8 +77,9 @@ async def start_monitor(
     engulf_sent = False
     level_broken_sent = False
     classify_sent = False  # prevent duplicate _classify_and_log_level_event calls
+    _outcome_saved = [False]  # mutable flag: True if monitor.py already wrote level_outcomes
     iteration = 0
-    delta_stream_task = None  # kept for local reference; stream lifecycle managed by collector
+    delta_stream_task = None
     delta_signal_sent = False
     touch_c1m_idx = 0  # index in c1m when touch happened
     touch_classify_at = 0  # c1m index when to classify (touch_idx + 5)
@@ -119,6 +120,7 @@ async def start_monitor(
             "approach_style": approach_style,
             "atr_ratio": atr_ratio,
             "vol_ratio_at_touch": vol_ratio,
+            "outcome_saved": _outcome_saved[0],
         }
 
     _monitor_result = None
@@ -208,8 +210,10 @@ async def start_monitor(
 
             if level_side == "support" and last["low"] <= level * 1.002:
                 if not touched:
-                    # start_delta_tracking now also spawns/reuses the stream task (BUG-26)
+                    # Start delta tracking on first touch
                     start_delta_tracking(symbol)
+                    if delta_stream_task is None or delta_stream_task.done():
+                        delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
                     touch_c1m_idx = len(c1m) - 1
                     touch_classify_at = touch_c1m_idx + 5  # classify after 5 x 1M candles
                     touch_start_time = time.time()
@@ -220,6 +224,8 @@ async def start_monitor(
             if level_side == "resistance" and last["high"] >= level * 0.998:
                 if not touched:
                     start_delta_tracking(symbol)
+                    if delta_stream_task is None or delta_stream_task.done():
+                        delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
                     touch_c1m_idx = len(c1m) - 1
                     touch_classify_at = touch_c1m_idx + 5
                     touch_start_time = time.time()
@@ -237,6 +243,7 @@ async def start_monitor(
                         approach_style=approach_style, atr_ratio=atr_ratio,
                         touch_start_time=touch_start_time,
                         vol_ratio_at_touch=vol_ratio_captured,
+                        outcome_saved_flag=_outcome_saved,
                     ))
                     classify_sent = True
                 touch_classify_at = 0  # reset so we don't classify again
@@ -272,7 +279,8 @@ async def start_monitor(
                             level_type=level_type, strength=strength,
                             approach_style=approach_style, atr_ratio=atr_ratio,
                             touch_start_time=touch_start_time,
-                        vol_ratio_at_touch=vol_ratio_captured,
+                            vol_ratio_at_touch=vol_ratio_captured,
+                            outcome_saved_flag=_outcome_saved,
                         ))
                     else:
                         # classify already ran (5-candle timer) but bounce happened later — log it now
@@ -282,6 +290,7 @@ async def start_monitor(
                             approach_style=approach_style, atr_ratio=atr_ratio,
                             touch_start_time=touch_start_time,
                             vol_ratio_at_touch=vol_ratio_captured,
+                            outcome_saved_flag=_outcome_saved,
                         ))
                     classify_sent = True
                     rebound_sent = True
@@ -306,7 +315,8 @@ async def start_monitor(
                             level_type=level_type, strength=strength,
                             approach_style=approach_style, atr_ratio=atr_ratio,
                             touch_start_time=touch_start_time,
-                        vol_ratio_at_touch=vol_ratio_captured,
+                            vol_ratio_at_touch=vol_ratio_captured,
+                            outcome_saved_flag=_outcome_saved,
                         ))
                     else:
                         asyncio.create_task(_log_bounce_outcome(
@@ -315,6 +325,7 @@ async def start_monitor(
                             approach_style=approach_style, atr_ratio=atr_ratio,
                             touch_start_time=touch_start_time,
                             vol_ratio_at_touch=vol_ratio_captured,
+                            outcome_saved_flag=_outcome_saved,
                         ))
                     classify_sent = True
                     rebound_sent = True
@@ -341,7 +352,8 @@ async def start_monitor(
                             level_type=level_type, strength=strength,
                             approach_style=approach_style, atr_ratio=atr_ratio,
                             touch_start_time=touch_start_time,
-                        vol_ratio_at_touch=vol_ratio_captured,
+                            vol_ratio_at_touch=vol_ratio_captured,
+                            outcome_saved_flag=_outcome_saved,
                         ))
                         classify_sent = True
                     # Check near_miss: came within 0.5% but never touched
@@ -354,13 +366,15 @@ async def start_monitor(
                                 level_type=level_type, strength=strength,
                                 approach_style=approach_style, atr_ratio=atr_ratio,
                                 touch_start_time=touch_start_time,
-                        vol_ratio_at_touch=vol_ratio_captured,
+                                vol_ratio_at_touch=vol_ratio_captured,
+                                outcome_saved_flag=_outcome_saved,
                             ))
                             classify_sent = True
                     rebound_sent = False
                     approach_warned = False
                     touched = False
                     classify_sent = False  # reset for next touch
+                    _outcome_saved[0] = False  # reset: next touch is a new event
                     engulf_sent = False
                     level_broken_sent = False
                     delta_signal_sent = False
@@ -369,6 +383,7 @@ async def start_monitor(
                     touched = False
                     rebound_sent = False
                     classify_sent = False
+                    _outcome_saved[0] = False  # reset: next touch is a new event
                     touch_start_time = 0.0
                     vol_ratio_captured = 1.0
                     min_price_during = None
@@ -402,19 +417,15 @@ async def start_monitor(
         await asyncio.sleep(COLLECTOR_UPDATE_INTERVAL_SECONDS)
 
     # Cleanup delta tracking when monitor exits
-    # stop_delta_tracking now also cancels the stream task via _stream_tasks (BUG-26)
     stop_delta_tracking(symbol)
+    if delta_stream_task and not delta_stream_task.done():
+        delta_stream_task.cancel()
 
     return _monitor_result
 
 
 # Dedup guard: prevent multiple classify calls for the same touch event
 _classify_last_sent: dict[str, float] = {}  # key: "symbol:level" -> timestamp
-
-# Tracks levels for which save_level_outcome was already called inside monitor.py
-# to prevent double-write from _monitored() in main.py.
-# Key: "SYMBOL::LEVEL_ROUNDED", value: True
-_outcome_already_saved: dict[str, bool] = {}
 
 # Dedup guard: prevent duplicate rebound messages per symbol
 _rebound_last_sent: dict[str, float] = {}  # key: "symbol" -> timestamp
@@ -430,6 +441,7 @@ async def _log_bounce_outcome(
     atr_ratio: float = None,
     touch_start_time: float = 0.0,
     vol_ratio_at_touch: float = 1.0,
+    outcome_saved_flag: list = None,
 ):
     """Log a confirmed bounce directly to level_outcomes (used when classify already ran)."""
     import time as _time
@@ -458,7 +470,8 @@ async def _log_bounce_outcome(
         atr_ratio=atr_ratio,
         fill_depth_pct=round(fill_depth_pct, 4),
     )
-    _outcome_already_saved[f"{symbol}::{round(level, 8)}"] = True
+    if outcome_saved_flag is not None:
+        outcome_saved_flag[0] = True
 
 
 async def _classify_and_log_level_event(
@@ -474,6 +487,7 @@ async def _classify_and_log_level_event(
     atr_ratio: float = None,
     touch_start_time: float = 0.0,
     vol_ratio_at_touch: float = 1.0,
+    outcome_saved_flag: list = None,
 ):
     """
     Classify what happened at the level and log to history + send message.
@@ -564,7 +578,8 @@ async def _classify_and_log_level_event(
         atr_ratio=atr_ratio,
         fill_depth_pct=round(fill_depth_pct, 4),
     )
-    _outcome_already_saved[f"{symbol}::{round(level, 8)}"] = True
+    if outcome_saved_flag is not None:
+        outcome_saved_flag[0] = True
 
 
 def _check_complications(symbol: str, level: float, level_side: str, approach_warned: bool = False, volume_spike_notified: bool = False, engulf_sent: bool = False, level_broken_sent: bool = False, weak_breakout_active: bool = False) -> tuple[str | None, str | None]:

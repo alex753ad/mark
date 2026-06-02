@@ -16,8 +16,10 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY")  # Optional proxy URL
 # File paths
 TOKENS_FILE = "tokens.json"
 TRIGGER_TIMES_FILE = "trigger_times.json"
-HISTORY_DB_FILE = "history.db"
 ACTIVE_MONITORS_FILE = "active_monitors.json"
+
+_DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "")
+HISTORY_DB_FILE = os.path.join(_DATA_DIR, "history.db") if _DATA_DIR else "history.db"
 
 
 class TokenRegistry:
