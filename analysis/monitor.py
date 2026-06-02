@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from data.collector import candles_15m, candles_1m, start_delta_tracking, stop_delta_tracking, get_delta, _stream_agg_trades
+from data.collector import candles_15m, candles_1m, start_delta_tracking, stop_delta_tracking, get_delta
 from bot.telegram import send_message
 from constants import (
     VOLUME_BREAKOUT_RATIO,
@@ -78,7 +78,7 @@ async def start_monitor(
     level_broken_sent = False
     classify_sent = False  # prevent duplicate _classify_and_log_level_event calls
     iteration = 0
-    delta_stream_task = None
+    delta_stream_task = None  # kept for local reference; stream lifecycle managed by collector
     delta_signal_sent = False
     touch_c1m_idx = 0  # index in c1m when touch happened
     touch_classify_at = 0  # c1m index when to classify (touch_idx + 5)
@@ -208,10 +208,8 @@ async def start_monitor(
 
             if level_side == "support" and last["low"] <= level * 1.002:
                 if not touched:
-                    # Start delta tracking on first touch
+                    # start_delta_tracking now also spawns/reuses the stream task (BUG-26)
                     start_delta_tracking(symbol)
-                    if delta_stream_task is None or delta_stream_task.done():
-                        delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
                     touch_c1m_idx = len(c1m) - 1
                     touch_classify_at = touch_c1m_idx + 5  # classify after 5 x 1M candles
                     touch_start_time = time.time()
@@ -222,8 +220,6 @@ async def start_monitor(
             if level_side == "resistance" and last["high"] >= level * 0.998:
                 if not touched:
                     start_delta_tracking(symbol)
-                    if delta_stream_task is None or delta_stream_task.done():
-                        delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
                     touch_c1m_idx = len(c1m) - 1
                     touch_classify_at = touch_c1m_idx + 5
                     touch_start_time = time.time()
@@ -406,9 +402,8 @@ async def start_monitor(
         await asyncio.sleep(COLLECTOR_UPDATE_INTERVAL_SECONDS)
 
     # Cleanup delta tracking when monitor exits
+    # stop_delta_tracking now also cancels the stream task via _stream_tasks (BUG-26)
     stop_delta_tracking(symbol)
-    if delta_stream_task and not delta_stream_task.done():
-        delta_stream_task.cancel()
 
     return _monitor_result
 
