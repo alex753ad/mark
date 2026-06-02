@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Trading Dashboard</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<style>
+/* ─── Reset & Base ──────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:        #0d1117;
+  --surface:   #161b22;
+  --border:    #21262d;
+  --text:      #e6edf3;
+  --muted:     #7d8590;
+  --green:     #3fb950;
+  --red:       #f85149;
+  --cyan:      #58a6ff;
+  --orange:    #e3b341;
+  --purple:    #bc8cff;
+  --mono:      'Consolas', 'Courier New', monospace;
+}
+
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; }
+
+/* ─── Layout ────────────────────────────────────────────────────────── */
+#app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+/* Ticker bar */
+.ticker-bar {
+  display: flex; align-items: center; gap: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  height: 38px; flex-shrink: 0;
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
+}
+.ticker-bar::-webkit-scrollbar { display: none; }
+.ticker-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 16px; height: 100%;
+  border-right: 1px solid var(--border);
+  cursor: pointer; white-space: nowrap;
+  transition: background 0.15s;
+}
+.ticker-item:hover { background: var(--border); }
+.ticker-item.active { background: #1f2937; }
+.ticker-sym { font-weight: 600; font-size: 12px; color: var(--text); }
+.ticker-price { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.badge {
+  font-size: 10px; font-weight: 700; padding: 1px 5px;
+  border-radius: 3px; font-family: var(--mono);
+}
+.badge.up   { background: rgba(63,185,80,.18); color: var(--green); }
+.badge.down { background: rgba(248,81,73,.18);  color: var(--red);   }
+.badge.flat { background: rgba(125,133,144,.18); color: var(--muted); }
+.dot {
+  width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+}
+.dot.monitoring { background: var(--green); box-shadow: 0 0 5px var(--green); animation: pulse 2s infinite; }
+.dot.idle       { background: var(--muted); }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+/* Main content */
+.content { display: flex; flex: 1; overflow: hidden; }
+
+/* ─── Left: coin grid ───────────────────────────────────────────────── */
+.grid-panel {
+  flex: 1 1 60%; overflow-y: auto; padding: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+  align-content: start;
+}
+.grid-panel::-webkit-scrollbar { width: 4px; }
+.grid-panel::-webkit-scrollbar-track { background: transparent; }
+.grid-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* Coin card */
+.coin-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px;
+  cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.coin-card:hover        { border-color: #3a3f47; }
+.coin-card.selected     { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan); }
+.coin-card.monitoring   { border-left: 3px solid var(--green); }
+
+.card-header {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
+}
+.card-sym { font-weight: 700; font-size: 13px; }
+.card-price {
+  font-family: var(--mono); font-size: 12px; color: var(--muted);
+  margin-left: auto;
+}
+.phase-badge {
+  font-size: 9px; font-weight: 700; padding: 1px 5px;
+  border-radius: 3px; text-transform: uppercase; letter-spacing: .5px;
+}
+.phase-badge.phase2 { background: rgba(63,185,80,.18); color: var(--green); }
+.phase-badge.phase1 { background: rgba(227,179,65,.18); color: var(--orange); }
+.phase-badge.idle   { background: rgba(125,133,144,.15); color: var(--muted); }
+
+/* Level ruler */
+.ruler { position: relative; height: 140px; margin: 0 4px; }
+.ruler-axis {
+  position: absolute; left: 50%; top: 0; bottom: 0;
+  width: 1px; background: var(--border);
+}
+
+.level-row {
+  position: absolute; left: 0; right: 0;
+  display: flex; align-items: center; gap: 4px;
+}
+.level-line {
+  flex: 1; height: 1px;
+  border-top: 1px dashed;
+}
+.level-line.support    { border-color: var(--green); }
+.level-line.resistance { border-color: var(--red); }
+.level-line.monitored  { border-top-style: solid; }
+
+.level-label {
+  font-family: var(--mono); font-size: 9px; white-space: nowrap;
+  display: flex; align-items: center; gap: 3px;
+}
+.level-label.left-label  { text-align: right; min-width: 60px; color: var(--muted); }
+.level-label.right-label { min-width: 54px; }
+
+.stars { letter-spacing: -2px; font-size: 8px; }
+.stars .s { color: var(--orange); }
+.stars .e { color: var(--border); }
+
+/* Current price marker */
+.price-marker {
+  position: absolute; left: 0; right: 0;
+  display: flex; align-items: center; pointer-events: none; z-index: 2;
+}
+.price-line {
+  flex: 1; height: 1px; background: var(--cyan);
+  box-shadow: 0 0 4px var(--cyan);
+}
+.price-tag {
+  font-family: var(--mono); font-size: 9px; font-weight: 700;
+  color: var(--bg); background: var(--cyan);
+  padding: 1px 4px; border-radius: 2px; white-space: nowrap;
+}
+
+.no-levels {
+  height: 140px; display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 11px;
+}
+
+/* ─── Right: detail panel ───────────────────────────────────────────── */
+.detail-panel {
+  width: 360px; flex-shrink: 0;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.detail-panel.hidden { display: none; }
+
+.detail-header {
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.detail-sym {
+  font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 8px;
+}
+.detail-price {
+  font-family: var(--mono); font-size: 22px; font-weight: 700;
+  color: var(--cyan); margin-top: 2px;
+}
+.detail-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
+/* Levels table */
+.section-title {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .8px; color: var(--muted);
+  padding: 8px 16px 4px;
+}
+.levels-table { padding: 0 8px; flex-shrink: 0; }
+.levels-table table { width: 100%; border-collapse: collapse; }
+.levels-table th {
+  font-size: 9px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--muted); padding: 3px 6px; text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.levels-table td {
+  font-family: var(--mono); font-size: 11px;
+  padding: 4px 6px; border-bottom: 1px solid #1a1f27;
+}
+.levels-table tr:hover td { background: #1c2130; }
+.levels-table .mon-dot {
+  display: inline-block; width: 5px; height: 5px;
+  border-radius: 50%; background: var(--green);
+  box-shadow: 0 0 4px var(--green);
+  margin-right: 4px;
+}
+
+.strength-bar {
+  display: flex; gap: 2px; align-items: center;
+}
+.strength-pip {
+  width: 8px; height: 8px; border-radius: 1px;
+}
+.strength-pip.on  { background: var(--orange); }
+.strength-pip.off { background: var(--border); }
+
+/* Event log */
+.event-log {
+  flex: 1; overflow-y: auto; padding: 0 8px 8px;
+}
+.event-log::-webkit-scrollbar { width: 3px; }
+.event-log::-webkit-scrollbar-thumb { background: var(--border); }
+
+.event-row {
+  display: flex; gap: 6px; align-items: flex-start;
+  padding: 4px 6px; border-radius: 4px;
+  font-size: 11px; line-height: 1.4;
+}
+.event-row:hover { background: #1a1f27; }
+.event-time { color: var(--muted); font-family: var(--mono); font-size: 10px; white-space: nowrap; margin-top: 1px; }
+.event-type { font-size: 13px; flex-shrink: 0; }
+.event-text { color: var(--text); word-break: break-word; }
+
+/* ─── Empty / loading states ────────────────────────────────────────── */
+.empty-state {
+  grid-column: 1/-1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  color: var(--muted); gap: 8px; padding: 60px 0; font-size: 13px;
+}
+.empty-state .icon { font-size: 32px; }
+
+/* ─── Scrollbar global ──────────────────────────────────────────────── */
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+</style>
+</head>
+
+<body>
+<div id="app">
+
+  <!-- ── Ticker bar ── -->
+  <div class="ticker-bar">
+    <div
+      v-for="coin in state.coins"
+      :key="coin.symbol"
+      class="ticker-item"
+      :class="{ active: selected && selected.symbol === coin.symbol }"
+      @click="selectCoin(coin)"
+    >
+      <div class="dot" :class="coin.monitor_count > 0 ? 'monitoring' : 'idle'"></div>
+      <span class="ticker-sym">{{ coin.symbol.replace('USDT','') }}</span>
+      <span class="ticker-price">{{ fmtPrice(coin.price) }}</span>
+      <span class="badge" :class="pctClass(coin.pct_change)">
+        {{ fmtPct(coin.pct_change) }}
+      </span>
+    </div>
+    <div v-if="state.coins.length === 0" style="padding:0 16px;color:var(--muted)">
+      Ожидание данных…
+    </div>
+  </div>
+
+  <!-- ── Main ── -->
+  <div class="content">
+
+    <!-- Left: coin grid -->
+    <div class="grid-panel">
+
+      <div v-if="state.coins.length === 0" class="empty-state">
+        <div class="icon">📡</div>
+        <div>Подключение к боту…</div>
+        <div style="font-size:11px">{{ lastError || 'GET /api/state' }}</div>
+      </div>
+
+      <div
+        v-for="coin in state.coins"
+        :key="coin.symbol"
+        class="coin-card"
+        :class="{
+          selected:   selected && selected.symbol === coin.symbol,
+          monitoring: coin.monitor_count > 0,
+        }"
+        @click="selectCoin(coin)"
+      >
+        <!-- Card header -->
+        <div class="card-header">
+          <div class="dot" :class="coin.monitor_count > 0 ? 'monitoring' : 'idle'"></div>
+          <span class="card-sym">{{ coin.symbol.replace('USDT','') }}</span>
+          <span class="phase-badge" :class="coin.phase">{{ coin.phase }}</span>
+          <span class="card-price">{{ fmtPrice(coin.price) }}</span>
+        </div>
+
+        <!-- Level ruler -->
+        <div v-if="coin.levels.length > 0" class="ruler">
+          <div class="ruler-axis"></div>
+
+          <!-- Level lines, positioned by price -->
+          <div
+            v-for="lvl in rulerLevels(coin)"
+            :key="lvl.price"
+            class="level-row"
+            :style="{ top: lvl.top + 'px' }"
+          >
+            <div class="level-label left-label">
+              <span>{{ fmtPrice(lvl.price) }}</span>
+            </div>
+            <div
+              class="level-line"
+              :class="{
+                support:    lvl.price <= coin.price,
+                resistance: lvl.price > coin.price,
+                monitored:  lvl.monitored,
+              }"
+            ></div>
+            <div class="level-label right-label">
+              <span class="stars">
+                <span v-for="i in 5" :key="i" :class="i <= lvl.strength ? 's' : 'e'">★</span>
+              </span>
+              <span style="font-size:9px;color:var(--muted);margin-left:2px">{{ lvl.type.replace('_',' ') }}</span>
+            </div>
+          </div>
+
+          <!-- Current price marker -->
+          <div
+            v-if="coin.price"
+            class="price-marker"
+            :style="{ top: priceTop(coin) + 'px' }"
+          >
+            <div class="price-line"></div>
+            <div class="price-tag">{{ fmtPrice(coin.price) }}</div>
+            <div class="price-line"></div>
+          </div>
+        </div>
+
+        <div v-else class="no-levels">нет уровней — запустите /analyze</div>
+      </div>
+
+    </div>
+
+    <!-- Right: detail panel -->
+    <div class="detail-panel" :class="{ hidden: !selected }">
+      <template v-if="selected">
+
+        <div class="detail-header">
+          <div class="detail-sym">
+            <div class="dot" :class="selected.monitor_count > 0 ? 'monitoring' : 'idle'"></div>
+            {{ selected.symbol }}
+            <span class="phase-badge" :class="selected.phase" style="font-size:10px">{{ selected.phase }}</span>
+          </div>
+          <div class="detail-price">{{ fmtPrice(selected.price) }}</div>
+          <div class="detail-meta">
+            <span :class="pctClass(selected.pct_change)" style="font-weight:600">{{ fmtPct(selected.pct_change) }}</span>
+            &nbsp;·&nbsp;
+            Vol 15M: {{ fmtVol(selected.vol_15m) }}
+            &nbsp;·&nbsp;
+            {{ selected.monitor_count }} монитор{{ pluralRu(selected.monitor_count) }}
+          </div>
+        </div>
+
+        <!-- Levels table -->
+        <div class="section-title">Уровни</div>
+        <div class="levels-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Цена</th>
+                <th>Тип</th>
+                <th>Сила</th>
+                <th>Δ%</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="selected.levels.length === 0">
+                <td colspan="5" style="text-align:center;color:var(--muted);padding:12px">
+                  нет данных — /analyze
+                </td>
+              </tr>
+              <tr v-for="lvl in selected.levels" :key="lvl.price">
+                <td>{{ fmtPrice(lvl.price) }}</td>
+                <td style="color:var(--muted);font-size:10px">{{ lvl.type.replace('_',' ') }}</td>
+                <td>
+                  <div class="strength-bar">
+                    <div v-for="i in 5" :key="i" class="strength-pip" :class="i <= lvl.strength ? 'on' : 'off'"></div>
+                  </div>
+                </td>
+                <td :style="{ color: lvl.dist_pct < 0 ? 'var(--green)' : 'var(--red)' }">
+                  {{ lvl.dist_pct !== null ? (lvl.dist_pct > 0 ? '+' : '') + lvl.dist_pct + '%' : '—' }}
+                </td>
+                <td>
+                  <span v-if="lvl.monitored" class="mon-dot" title="мониторится"></span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Event log -->
+        <div class="section-title">События</div>
+        <div class="event-log" ref="eventLog">
+          <div v-if="events.length === 0" style="text-align:center;padding:16px;color:var(--muted)">нет событий</div>
+          <div
+            v-for="ev in events"
+            :key="ev.created_at + ev.event_type"
+            class="event-row"
+          >
+            <span class="event-time">{{ fmtTime(ev.created_at) }}</span>
+            <span class="event-type">{{ eventEmoji(ev.event_type) }}</span>
+            <span class="event-text">
+              <b>{{ ev.event_type }}</b>
+              <span v-if="ev.details" style="color:var(--muted)"> · {{ ev.details }}</span>
+            </span>
+          </div>
+        </div>
+
+      </template>
+      <div v-else style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted)">
+        Выберите монету
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const { createApp, ref, computed, onMounted, onUnmounted, watch, nextTick } = Vue;
+
+createApp({
+  setup() {
+    const POLL_MS   = 3000;
+    const RULER_H   = 140;
+    const PAD       = 12;   // px top/bottom padding for ruler
+
+    const state     = ref({ coins: [], ts: 0 });
+    const selected  = ref(null);
+    const events    = ref([]);
+    const lastError = ref('');
+    const eventLog  = ref(null);
+
+    let pollTimer   = null;
+    let evTimer     = null;
+
+    // ── Fetch state ──────────────────────────────────────────────────
+    async function fetchState() {
+      try {
+        const r = await fetch('/api/state');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        state.value = data;
+        lastError.value = '';
+
+        // Refresh selected coin reference
+        if (selected.value) {
+          const fresh = data.coins.find(c => c.symbol === selected.value.symbol);
+          if (fresh) selected.value = fresh;
+        }
+      } catch (e) {
+        lastError.value = e.message;
+      }
+    }
+
+    // ── Fetch events for selected coin ───────────────────────────────
+    async function fetchEvents(symbol) {
+      try {
+        const r = await fetch(`/api/events/${symbol}`);
+        if (!r.ok) return;
+        events.value = await r.json();
+        await nextTick();
+        // Scroll to top (newest first)
+        if (eventLog.value) eventLog.value.scrollTop = 0;
+      } catch { /* silent */ }
+    }
+
+    // ── Select coin ──────────────────────────────────────────────────
+    function selectCoin(coin) {
+      selected.value = coin;
+      events.value   = [];
+      fetchEvents(coin.symbol);
+      clearInterval(evTimer);
+      evTimer = setInterval(() => fetchEvents(coin.symbol), 5000);
+    }
+
+    // ── Ruler helpers ─────────────────────────────────────────────────
+    function rulerLevels(coin) {
+      if (!coin.price || coin.levels.length === 0) return [];
+
+      // Show max 6 levels closest to current price
+      const sorted = [...coin.levels]
+        .filter(l => l.price)
+        .sort((a, b) => Math.abs(a.dist_pct ?? 999) - Math.abs(b.dist_pct ?? 999))
+        .slice(0, 6);
+
+      const prices = sorted.map(l => l.price).concat(coin.price);
+      const minP   = Math.min(...prices) * 0.9995;
+      const maxP   = Math.max(...prices) * 1.0005;
+      const range  = maxP - minP || 1;
+
+      return sorted.map(l => ({
+        ...l,
+        top: PAD + (1 - (l.price - minP) / range) * (RULER_H - PAD * 2),
+      }));
+    }
+
+    function priceTop(coin) {
+      if (!coin.price || coin.levels.length === 0) return RULER_H / 2;
+      const prices = coin.levels.map(l => l.price).filter(Boolean).concat(coin.price);
+      const minP   = Math.min(...prices) * 0.9995;
+      const maxP   = Math.max(...prices) * 1.0005;
+      const range  = maxP - minP || 1;
+      return PAD + (1 - (coin.price - minP) / range) * (RULER_H - PAD * 2);
+    }
+
+    // ── Formatters ────────────────────────────────────────────────────
+    function fmtPrice(p) {
+      if (p == null) return '—';
+      if (p >= 1000) return p.toLocaleString('en', { maximumFractionDigits: 2 });
+      if (p >= 1)    return p.toFixed(4);
+      if (p >= 0.01) return p.toFixed(5);
+      return p.toFixed(8);
+    }
+
+    function fmtPct(v) {
+      if (v == null) return '—';
+      return (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+    }
+
+    function fmtVol(v) {
+      if (v == null) return '—';
+      if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+      if (v >= 1e6) return (v / 1e6).toFixed(0) + 'M';
+      if (v >= 1e3) return (v / 1e3).toFixed(0) + 'K';
+      return v.toString();
+    }
+
+    function fmtTime(ts) {
+      if (!ts) return '';
+      // ts may be ISO string or unix
+      const d = isNaN(ts) ? new Date(ts) : new Date(ts * 1000);
+      return d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function pctClass(v) {
+      if (v == null) return 'flat';
+      if (v > 0) return 'up';
+      if (v < 0) return 'down';
+      return 'flat';
+    }
+
+    function pluralRu(n) {
+      if (n === 1) return '';
+      if (n >= 2 && n <= 4) return 'а';
+      return 'ов';
+    }
+
+    const EVENT_EMOJI = {
+      bounce:           '✅',
+      breakout:         '💥',
+      monitoring_start: '👁',
+      levels_built:     '📐',
+      added_screener:   '🆕',
+      added_manual:     '✍️',
+      removed:          '🗑',
+      zakol:            '⚡',
+      volume_fade:      '📉',
+    };
+    function eventEmoji(t) {
+      return EVENT_EMOJI[t] || '📌';
+    }
+
+    // ── Lifecycle ────────────────────────────────────────────────────
+    onMounted(() => {
+      fetchState();
+      pollTimer = setInterval(fetchState, POLL_MS);
+    });
+
+    onUnmounted(() => {
+      clearInterval(pollTimer);
+      clearInterval(evTimer);
+    });
+
+    return {
+      state, selected, events, lastError, eventLog,
+      selectCoin, rulerLevels, priceTop,
+      fmtPrice, fmtPct, fmtVol, fmtTime, pctClass, pluralRu, eventEmoji,
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
