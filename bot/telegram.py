@@ -148,6 +148,22 @@ async def cb_remove(callback: CallbackQuery):
     if not token_registry.contains(symbol):
         await callback.answer(f"{symbol} не найден")
         return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Да, удалить", callback_data=f"remove_confirm:{symbol}"),
+        InlineKeyboardButton(text="Отмена",      callback_data="remove_cancel"),
+    ]])
+    await callback.message.edit_text(f"Удалить {symbol}?", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("remove_confirm:"))
+async def cb_remove_confirm(callback: CallbackQuery):
+    if not _authorized_cb(callback):
+        return
+    symbol = callback.data.split(":", 1)[1]
+    if not token_registry.contains(symbol):
+        await callback.answer(f"{symbol} не найден")
+        return
     token_registry.remove(symbol)
     from data.collector import candles_1m as c1m_data, candles_15m as c15m_data
     from main import cancel_tasks_for_symbol, clear_analysis_cache
@@ -159,6 +175,12 @@ async def cb_remove(callback: CallbackQuery):
     state_manager.get_state(symbol).phase = "idle"
     await callback.answer()
     await callback.message.edit_text(f"🛑 {symbol} удалён")
+
+
+@router.callback_query(F.data == "remove_cancel")
+async def cb_remove_cancel(callback: CallbackQuery):
+    await callback.message.edit_text("Отмена")
+    await callback.answer()
 
 
 @router.message(F.text == "📋 Список")
@@ -574,15 +596,7 @@ async def cmd_analyze(message: Message):
         await message.answer("Использование: /analyze SYMBOL", reply_markup=get_main_keyboard())
         return
     symbol = normalize_symbol(args[1])
-    # BUG-37: guard against double analysis (same fix as cb_analyze)
-    if symbol in _analyzing:
-        await message.answer(f"⏳ Анализ {symbol} уже выполняется...", reply_markup=get_main_keyboard())
-        return
-    _analyzing.add(symbol)
-    try:
-        await _do_analyze(message, symbol)
-    finally:
-        _analyzing.discard(symbol)
+    await _do_analyze(message, symbol)
 
 
 async def _do_analyze(message: Message, symbol: str):
@@ -739,10 +753,8 @@ async def _do_analyze(message: Message, symbol: str):
             logger.error("Failed to use Claude for analyze, falling back to Python",
                         symbol=symbol,
                         error=str(e))
-            # BUG-27: python_strength already calculated above — restore it,
-            # do NOT call calculate_strength() again (would double-penalise approach etc.)
             for lvl in filtered:
-                lvl["strength"] = lvl.get("python_strength", lvl["strength"])
+                lvl["strength"] = lvl.get("python_strength", lvl.get("strength", 1))
     else:
         # Use Python calculation
         for lvl in filtered:
@@ -951,17 +963,7 @@ async def _do_check(message: Message, symbol: str, level: float):
     zone_radius = atr_pct / 100 * current_price if current_price > 0 else 0
     all_levels = build_levels(symbol)
 
-    # Подсказка ближайшего уровня
-    if all_levels and level != 0:
-        nearest = min(all_levels, key=lambda l: abs(l["level"] - level))
-        distance_pct = abs(nearest["level"] - level) / level * 100
-
-        if distance_pct <= 2.0 and nearest["level"] != level:
-            await message.answer(
-                f"🔍 Ближайший уровень в данных: {nearest['level']}\n"
-                f"   Оцениваю {nearest['level']}..."
-            )
-            level = nearest["level"]
+    # find_real_level уже сделал кластерный поиск — второй поиск лишний
 
     match = None
     for lvl in all_levels:
@@ -1222,12 +1224,16 @@ async def cmd_stop(message: Message):
 
 
 async def send_message(text: str):
-    try:
-        if len(text) > 4096:
-            text = text[:4093] + "..."
-        await bot.send_message(TELEGRAM_CHAT_ID, text, reply_markup=get_main_keyboard())
-    except Exception:
-        logger.exception("Failed to send Telegram message")
+    if len(text) > 4096:
+        text = text[:4093] + "..."
+    for attempt in range(3):
+        try:
+            await bot.send_message(TELEGRAM_CHAT_ID, text, reply_markup=get_main_keyboard())
+            return
+        except Exception:
+            if attempt == 2:
+                logger.exception("Failed to send Telegram message after 3 attempts")
+            await asyncio.sleep(1)
 
 
 async def start_bot():

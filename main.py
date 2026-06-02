@@ -214,7 +214,7 @@ async def _auto_screener_loop():
 
                             strong = [l for l in supports if l["strength"] >= 3]
                             if not strong:
-                                await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Нет сильных уровней (strength < 3), мониторинг не запущен")
+                                await send_message(f"🆕 {sym} добавлен | {chg:+.1f}% | NATR {natr:.1f}%\n   Нет уровней с силой >= 3, мониторинг не запущен")
                                 continue
 
                             # Monitor only the nearest strong level
@@ -604,36 +604,30 @@ async def _monitored(symbol: str, level: float, level_side: str,
 
         try:
             from analysis.trigger import _calc_vol_ratio, _count_approaches, calculate_atr
-            from analysis.monitor import _outcome_already_saved as _oas
-            _oas_key = f"{symbol}::{round(level, 8)}"
-            if _oas.pop(_oas_key, False):
-                logger.debug("Skipping duplicate save_level_outcome", symbol=symbol, level=level)
-                await update_symbol_profile(symbol)
-            else:
-                atr = calculate_atr(symbol)
-                vol_ratio_old = _calc_vol_ratio(symbol)
-                touches = _count_approaches(symbol, level, atr) if atr > 0 else 1
-                await save_level_outcome(
-                    symbol=symbol, level=level, level_type=level_type,
-                    strength=strength, approach_type=level_side,
-                    vol_ratio=vol_ratio_old, touches=touches,
-                    result=result, duration=duration,
-                    outcome=outcome,
-                    approach_style=m_approach_style,
-                    vol_ratio_at_touch=m_vol_ratio,
-                    atr_ratio=m_atr_ratio,
-                    fill_depth_pct=fill_depth_pct,
-                    btc_change_1m=btc_change,
-                    funding_rate=funding,
-                )
-                await update_symbol_profile(symbol)
-                logger.info("Level outcome saved",
-                           symbol=symbol, level=level, result=result,
-                           outcome=outcome, duration=duration)
-                if outcome == "bounce":
-                    await log_event(symbol, "bounce", f"level={level} fill_depth={fill_depth_pct:.2f}% duration={duration}m")
-                elif outcome == "breakout":
-                    await log_event(symbol, "breakout", f"level={level} duration={duration}m")
+            atr = calculate_atr(symbol)
+            vol_ratio_old = _calc_vol_ratio(symbol)
+            touches = _count_approaches(symbol, level, atr) if atr > 0 else 1
+            await save_level_outcome(
+                symbol=symbol, level=level, level_type=level_type,
+                strength=strength, approach_type=level_side,
+                vol_ratio=vol_ratio_old, touches=touches,
+                result=result, duration=duration,
+                outcome=outcome,
+                approach_style=m_approach_style,
+                vol_ratio_at_touch=m_vol_ratio,
+                atr_ratio=m_atr_ratio,
+                fill_depth_pct=fill_depth_pct,
+                btc_change_1m=btc_change,
+                funding_rate=funding,
+            )
+            await update_symbol_profile(symbol)
+            logger.info("Level outcome saved",
+                       symbol=symbol, level=level, result=result,
+                       outcome=outcome, duration=duration)
+            if outcome == "bounce":
+                await log_event(symbol, "bounce", f"level={level} fill_depth={fill_depth_pct:.2f}% duration={duration}m")
+            elif outcome == "breakout":
+                await log_event(symbol, "breakout", f"level={level} duration={duration}m")
         except Exception as e:
             logger.exception("Failed to save history", task_key=task_key, error=str(e))
 
@@ -681,7 +675,7 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
     If nothing found — check screener and possibly remove symbol.
     """
     from data.collector import candles_1m as _c1m, candles_15m as _c15m
-    from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches, detect_approach_style
+    from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
     from bot.telegram import _last_analysis_cache
 
     state = state_manager.get_state(symbol)
@@ -721,60 +715,31 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
             next_started = True
             logger.info("Previous level started after breakout", symbol=symbol, level=prev_level)
 
-    # --- Priority 1: cached levels from last /analyze (strength recalculated) ---
+    # --- Priority 1: cached levels from last /analyze ---
     cached = _last_analysis_cache.get(symbol, [])
-    candidates = [l for l in cached if _in_range(l["level"])]
+    candidates = [l for l in cached if _in_range(l["level"]) and l.get("strength", 0) >= 3]
 
     if candidates:
         nearest = min(candidates, key=lambda l: abs(current_price - l["level"]))
-        # Recalculate strength with current data (cache may be stale)
-        recalc = {
-            "level": nearest["level"],
-            "type": nearest["type"],
-            "symbol": symbol,
-            "level_side": "support",
-            "position": nearest.get("position", "mid_move"),
-            "cluster": nearest.get("cluster", False),
-            "pump_volume_ratio": nearest.get("pump_volume_ratio", 1.5),
-            "poc_aligned": nearest.get("poc_aligned", False),
-            "hourly_open_bonus": nearest.get("hourly_open_bonus", 0),
-            "round_number_bonus": nearest.get("round_number_bonus", 0),
-            "candle_count": nearest.get("candle_count", 1),
-        }
-        recalc["approach"] = _count_approaches(symbol, recalc["level"], atr) if atr > 0 else 0
-        if atr > 0:
-            recalc.update(get_level_history(symbol, recalc["level"], atr))
-        calculate_strength(recalc)
-        try:
-            from analysis.ml_score import apply_ml_to_level
-            recalc["approach_style"] = detect_approach_style(symbol)
-            apply_ml_to_level(recalc)
-        except Exception as _e:
-            logger.warning("ml_score failed in cache recalc: %s", _e)
-        if recalc.get("strength", 0) < 3:
-            logger.info("Cached level strength too low after recalc, skipping",
-                       symbol=symbol, level=recalc["level"], strength=recalc.get("strength"))
-        else:
-            task_key = state.make_task_key(recalc["level"])
-            if task_key not in state.tasks:
-                task = asyncio.create_task(
-                    _monitored(symbol, recalc["level"], "support",
-                               level_type=recalc["type"],
-                               strength=recalc["strength"])
-                )
-                state.add_task(recalc["level"], task, strength=recalc.get("strength", 0))
-                state.phase = "phase2"
-                stars = "⭐️" * recalc["strength"]
-                await send_message(
-                    f"📋 {symbol} следующий уровень\n"
-                    f"   {stars} {recalc['level']} — {recalc['type']}\n"
-                    f"👁 Мониторинг запущен"
-                )
-                await log_event(symbol, "monitoring_start",
-                               f"level={recalc['level']} strength={recalc['strength']} (after breakout of {broken_level})")
-                next_started = True
-                logger.info("Next level from cache started (recalculated)", symbol=symbol,
-                           level=recalc["level"], strength=recalc["strength"])
+        task_key = state.make_task_key(nearest["level"])
+        if task_key not in state.tasks:
+            task = asyncio.create_task(
+                _monitored(symbol, nearest["level"], "support",
+                           level_type=nearest["type"],
+                           strength=nearest["strength"])
+            )
+            state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
+            state.phase = "phase2"
+            stars = "⭐️" * nearest["strength"]
+            await send_message(
+                f"📋 {symbol} следующий уровень\n"
+                f"   {stars} {nearest['level']} — {nearest['type']}\n"
+                f"👁 Мониторинг запущен"
+            )
+            await log_event(symbol, "monitoring_start",
+                           f"level={nearest['level']} strength={nearest['strength']} (after breakout of {broken_level})")
+            next_started = True
+            logger.info("Next level from cache started", symbol=symbol, level=nearest["level"])
 
     # --- Priority 2: rebuild from candles ---
     if not next_started and ext_c1m:
@@ -1259,8 +1224,17 @@ async def _startup_monitoring():
                     sym_state = state_manager.get_state(sym)
                     task_key  = sym_state.make_task_key(nearest_level)
                     if task_key not in sym_state.tasks:
-                        task = asyncio.create_task(_monitored(sym, nearest_level, "support"))
-                        sym_state.add_task(nearest_level, task)
+                        all_levels = build_levels(sym)
+                        matched = next(
+                            (l for l in all_levels if abs(l["level"] - nearest_level) / nearest_level < 0.003),
+                            None
+                        )
+                        strength = 0
+                        if matched:
+                            calculate_strength(matched)
+                            strength = matched.get("strength", 0)
+                        task = asyncio.create_task(_monitored(sym, nearest_level, "support", strength=strength))
+                        sym_state.add_task(nearest_level, task, strength=strength)
                         sym_state.phase = "phase2"
                         restored_symbols.add(sym)
                         if len(levels) > 1:

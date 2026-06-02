@@ -39,19 +39,15 @@ class TokenRegistry:
                 self._tokens = []
 
     def _save(self):
-        """Save tokens to file atomically (BUG-22: prevent partial writes)."""
-        tmp = TOKENS_FILE + ".tmp"
+        """Save tokens to file (atomic write to avoid corruption on crash)."""
         try:
+            tmp = TOKENS_FILE + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(self._tokens, f, indent=2)
             os.replace(tmp, TOKENS_FILE)
             logger.debug("Saved tokens", count=len(self._tokens))
         except Exception as e:
             logger.error("Failed to save tokens", error=str(e))
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
 
     def get_all(self) -> list[str]:
         """Get all registered tokens."""

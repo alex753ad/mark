@@ -242,15 +242,13 @@ async def get_outcome_probs(
 
             total = len(rows)
             counts = {"no_reach": 0, "partial": 0, "bounce": 0, "breakout": 0}
-            # All partial_* variants normalise to "partial" (BUG-29)
-            _PARTIAL_VARIANTS = {"partial", "partial_shallow", "partial_mid", "partial_deep"}
             fill_depths = []
 
+            _PARTIAL = {"partial", "partial_shallow", "partial_mid", "partial_deep"}
             for outcome, fill_depth in rows:
-                if outcome in _PARTIAL_VARIANTS:
-                    counts["partial"] += 1
-                elif outcome in counts:
-                    counts[outcome] += 1
+                normalized = "partial" if outcome in _PARTIAL else outcome
+                if normalized in counts:
+                    counts[normalized] += 1
                 if outcome == "bounce" and fill_depth is not None:
                     fill_depths.append(fill_depth)
 
