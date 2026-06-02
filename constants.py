@@ -41,11 +41,16 @@ CANDLES_HISTORY_LIMIT = 300  # Количество свечей для хран
 COLLECTOR_UPDATE_INTERVAL_SECONDS = 5  # Интервал обновления данных с Binance
 
 # Screener settings
-SCREENER_MIN_VOLUME_USD = 40_000_000  # Минимальный объём для скринера
-SCREENER_MIN_GROWTH_PCT = 10.0  # Минимальный рост для скринера
+SCREENER_MIN_VOLUME_USD = 40_000_000  # Минимальный объём за 24ч для скринера
+SCREENER_MIN_GROWTH_PCT = 10.0  # Минимальный рост за 24ч для скринера
 SCREENER_MIN_NATR = 2.0  # Минимальный NATR для скринера
+SCREENER_MIN_15M_VOLUME_USD = 1_000_000  # Минимальный объём последней 15М свечи для добавления
 SCREENER_DELAY_SECONDS = 15  # Задержка перед запуском скринера
 SCREENER_AUTO_INTERVAL_SECONDS = 600  # Интервал автоскринера (10 минут)
+
+# Volume fade — автоудаление монеты при падении объёма
+LOW_VOLUME_FADE_CANDLES = 4        # Сколько подряд 15М свечей проверять
+LOW_VOLUME_FADE_THRESHOLD = 400_000  # Порог объёма ($) каждой из N свечей
 
 # API limits
 CLAUDE_MAX_CONCURRENT_REQUESTS = 2  # Максимум параллельных запросов к Claude API
