@@ -411,6 +411,11 @@ async def start_monitor(
 # Dedup guard: prevent multiple classify calls for the same touch event
 _classify_last_sent: dict[str, float] = {}  # key: "symbol:level" -> timestamp
 
+# Tracks levels for which save_level_outcome was already called inside monitor.py
+# to prevent double-write from _monitored() in main.py.
+# Key: "SYMBOL::LEVEL_ROUNDED", value: True
+_outcome_already_saved: dict[str, bool] = {}
+
 # Dedup guard: prevent duplicate rebound messages per symbol
 _rebound_last_sent: dict[str, float] = {}  # key: "symbol" -> timestamp
 
@@ -453,6 +458,7 @@ async def _log_bounce_outcome(
         atr_ratio=atr_ratio,
         fill_depth_pct=round(fill_depth_pct, 4),
     )
+    _outcome_already_saved[f"{symbol}::{round(level, 8)}"] = True
 
 
 async def _classify_and_log_level_event(
@@ -558,6 +564,7 @@ async def _classify_and_log_level_event(
         atr_ratio=atr_ratio,
         fill_depth_pct=round(fill_depth_pct, 4),
     )
+    _outcome_already_saved[f"{symbol}::{round(level, 8)}"] = True
 
 
 def _check_complications(symbol: str, level: float, level_side: str, approach_warned: bool = False, volume_spike_notified: bool = False, engulf_sent: bool = False, level_broken_sent: bool = False, weak_breakout_active: bool = False) -> tuple[str | None, str | None]:

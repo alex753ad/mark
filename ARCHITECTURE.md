@@ -132,8 +132,8 @@ TELEGRAM_CHAT_ID=...         # Chat ID для авторизации (int)
 | | `LEVEL_CLUSTER_RADIUS_PCT` | 0.01 (1%) | Радиус кластера уровней |
 | | `LEVEL_REAL_CLUSTER_MIN_TOUCHES` | 3 | Мин. касаний для уточнения уровня |
 | | `LEVEL_REAL_CLUSTER_SHIFT_THRESHOLD` | 0.3 (30%) | Порог смещения медианы |
-| **Мониторинг** | `PROXIMITY_ALERT_DISTANCE_PCT` | 0.004 (0.4%) | Расстояние для proximity alert |
-| | `PROXIMITY_ALERT_COOLDOWN_SECONDS` | 600 (10 мин) | Cooldown proximity alerts |
+| **Мониторинг** | `PROXIMITY_ALERT_DISTANCE_PCT` | 0.02 (2%) | Расстояние для proximity alert |
+| | `PROXIMITY_ALERT_COOLDOWN_SECONDS` | 86400 (24 ч) | Cooldown proximity alerts |
 | | `WEAK_BREAKOUT_COOLDOWN_SECONDS` | 300 (5 мин) | Cooldown слабого пробоя |
 | **Объём** | `VOLUME_BREAKOUT_RATIO` | 2.0 | ×2 для подтверждения пробоя |
 | | `VOLUME_SPIKE_RATIO` | 3.0 | ×3 для алерта спайка |
