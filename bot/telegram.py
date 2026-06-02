@@ -1224,13 +1224,49 @@ async def cmd_stop(message: Message):
     await message.answer(f"🛑 Мониторинг {symbol} остановлен", reply_markup=get_main_keyboard())
 
 
-async def send_message(text: str):
-    try:
-        if len(text) > 4096:
-            text = text[:4093] + "..."
-        await bot.send_message(TELEGRAM_CHAT_ID, text, reply_markup=get_main_keyboard())
-    except Exception:
-        logger.exception("Failed to send Telegram message")
+async def send_message(text: str, max_retries: int = 3) -> bool:
+    """Send a Telegram message with retry logic (BUG-23).
+
+    Retries on transient errors (flood control, network, server) with
+    exponential back-off.  Non-retryable errors (BadRequest, Forbidden,
+    etc.) are logged and abort immediately so callers aren't silently
+    blocked.
+
+    Returns True on success, False if all attempts failed.
+    """
+    from aiogram.exceptions import (
+        TelegramRetryAfter,
+        TelegramNetworkError,
+        TelegramServerError,
+    )
+
+    if len(text) > 4096:
+        text = text[:4093] + "..."
+
+    for attempt in range(max_retries):
+        try:
+            await bot.send_message(TELEGRAM_CHAT_ID, text, reply_markup=get_main_keyboard())
+            return True
+        except TelegramRetryAfter as e:
+            wait = e.retry_after + 1
+            logger.warning("Telegram flood control — retrying in %ds (attempt %d/%d)",
+                           wait, attempt + 1, max_retries)
+            await asyncio.sleep(wait)
+        except (TelegramNetworkError, TelegramServerError) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning("Telegram transient error '%s' — retrying in %ds (attempt %d/%d)",
+                               type(e).__name__, wait, attempt + 1, max_retries)
+                await asyncio.sleep(wait)
+            else:
+                logger.error("Telegram transient error after %d attempts: %s", max_retries, e)
+        except Exception as e:
+            # Non-retryable (BadRequest, Forbidden, etc.) — log and give up
+            logger.exception("Telegram non-retryable error on send_message: %s", e)
+            return False
+
+    logger.error("send_message failed after %d attempts, message lost: %.80s", max_retries, text)
+    return False
 
 
 async def start_bot():
