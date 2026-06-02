@@ -52,6 +52,11 @@ async def _update(client: AsyncClient, symbol: str):
     try:
         raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=2)
         raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=2)
+    except BinanceAPIException:
+        # BUG-31: symbol was delisted / renamed after startup — stop polling it
+        invalid_symbols.add(symbol)
+        logger.warning("Symbol became invalid during update, skipping: %s", symbol)
+        return
     except Exception:
         logger.warning("Failed to update candles for %s", symbol)
         return

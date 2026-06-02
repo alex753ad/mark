@@ -2,6 +2,7 @@
 
 import os
 import json
+import shutil
 from dotenv import load_dotenv
 from logger import logger
 
@@ -10,7 +11,9 @@ load_dotenv()
 # API Configuration
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+# BUG-38: avoid silent "everyone is unauthorized" when var is missing
+_raw_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = int(_raw_chat_id) if _raw_chat_id else 0
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY")  # Optional proxy URL
 
 # File paths
@@ -39,13 +42,23 @@ class TokenRegistry:
                 self._tokens = []
 
     def _save(self):
-        """Save tokens to file."""
+        """Save tokens to file atomically (BUG-22: prevents truncation on crash).
+
+        Writes to a temp file first, then renames — so a kill between the two
+        operations leaves the original intact rather than an empty file.
+        """
+        tmp_path = TOKENS_FILE + ".tmp"
         try:
-            with open(TOKENS_FILE, "w") as f:
+            with open(tmp_path, "w") as f:
                 json.dump(self._tokens, f, indent=2)
+            shutil.move(tmp_path, TOKENS_FILE)
             logger.debug("Saved tokens", count=len(self._tokens))
         except Exception as e:
             logger.error("Failed to save tokens", error=str(e))
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     def get_all(self) -> list[str]:
         """Get all registered tokens."""

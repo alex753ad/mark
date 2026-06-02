@@ -27,8 +27,10 @@ def _authorized_cb(callback: CallbackQuery) -> bool:
 
 
 def normalize_symbol(raw: str) -> str:
+    # BUG-33: don't blindly append USDT — check for other known quote assets first
+    _QUOTE_ASSETS = ("USDT", "BUSD", "USDC", "BTC", "ETH", "BNB")
     symbol = raw.upper().strip()
-    if not symbol.endswith("USDT"):
+    if not any(symbol.endswith(q) for q in _QUOTE_ASSETS):
         symbol = symbol + "USDT"
     return symbol
 
@@ -397,9 +399,9 @@ async def send_screener_with_buttons(text: str, rows: list[tuple]):
     symbols = [sym for _, _, _, _, sym in rows]
     kb = _build_analyze_keyboard(symbols)
     try:
+        # BUG-39: no parse_mode — tickers with _ (e.g. 1000PEPE_USDT) crash Markdown parser
         await bot.send_message(
             TELEGRAM_CHAT_ID, text,
-            parse_mode="Markdown",
             reply_markup=kb
         )
     except Exception:
@@ -432,8 +434,8 @@ async def btn_market(message: Message):
 
         symbols = [sym for _, _, _, _, sym in rows]
         kb = _build_analyze_keyboard(symbols)
-        await message.answer("```\n" + "\n".join(lines) + "\n```",
-                             parse_mode="Markdown", reply_markup=kb)
+        # BUG-39: tickers with _ break Markdown — send as plain text
+        await message.answer("\n".join(lines), reply_markup=kb)
         logger.info("Market screener sent", symbols_count=len(rows))
 
     except Exception as e:
@@ -574,7 +576,15 @@ async def cmd_analyze(message: Message):
         await message.answer("Использование: /analyze SYMBOL", reply_markup=get_main_keyboard())
         return
     symbol = normalize_symbol(args[1])
-    await _do_analyze(message, symbol)
+    # BUG-37: guard against simultaneous /analyze + button tap for the same symbol
+    if symbol in _analyzing:
+        await message.answer(f"Анализ {symbol} уже выполняется...")
+        return
+    _analyzing.add(symbol)
+    try:
+        await _do_analyze(message, symbol)
+    finally:
+        _analyzing.discard(symbol)
 
 
 async def _do_analyze(message: Message, symbol: str):
@@ -731,13 +741,15 @@ async def _do_analyze(message: Message, symbol: str):
             logger.error("Failed to use Claude for analyze, falling back to Python",
                         symbol=symbol,
                         error=str(e))
-            # Fallback to Python
+            # BUG-27: do NOT call calculate_strength again — it already ran above
+            # and would double-apply penalties (approach>=2 → strength=2 twice → 1).
+            # Restore the pre-Claude python_strength instead.
             for lvl in filtered:
-                calculate_strength(lvl)
+                lvl["strength"] = lvl.get("python_strength", lvl["strength"])
     else:
-        # Use Python calculation
+        # Claude disabled — python_strength is already the final value
         for lvl in filtered:
-            calculate_strength(lvl)
+            lvl["strength"] = lvl.get("python_strength", lvl["strength"])
 
     # ML scoring
     # 1.4: approach_style должен быть выставлен ДО вызова ML
