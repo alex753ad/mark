@@ -9,16 +9,12 @@ import time
 invalid_symbols: set[str] = set()
 
 candles_15m: dict[str, list[dict]] = {}
-candles_1m:  dict[str, list[dict]] = {}
+candles_1m: dict[str, list[dict]] = {}
 
-# aggTrades delta buffer: {symbol: list of {ts, qty, is_buy}}
-# Only populated when symbol is being monitored.
+# aggTrades delta buffer: {symbol: deque of (timestamp, qty, is_buy_taker)}
+# Only populated when symbol is being monitored
 agg_trades: dict[str, list[dict]] = {}
 AGG_TRADES_WINDOW = 60  # keep last 60 seconds of trades
-
-# Active stream tasks — one per symbol. Used to prevent duplicate streams
-# and to cancel cleanly when stop_delta_tracking() is called (BUG-26).
-_stream_tasks: dict[str, asyncio.Task] = {}
 
 MAX_CANDLES = 300
 _ALWAYS_COLLECT = ["BTCUSDT"]
@@ -57,7 +53,6 @@ async def _update(client: AsyncClient, symbol: str):
         raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=2)
         raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=2)
     except BinanceAPIException:
-        # BUG-31: symbol was delisted / renamed after startup — stop polling it
         invalid_symbols.add(symbol)
         logger.warning("Symbol became invalid during update, skipping: %s", symbol)
         return
@@ -92,37 +87,16 @@ def _all_symbols() -> list[str]:
 
 
 def start_delta_tracking(symbol: str):
-    """Start tracking aggTrades delta for a symbol.
-
-    BUG-26: also spawns the self-healing stream task if not already running.
-    Calling this multiple times for the same symbol is safe — duplicate tasks
-    are suppressed via _stream_tasks.
-    """
+    """Start tracking aggTrades delta for a symbol."""
     if symbol not in agg_trades:
         agg_trades[symbol] = []
         logger.debug("Delta tracking started", symbol=symbol)
 
-    # Spawn or reuse the stream task
-    existing = _stream_tasks.get(symbol)
-    if existing is None or existing.done():
-        task = asyncio.create_task(_stream_agg_trades(symbol))
-        _stream_tasks[symbol] = task
-        logger.debug("aggTrades stream task spawned", symbol=symbol)
-
 
 def stop_delta_tracking(symbol: str):
-    """Stop tracking aggTrades delta for a symbol.
-
-    BUG-26: cancels the stream task so the connection is closed immediately.
-    """
+    """Stop tracking aggTrades delta for a symbol."""
     agg_trades.pop(symbol, None)
-
-    task = _stream_tasks.pop(symbol, None)
-    if task and not task.done():
-        task.cancel()
-        logger.debug("aggTrades stream task cancelled", symbol=symbol)
-    else:
-        logger.debug("Delta tracking stopped", symbol=symbol)
+    logger.debug("Delta tracking stopped", symbol=symbol)
 
 
 def get_delta(symbol: str, window_seconds: int = 30) -> dict:
@@ -156,74 +130,43 @@ def get_delta(symbol: str, window_seconds: int = 30) -> dict:
 
 
 async def _stream_agg_trades(symbol: str):
-    """Stream aggTrades for a symbol with automatic reconnection (BUG-26).
+    """Stream aggTrades for a symbol and update delta buffer."""
+    from binance import AsyncClient
+    client = await AsyncClient.create()
+    try:
+        bm = client.futures_multiplex_socket([f"{symbol.lower()}@aggTrade"])
+        async with bm as stream:
+            while symbol in agg_trades:
+                msg = await stream.recv()
+                if not msg or "data" not in msg:
+                    continue
+                data = msg["data"]
+                if data.get("e") != "aggTrade":
+                    continue
 
-    Changes vs old implementation:
-    - Self-healing reconnect loop with exponential back-off (1s → 30s).
-      Restarts on any error without waiting for monitor.py's 5-second tick.
-    - Single AsyncClient per connection attempt — no client created per call.
-    - Buffer cleared on disconnect so get_delta() returns zeros, not stale data.
-    - Exits cleanly (no reconnect) on CancelledError or when stop_delta_tracking()
-      removes the symbol from agg_trades.
-    """
-    _RECONNECT_DELAY_MIN = 1
-    _RECONNECT_DELAY_MAX = 30
-    delay = _RECONNECT_DELAY_MIN
+                # m=True means buyer is maker → sell taker
+                # m=False means seller is maker → buy taker
+                is_buy = not data["m"]
+                qty = float(data["q"])
+                ts = data["T"] / 1000  # ms to seconds
 
-    while symbol in agg_trades:
-        client = None
+                buf = agg_trades.get(symbol)
+                if buf is None:
+                    break
+
+                buf.append({"ts": ts, "qty": qty, "is_buy": is_buy})
+
+                # Trim old entries
+                cutoff = time.time() - AGG_TRADES_WINDOW
+                agg_trades[symbol] = [t for t in buf if t["ts"] >= cutoff]
+
+    except Exception as e:
+        logger.debug("aggTrades stream error", symbol=symbol, error=str(e))
+    finally:
         try:
-            client = await AsyncClient.create()
-            delay = _RECONNECT_DELAY_MIN  # reset back-off on successful connect
-
-            bm = client.futures_multiplex_socket([f"{symbol.lower()}@aggTrade"])
-            async with bm as stream:
-                logger.debug("aggTrades stream connected", symbol=symbol)
-                while symbol in agg_trades:
-                    msg = await stream.recv()
-                    if not msg or "data" not in msg:
-                        continue
-                    data = msg["data"]
-                    if data.get("e") != "aggTrade":
-                        continue
-
-                    # m=True means buyer is maker → sell taker
-                    # m=False means seller is maker → buy taker
-                    is_buy = not data["m"]
-                    qty = float(data["q"])
-                    ts = data["T"] / 1000  # ms to seconds
-
-                    buf = agg_trades.get(symbol)
-                    if buf is None:
-                        return  # stop_delta_tracking was called mid-stream
-
-                    buf.append({"ts": ts, "qty": qty, "is_buy": is_buy})
-
-                    # Trim entries older than the window
-                    cutoff = time.time() - AGG_TRADES_WINDOW
-                    agg_trades[symbol] = [t for t in buf if t["ts"] >= cutoff]
-
-        except asyncio.CancelledError:
-            logger.debug("aggTrades stream cancelled", symbol=symbol)
-            return  # clean exit — do not reconnect
-        except Exception as e:
-            if symbol not in agg_trades:
-                return  # tracking stopped while connecting
-
-            logger.warning("aggTrades stream error — reconnecting in %ds: %s", delay, e)
-
-            # Clear stale buffer so callers see zeros, not data from dead stream
-            if symbol in agg_trades:
-                agg_trades[symbol] = []
-
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, _RECONNECT_DELAY_MAX)
-        finally:
-            if client is not None:
-                try:
-                    await client.close_connection()
-                except Exception:
-                    pass
+            await client.close_connection()
+        except Exception:
+            pass
 
 
 async def start_collector():

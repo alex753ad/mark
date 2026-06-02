@@ -1,13 +1,10 @@
 import aiosqlite
 import os
-from collections import defaultdict
 from logger import logger
-from config import HISTORY_DB_FILE
 
-# BUG-24: use the canonical path from config instead of __file__-relative logic.
-# On Railway, RAILWAY_VOLUME_MOUNT_PATH overrides the default.
-_railway_vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
-DB_PATH = os.path.join(_railway_vol, "history.db") if _railway_vol else HISTORY_DB_FILE
+from config import HISTORY_DB_FILE as _HISTORY_DB_FILE
+_railway = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+DB_PATH = os.path.join(_railway, "history.db") if _railway else _HISTORY_DB_FILE
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS level_outcomes (
@@ -178,29 +175,20 @@ async def update_symbol_profile(symbol: str) -> None:
                 return
 
             total = len(rows)
-            # BUG-28: use defaultdict so breakout_level, order_block etc. are counted too
-            type_counts: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # [bounces, total]
+            from collections import defaultdict
+            type_counts: dict = defaultdict(lambda: [0, 0])
 
             for level_type, result in rows:
-                if not level_type:
-                    continue
-                type_counts[level_type][1] += 1
-                if result == "отбой":
-                    type_counts[level_type][0] += 1
+                if level_type:
+                    type_counts[level_type][1] += 1
+                    if result == "отбой":
+                        type_counts[level_type][0] += 1
 
-            best_type = max(
-                type_counts.items(),
-                key=lambda x: x[1][0] / x[1][1] if x[1][1] > 0 else 0,
-                default=("pump_base", [0, 0]),
-            )[0]
+            base_rate = type_counts["pump_base"][0] / type_counts["pump_base"][1] if type_counts["pump_base"][1] > 0 else 0
+            body_rate = type_counts["body_level"][0] / type_counts["body_level"][1] if type_counts["body_level"][1] > 0 else 0
+            wick_rate = type_counts["wick_level"][0] / type_counts["wick_level"][1] if type_counts["wick_level"][1] > 0 else 0
 
-            def _rate(t: str) -> float:
-                c = type_counts[t]
-                return c[0] / c[1] if c[1] > 0 else 0.0
-
-            base_rate = _rate("pump_base")
-            body_rate = _rate("body_level")
-            wick_rate = _rate("wick_level")
+            best_type = max(type_counts.items(), key=lambda x: x[1][0] / x[1][1] if x[1][1] > 0 else 0)[0] if type_counts else "body_level"
 
             await db.execute(
                 """INSERT OR REPLACE INTO symbol_profiles
@@ -258,13 +246,9 @@ async def get_outcome_probs(
             fill_depths = []
 
             for outcome, fill_depth in rows:
-                # BUG-29: normalise partial_shallow / partial_deep / partial_mid → "partial"
-                if outcome and outcome.startswith("partial"):
-                    key = "partial"
-                else:
-                    key = outcome
-                if key in counts:
-                    counts[key] += 1
+                normalized = outcome if outcome in counts else ("partial" if outcome and outcome.startswith("partial") else None)
+                if normalized:
+                    counts[normalized] += 1
                 if outcome == "bounce" and fill_depth is not None:
                     fill_depths.append(fill_depth)
 

@@ -27,10 +27,8 @@ def _authorized_cb(callback: CallbackQuery) -> bool:
 
 
 def normalize_symbol(raw: str) -> str:
-    # BUG-33: don't blindly append USDT — check for other known quote assets first
-    _QUOTE_ASSETS = ("USDT", "BUSD", "USDC", "BTC", "ETH", "BNB")
     symbol = raw.upper().strip()
-    if not any(symbol.endswith(q) for q in _QUOTE_ASSETS):
+    if not symbol.endswith("USDT"):
         symbol = symbol + "USDT"
     return symbol
 
@@ -150,6 +148,22 @@ async def cb_remove(callback: CallbackQuery):
     if not token_registry.contains(symbol):
         await callback.answer(f"{symbol} не найден")
         return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"remove_confirm:{symbol}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="remove_cancel"),
+    ]])
+    await callback.answer()
+    await callback.message.edit_text(f"Удалить {symbol}?", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("remove_confirm:"))
+async def cb_remove_confirm(callback: CallbackQuery):
+    if not _authorized_cb(callback):
+        return
+    symbol = callback.data.split(":", 1)[1]
+    if not token_registry.contains(symbol):
+        await callback.answer(f"{symbol} не найден")
+        return
     token_registry.remove(symbol)
     from data.collector import candles_1m as c1m_data, candles_15m as c15m_data
     from main import cancel_tasks_for_symbol, clear_analysis_cache
@@ -159,8 +173,17 @@ async def cb_remove(callback: CallbackQuery):
     cancel_tasks_for_symbol(symbol)
     clear_analysis_cache(symbol)
     state_manager.get_state(symbol).phase = "idle"
+    await log_event(symbol, "removed", "manual via button")
     await callback.answer()
     await callback.message.edit_text(f"🛑 {symbol} удалён")
+
+
+@router.callback_query(F.data == "remove_cancel")
+async def cb_remove_cancel(callback: CallbackQuery):
+    if not _authorized_cb(callback):
+        return
+    await callback.answer()
+    await callback.message.edit_text("Удаление отменено")
 
 
 @router.message(F.text == "📋 Список")
@@ -399,9 +422,9 @@ async def send_screener_with_buttons(text: str, rows: list[tuple]):
     symbols = [sym for _, _, _, _, sym in rows]
     kb = _build_analyze_keyboard(symbols)
     try:
-        # BUG-39: no parse_mode — tickers with _ (e.g. 1000PEPE_USDT) crash Markdown parser
         await bot.send_message(
             TELEGRAM_CHAT_ID, text,
+            parse_mode="Markdown",
             reply_markup=kb
         )
     except Exception:
@@ -434,8 +457,8 @@ async def btn_market(message: Message):
 
         symbols = [sym for _, _, _, _, sym in rows]
         kb = _build_analyze_keyboard(symbols)
-        # BUG-39: tickers with _ break Markdown — send as plain text
-        await message.answer("\n".join(lines), reply_markup=kb)
+        await message.answer("```\n" + "\n".join(lines) + "\n```",
+                             parse_mode="Markdown", reply_markup=kb)
         logger.info("Market screener sent", symbols_count=len(rows))
 
     except Exception as e:
@@ -576,15 +599,7 @@ async def cmd_analyze(message: Message):
         await message.answer("Использование: /analyze SYMBOL", reply_markup=get_main_keyboard())
         return
     symbol = normalize_symbol(args[1])
-    # BUG-37: guard against simultaneous /analyze + button tap for the same symbol
-    if symbol in _analyzing:
-        await message.answer(f"Анализ {symbol} уже выполняется...")
-        return
-    _analyzing.add(symbol)
-    try:
-        await _do_analyze(message, symbol)
-    finally:
-        _analyzing.discard(symbol)
+    await _do_analyze(message, symbol)
 
 
 async def _do_analyze(message: Message, symbol: str):
@@ -741,15 +756,13 @@ async def _do_analyze(message: Message, symbol: str):
             logger.error("Failed to use Claude for analyze, falling back to Python",
                         symbol=symbol,
                         error=str(e))
-            # BUG-27: do NOT call calculate_strength again — it already ran above
-            # and would double-apply penalties (approach>=2 → strength=2 twice → 1).
-            # Restore the pre-Claude python_strength instead.
+            # Fallback: restore python_strength, don't recalculate
             for lvl in filtered:
                 lvl["strength"] = lvl.get("python_strength", lvl["strength"])
     else:
-        # Claude disabled — python_strength is already the final value
+        # Use Python calculation
         for lvl in filtered:
-            lvl["strength"] = lvl.get("python_strength", lvl["strength"])
+            calculate_strength(lvl)
 
     # ML scoring
     # 1.4: approach_style должен быть выставлен ДО вызова ML
@@ -954,17 +967,15 @@ async def _do_check(message: Message, symbol: str, level: float):
     zone_radius = atr_pct / 100 * current_price if current_price > 0 else 0
     all_levels = build_levels(symbol)
 
-    # Подсказка ближайшего уровня
+    # Подсказка ближайшего уровня (только информационно, не меняет level)
     if all_levels and level != 0:
         nearest = min(all_levels, key=lambda l: abs(l["level"] - level))
         distance_pct = abs(nearest["level"] - level) / level * 100
 
         if distance_pct <= 2.0 and nearest["level"] != level:
             await message.answer(
-                f"🔍 Ближайший уровень в данных: {nearest['level']}\n"
-                f"   Оцениваю {nearest['level']}..."
+                f"🔍 Ближайший уровень в данных: {nearest['level']} ({distance_pct:.1f}%)"
             )
-            level = nearest["level"]
 
     match = None
     for lvl in all_levels:
@@ -1224,49 +1235,23 @@ async def cmd_stop(message: Message):
     await message.answer(f"🛑 Мониторинг {symbol} остановлен", reply_markup=get_main_keyboard())
 
 
-async def send_message(text: str, max_retries: int = 3) -> bool:
-    """Send a Telegram message with retry logic (BUG-23).
-
-    Retries on transient errors (flood control, network, server) with
-    exponential back-off.  Non-retryable errors (BadRequest, Forbidden,
-    etc.) are logged and abort immediately so callers aren't silently
-    blocked.
-
-    Returns True on success, False if all attempts failed.
-    """
-    from aiogram.exceptions import (
-        TelegramRetryAfter,
-        TelegramNetworkError,
-        TelegramServerError,
-    )
-
+async def send_message(text: str):
     if len(text) > 4096:
         text = text[:4093] + "..."
-
-    for attempt in range(max_retries):
+    for attempt in range(3):
         try:
             await bot.send_message(TELEGRAM_CHAT_ID, text, reply_markup=get_main_keyboard())
-            return True
-        except TelegramRetryAfter as e:
-            wait = e.retry_after + 1
-            logger.warning("Telegram flood control — retrying in %ds (attempt %d/%d)",
-                           wait, attempt + 1, max_retries)
-            await asyncio.sleep(wait)
-        except (TelegramNetworkError, TelegramServerError) as e:
-            if attempt < max_retries - 1:
-                wait = 2 ** attempt  # 1s, 2s, 4s
-                logger.warning("Telegram transient error '%s' — retrying in %ds (attempt %d/%d)",
-                               type(e).__name__, wait, attempt + 1, max_retries)
-                await asyncio.sleep(wait)
-            else:
-                logger.error("Telegram transient error after %d attempts: %s", max_retries, e)
+            return
         except Exception as e:
-            # Non-retryable (BadRequest, Forbidden, etc.) — log and give up
-            logger.exception("Telegram non-retryable error on send_message: %s", e)
-            return False
-
-    logger.error("send_message failed after %d attempts, message lost: %.80s", max_retries, text)
-    return False
+            err = str(e)
+            if "retry after" in err.lower():
+                import re as _re
+                m = _re.search(r"retry after (\d+)", err.lower())
+                await asyncio.sleep(int(m.group(1)) if m else 5)
+            elif attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                logger.exception("Failed to send Telegram message after retries")
 
 
 async def start_bot():
