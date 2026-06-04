@@ -15,6 +15,7 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY")  # Optional proxy URL
 
 # File paths
 TOKENS_FILE = "tokens.json"
+BLACKLIST_FILE = "blacklist.json"
 TRIGGER_TIMES_FILE = "trigger_times.json"
 ACTIVE_MONITORS_FILE = "active_monitors.json"
 
@@ -74,8 +75,51 @@ class TokenRegistry:
         return symbol in self._tokens
 
 
+class BlacklistRegistry:
+    """Registry for symbols that should never be monitored or traded."""
+
+    def __init__(self):
+        self._symbols: set[str] = set()
+        self._load()
+
+    def _load(self):
+        if os.path.exists(BLACKLIST_FILE):
+            try:
+                with open(BLACKLIST_FILE) as f:
+                    self._symbols = set(json.load(f))
+                logger.info("Loaded blacklist", count=len(self._symbols), symbols=list(self._symbols))
+            except Exception as e:
+                logger.error("Failed to load blacklist", error=str(e))
+
+    def _save(self):
+        try:
+            tmp = BLACKLIST_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(sorted(self._symbols), f, indent=2)
+            os.replace(tmp, BLACKLIST_FILE)
+        except Exception as e:
+            logger.error("Failed to save blacklist", error=str(e))
+
+    def add(self, symbol: str):
+        self._symbols.add(symbol)
+        self._save()
+        logger.info("Blacklisted", symbol=symbol)
+
+    def remove(self, symbol: str):
+        self._symbols.discard(symbol)
+        self._save()
+        logger.info("Removed from blacklist", symbol=symbol)
+
+    def contains(self, symbol: str) -> bool:
+        return symbol in self._symbols
+
+    def get_all(self) -> list[str]:
+        return sorted(self._symbols)
+
+
 # Global token registry instance
 token_registry = TokenRegistry()
+blacklist = BlacklistRegistry()
 
 
 def validate_config() -> bool:

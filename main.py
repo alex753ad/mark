@@ -28,7 +28,7 @@ from analysis.trigger import (
 )
 from analysis.monitor import start_monitor
 from bot.telegram import send_message, start_bot
-from config import token_registry, validate_config, TRIGGER_TIMES_FILE, ACTIVE_MONITORS_FILE
+from config import token_registry, blacklist, validate_config, TRIGGER_TIMES_FILE, ACTIVE_MONITORS_FILE
 from data.history import init_db, save_level_outcome, update_symbol_profile, get_outcome_probs, log_event
 
 
@@ -133,6 +133,8 @@ async def _auto_screener_loop():
             new_symbols = []
 
             for ticker, chg, natr, vol, sym in rows:
+                if blacklist.contains(sym):
+                    continue
                 if sym not in known_symbols:
                     token_registry.add(sym)
                     known_symbols.add(sym)
@@ -284,6 +286,10 @@ async def _trigger_loop():
                 if state.phase == "phase1" or symbol in _building_levels:
                     continue
 
+                # Skip blacklisted symbols
+                if blacklist.contains(symbol):
+                    continue
+
                 # Check cooldown
                 last = trigger_times.get(symbol, 0)
                 if time.time() - last < TRIGGER_COOLDOWN_SECONDS:
@@ -363,6 +369,31 @@ async def _run_phase1(symbol: str):
                     apply_ml_to_level(lvl)
         except Exception as _e:
             logger.warning("ml_score failed in phase loop: %s", _e)
+
+        # --- Stop weak monitors (strength < 3) — всегда, не только в phase2 ---
+        if current_price > 0 and state.tasks:
+            weak_levels = []
+            for task_key in list(state.tasks.keys()):
+                task_strength = state.level_strengths.get(task_key, 3)
+                if task_strength < 3:
+                    stop_ev = state.stop_flags.get(task_key)
+                    if stop_ev:
+                        stop_ev.set()
+                    task = state.tasks.get(task_key)
+                    if task:
+                        task.cancel()
+                    parsed_wk = state.parse_task_key(task_key)
+                    state.remove_task(task_key)
+                    if parsed_wk:
+                        weak_levels.append(parsed_wk[1])
+                    logger.info("Weak monitor stopped (strength < 3)",
+                               symbol=symbol, task_key=task_key, strength=task_strength)
+            if weak_levels:
+                levels_str = ", ".join(str(l) for l in sorted(weak_levels))
+                await send_message(
+                    f"🔕 {symbol} мониторинг слабых уровней остановлен (strength < 3)\n"
+                    f"   {levels_str}"
+                )
 
         # --- Stop stale monitors (levels now outside -20% range) ---
         if was_in_phase2 and current_price > 0:

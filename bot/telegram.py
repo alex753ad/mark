@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import asyncio
 
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_PROXY, token_registry
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_PROXY, token_registry, blacklist
 from logger import logger
 
 # Bot will be initialized in start_bot() function
@@ -517,6 +517,41 @@ async def cmd_remove(message: Message):
     clear_analysis_cache(symbol)
     state_manager.get_state(symbol).phase = "idle"
     await message.answer(f"🛑 {symbol} удалён", reply_markup=get_main_keyboard())
+
+
+@router.message(Command("blacklist"))
+async def cmd_blacklist(message: Message):
+    if not _authorized(message):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        bl = blacklist.get_all()
+        if bl:
+            await message.answer("🚫 Блэклист:\n" + "\n".join(bl), reply_markup=get_main_keyboard())
+        else:
+            await message.answer("Блэклист пуст", reply_markup=get_main_keyboard())
+        return
+    symbol = normalize_symbol(args[1])
+    blacklist.add(symbol)
+    # Если символ активно мониторится — останавливаем
+    from main import cancel_tasks_for_symbol
+    from models import state_manager
+    cancel_tasks_for_symbol(symbol)
+    state_manager.get_state(symbol).phase = "idle"
+    await message.answer(f"🚫 {symbol} добавлен в блэклист — мониторинг остановлен", reply_markup=get_main_keyboard())
+
+
+@router.message(Command("unblacklist"))
+async def cmd_unblacklist(message: Message):
+    if not _authorized(message):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /unblacklist SYMBOL", reply_markup=get_main_keyboard())
+        return
+    symbol = normalize_symbol(args[1])
+    blacklist.remove(symbol)
+    await message.answer(f"✅ {symbol} убран из блэклиста", reply_markup=get_main_keyboard())
 
 
 @router.message(Command("list"))
@@ -1279,6 +1314,8 @@ async def start_bot():
         BotCommand(command="monitors", description="Активные мониторинги с дистанцией до цены"),
         BotCommand(command="stop", description="Остановить мониторинг — /stop SYMBOL"),
         BotCommand(command="analyze", description="Запустить анализ — /analyze SYMBOL"),
+        BotCommand(command="blacklist", description="Блэклист монет — /blacklist SYMBOL"),
+        BotCommand(command="unblacklist", description="Убрать из блэклиста — /unblacklist SYMBOL"),
     ])
 
     await bot.send_message(TELEGRAM_CHAT_ID, "Бот запущен", reply_markup=get_main_keyboard())
