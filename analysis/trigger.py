@@ -599,6 +599,7 @@ def calculate_strength(lvl: dict) -> dict:
     # not to levels that were crossed during the initial pump leg (position "in_move" or "origin")
     if was_broken and not sweep_reclaimed and position not in ("in_move", "origin"):
         strength -= 2
+        strength = min(strength, 2)  # Пробитый уровень не может быть выше 2
     if max_vol_on_approach > vol_ratio * 2:
         strength -= 1
 

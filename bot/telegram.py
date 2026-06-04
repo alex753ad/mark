@@ -857,7 +857,7 @@ async def _do_analyze(message: Message, symbol: str):
         
         # Check if we already have a monitor for this symbol near this price (within 1.5 ATR)
         already_monitored = False
-        threshold = atr * 1.5
+        threshold = max(atr * 3.0, current_price * 0.03)
         for task_key in sym_state.tasks:
             parsed_tk = SymbolState.parse_task_key(task_key)
             if parsed_tk is None:
@@ -1129,7 +1129,7 @@ async def _do_check(message: Message, symbol: str, level: float):
         # Check if we already have a monitor for this symbol near this price (within 1.5 ATR)
         from models import SymbolState as _SS_check
         already_monitored = False
-        threshold = atr * 1.5
+        threshold = max(atr * 3.0, current_price * 0.03)
         for task_key in sym_state.tasks:
             parsed_tk = _SS_check.parse_task_key(task_key)
             if parsed_tk is None:

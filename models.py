@@ -47,14 +47,14 @@ class SymbolState:
         """Add monitoring task for a level. Cancels existing tasks on nearby levels."""
         key = self.make_task_key(level)
 
-        # Cancel existing tasks on levels within 0.5% (duplicates)
+        # Cancel existing tasks on levels within 3% (duplicates)
         if level > 0:
             for existing_key in list(self.tasks.keys()):
                 parsed = self.parse_task_key(existing_key)
                 if parsed is None:
                     continue
                 existing_level = parsed[1]
-                if existing_level > 0 and abs(existing_level - level) / level < 0.005:
+                if existing_level > 0 and abs(existing_level - level) / level < 0.03:
                     self.tasks[existing_key].cancel()
                     stop = self.stop_flags.get(existing_key)
                     if stop:
