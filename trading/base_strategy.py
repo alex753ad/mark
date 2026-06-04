@@ -103,6 +103,17 @@ class BaseStrategy(ABC):
                     trade["entry_price"],
                     trade["direction"],
                 )
+                # Обновить dict в памяти чтобы _send_close_message видел актуальные extremes
+                ep = trade["entry_price"]
+                if ep > 0:
+                    if trade["direction"] == "long":
+                        fav = (current_price - ep) / ep * 100
+                        adv = (ep - current_price) / ep * 100
+                    else:
+                        fav = (ep - current_price) / ep * 100
+                        adv = (current_price - ep) / ep * 100
+                    trade["max_favorable_pct"] = max(trade.get("max_favorable_pct") or 0.0, fav)
+                    trade["max_adverse_pct"]   = max(trade.get("max_adverse_pct") or 0.0, adv)
                 await self._check_exit(trade, current_price)
             except Exception as e:
                 logger.error(
