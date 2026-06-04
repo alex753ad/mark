@@ -533,12 +533,15 @@ async def cmd_blacklist(message: Message):
         return
     symbol = normalize_symbol(args[1])
     blacklist.add(symbol)
+    # Удаляем из token_registry чтобы скринер не добавил снова
+    token_registry.remove(symbol)
     # Если символ активно мониторится — останавливаем
-    from main import cancel_tasks_for_symbol
+    from main import cancel_tasks_for_symbol, clear_analysis_cache
     from models import state_manager
     cancel_tasks_for_symbol(symbol)
+    clear_analysis_cache(symbol)
     state_manager.get_state(symbol).phase = "idle"
-    await message.answer(f"🚫 {symbol} добавлен в блэклист — мониторинг остановлен", reply_markup=get_main_keyboard())
+    await message.answer(f"🚫 {symbol} добавлен в блэклист и удалён из мониторинга", reply_markup=get_main_keyboard())
 
 
 @router.message(Command("unblacklist"))
