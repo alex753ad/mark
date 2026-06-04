@@ -731,23 +731,41 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
         nearest = min(candidates, key=lambda l: abs(current_price - l["level"]))
         task_key = state.make_task_key(nearest["level"])
         if task_key not in state.tasks:
-            task = asyncio.create_task(
-                _monitored(symbol, nearest["level"], "support",
-                           level_type=nearest["type"],
-                           strength=nearest["strength"])
-            )
-            state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
-            state.phase = "phase2"
-            stars = "⭐️" * nearest["strength"]
-            await send_message(
-                f"📋 {symbol} следующий уровень\n"
-                f"   {stars} {nearest['level']} — {nearest['type']}\n"
-                f"👁 Мониторинг запущен"
-            )
-            await log_event(symbol, "monitoring_start",
-                           f"level={nearest['level']} strength={nearest['strength']} (after breakout of {broken_level})")
-            next_started = True
-            logger.info("Next level from cache started", symbol=symbol, level=nearest["level"])
+            # BUG-05: recalculate strength with fresh data — cache may be hours old
+            nearest["approach"] = _count_approaches(symbol, nearest["level"], atr) if atr > 0 else 0
+            if atr > 0:
+                from analysis.trigger import get_level_history
+                nearest.update(get_level_history(symbol, nearest["level"], atr))
+            calculate_strength(nearest)
+            try:
+                from analysis.ml_score import apply_ml_to_level
+                nearest["approach_style"] = detect_approach_style(symbol)
+                apply_ml_to_level(nearest)
+            except Exception as _e:
+                logger.warning("ml_score failed in cache recalc: %s", _e)
+            # Re-check strength after recalculation — level may have degraded
+            if nearest.get("strength", 0) < 2:
+                logger.info("Cached level degraded after recalc, skipping",
+                            symbol=symbol, level=nearest["level"],
+                            strength=nearest.get("strength"))
+            else:
+                task = asyncio.create_task(
+                    _monitored(symbol, nearest["level"], "support",
+                               level_type=nearest["type"],
+                               strength=nearest["strength"])
+                )
+                state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
+                state.phase = "phase2"
+                stars = "⭐️" * nearest["strength"]
+                await send_message(
+                    f"📋 {symbol} следующий уровень\n"
+                    f"   {stars} {nearest['level']} — {nearest['type']}\n"
+                    f"👁 Мониторинг запущен"
+                )
+                await log_event(symbol, "monitoring_start",
+                               f"level={nearest['level']} strength={nearest['strength']} (after breakout of {broken_level})")
+                next_started = True
+                logger.info("Next level from cache started", symbol=symbol, level=nearest["level"])
 
     # --- Priority 2: rebuild from candles ---
     if not next_started and ext_c1m:

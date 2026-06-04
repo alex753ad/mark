@@ -209,39 +209,149 @@ def _find_breakout_level(
 
 
 def _find_consolidation_zones(c15m: list[dict], support_range_low: float, support_range_high: float, atr: float) -> list[tuple[float, int, dict]]:
-    """Find tight consolidation zones where price spent significant time."""
+    """Find tight consolidation zones where price spent significant time.
+
+    BUG-35/36 fix: cluster_radius and tight-zone threshold are now price-relative
+    (0.5% of median price) rather than a fixed ATR multiple.  The global 1M ATR
+    that was previously passed here was far too wide for low-price altcoins, causing
+    consolidation zones to merge across 2+ ATR distances.  We also compute a local
+    15M ATR per window so the tightness check adapts to the volatility of that slice.
+    """
     if len(c15m) < 10:
         return []
 
     zones = []
-    # Narrow window for finding tight consolidation.
-    # step = window // 2 avoids heavy overlap between consecutive chunks
-    # (previously step=2 meant each pair of adjacent chunks shared 6/8 candles,
-    # causing the same cluster to appear 3-4 times — BUG-21 fix).
     window = 8
-    step = window // 2  # = 4
+    step = window // 2  # = 4, avoids heavy overlap (BUG-21 fix)
 
     for i in range(0, len(c15m) - window, step):
         chunk = c15m[i:i+window]
         chunk_high = max(c["high"] for c in chunk)
-        chunk_low = min(c["low"] for c in chunk)
+        chunk_low  = min(c["low"]  for c in chunk)
         chunk_range = chunk_high - chunk_low
 
-        # Consolidation is tight if range < 3 ATR
-        if chunk_range <= atr * 3:
-            # Level is median of the range
-            price = (chunk_high + chunk_low) / 2
-            if support_range_low <= price <= support_range_high:
-                # Skip if an equivalent level is already queued (< 1 ATR away)
-                if atr > 0 and any(abs(z[0] - price) < atr for z in zones):
-                    continue
-                # Count how many candles are within 1 ATR of this price
-                count = sum(1 for c in chunk if abs(c["close"] - price) <= atr)
-                if count >= 5:
-                    vol = sum(c["volume"] for c in chunk)
-                    zones.append((price, count, {"volume_at_level": vol, "type": "consolidation_base"}))
+        import statistics as _stats
+        price = _stats.median(c["close"] for c in chunk)
+        if price <= 0:
+            continue
+
+        # BUG-35: price-relative radius — 0.5% of price, bounded by the passed ATR.
+        # Prevents over-merging on cheap altcoins where ATR*0.3 > 1% of price.
+        radius = min(price * 0.005, atr * 1.5) if atr > 0 else price * 0.005
+
+        # BUG-36: local ATR for the window so the tightness check reflects this
+        # slice's volatility rather than the global session ATR.
+        if len(chunk) >= 3:
+            local_trs = [
+                max(chunk[j]["high"] - chunk[j]["low"],
+                    abs(chunk[j]["high"] - chunk[j-1]["close"]),
+                    abs(chunk[j]["low"]  - chunk[j-1]["close"]))
+                for j in range(1, len(chunk))
+            ]
+            local_atr = sum(local_trs) / len(local_trs)
+        else:
+            local_atr = atr
+
+        # Consolidation is tight if range < 3× local ATR
+        if chunk_range > local_atr * 3:
+            continue
+
+        if not (support_range_low <= price <= support_range_high):
+            continue
+
+        # Skip if an equivalent level is already queued
+        if any(abs(z[0] - price) < radius for z in zones):
+            continue
+
+        # Count candles within radius of median close
+        count = sum(1 for c in chunk if abs(c["close"] - price) <= radius)
+        if count >= 4:
+            vol = sum(c["volume"] for c in chunk)
+            zones.append((price, count, {"volume_at_level": vol, "type": "consolidation_base"}))
 
     return zones
+
+
+def _build_levels_no_pump(
+    symbol: str,
+    c1m: list[dict],
+    c15m: list[dict],
+    atr: float,
+    atr_15m: float,
+    current_price: float,
+) -> list[dict]:
+    """
+    Fallback level builder for symbols without a detectable pump.
+    Uses consolidation zones + body levels + 1M near-zone scan.
+    Returns up to 7 levels sorted by quality score.
+    """
+    support_range_low  = current_price * 0.80 if current_price > 0 else 0
+    support_range_high = current_price * 1.05 if current_price > 0 else float("inf")
+    cluster_radius = atr_15m * 0.3 if atr_15m > 0 else max(atr * 0.5, current_price * 0.003)
+    # BUG-35: cap at 0.5% of current_price
+    if current_price > 0:
+        cluster_radius = min(cluster_radius, current_price * 0.005)
+
+    all_levels: list[dict] = []
+
+    # Consolidation zones from 15M
+    for price, candle_count, metadata in _find_consolidation_zones(c15m, support_range_low, support_range_high, atr_15m if atr_15m > 0 else atr):
+        all_levels.append({
+            "level": _round_level(price),
+            "type": "consolidation_base",
+            "candle_count": candle_count,
+            "poc_aligned": False,
+            **metadata,
+        })
+
+    # Body levels from 15M (no pump_peak_time filter)
+    for price, candle_count, metadata in _find_body_levels_simple(
+        c15m, support_range_low, support_range_high,
+        atr_15m if atr_15m > 0 else atr,
+        cluster_radius=cluster_radius,
+        pump_peak_time=0,
+    ):
+        all_levels.append({
+            "level": _round_level(price),
+            "type": "body_level",
+            "candle_count": candle_count,
+            "poc_aligned": False,
+            **metadata,
+        })
+
+    # 1M near-zone levels
+    for price, candle_count, metadata in _find_1m_near_zone_levels(c1m, current_price, near_zone_pct=0.20, atr=atr):
+        all_levels.append({
+            "level": _round_level(price),
+            "type": "body_level",
+            "candle_count": candle_count,
+            "poc_aligned": False,
+            **metadata,
+        })
+
+    if not all_levels:
+        return []
+
+    levels = _deduplicate_simple(all_levels, cluster_radius)
+    levels = [lvl for lvl in levels if support_range_low <= lvl["level"] <= support_range_high]
+    levels = _assign_positions(levels, support_range_low, support_range_high)
+    levels = _mark_clusters(levels)
+
+    # Top-7 by quality score (same as main build_levels)
+    def _quality(lvl: dict) -> float:
+        score = lvl.get("candle_count", 0) * 10
+        score += lvl.get("hourly_open_bonus", 0) * 5
+        score += lvl.get("round_number_bonus", 0) * 3
+        if lvl["type"] == "consolidation_base":
+            score += 2000
+        return score
+
+    levels.sort(key=_quality, reverse=True)
+    levels = levels[:7]
+
+    logger.info("Fallback levels built (no pump)", symbol=symbol, count=len(levels),
+                prices=[_round_level(l["level"]) for l in levels])
+    return levels
 
 
 def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: list[dict] = None) -> list[dict]:
@@ -272,8 +382,8 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     pump_legs = _find_pump_legs(c15m)
     logger.info("pump_legs result", symbol=symbol, count=len(pump_legs), legs=[(round(l[0],6), round(l[1],6)) for l in pump_legs])
     if not pump_legs:
-        logger.info("No pump legs found — levels skipped", symbol=symbol, c15m_len=len(c15m))
-        return []
+        logger.info("No pump legs found — using consolidation fallback", symbol=symbol, c15m_len=len(c15m))
+        return _build_levels_no_pump(symbol, c1m, c15m, atr, atr_15m, current_price)
 
     pump_low  = min(leg[0] for leg in pump_legs)
     pump_high = max(leg[1] for leg in pump_legs)
@@ -285,7 +395,10 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     pump_peak_time = c15m[pump_peak_idx]["open_time"] if pump_peak_idx < len(c15m) else 0
 
     # Cluster radius based on 15M ATR
+    # BUG-35: cap at 0.5% of current_price to prevent over-merging on cheap altcoins
     cluster_radius = atr_15m * 0.3 if atr_15m > 0 else max(atr * 0.5, current_price * 0.003)
+    if current_price > 0:
+        cluster_radius = min(cluster_radius, current_price * 0.005)
 
     logger.debug("Pump found",
                 symbol=symbol,
@@ -302,10 +415,9 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
     support_range_high = current_price * 1.05 if current_price > 0 else pump_high
 
     # POC: calculated from pump PEAK onward (post-pump consolidation).
-    # pump_start candles include the pump itself — big bodies 0.016→0.022
-    # spread volume across low bins and drown out the real consolidation zone.
-    # TradingView POC at 0.021 is the post-peak congestion area, not the pump base.
-    poc_start = max(pump_peak_idx, len(c15m) - 96)
+    # LEVEL-03: cap at 48 candles (~12h) so we don't pull 2-day noise into the POC.
+    # If pump peak is very recent (< 5 candles ago), use at least 5 candles.
+    poc_start = max(pump_peak_idx, len(c15m) - 48)
     poc_candles = c15m[poc_start:]
     if len(poc_candles) < 5:
         poc_candles = c15m[pump_peak_idx:]
@@ -593,16 +705,22 @@ def _find_pump_legs(c15m: list[dict]) -> list[tuple[float, float, int, int]]:
         return []
 
     pump_start_idx = None
-    for i in range(max(0, high_idx - 100), high_idx):
-        low_price = c15m[i]["low"]
-        if low_price > 0 and (high_price - low_price) / low_price >= 0.05:
-            pump_start_idx = i
+    # LEVEL-02: slow pumps can span > 60 candles — search up to 200 candles before high.
+    # Use a two-pass approach: first try strict 5% in 100 candles (fast pump),
+    # then fall back to 3% in 200 candles (slow/grinding pump).
+    for search_back, min_move in [(100, 0.05), (200, 0.03)]:
+        for i in range(max(0, high_idx - search_back), high_idx):
+            low_price = c15m[i]["low"]
+            if low_price > 0 and (high_price - low_price) / low_price >= min_move:
+                pump_start_idx = i
+                break
+        if pump_start_idx is not None:
             break
 
     if pump_start_idx is None:
-        logger.info("_find_pump_legs: no pump_start_idx — move < 5% in 100 candles before high",
+        logger.info("_find_pump_legs: no pump_start_idx — move < 3% in 200 candles before high",
                     high_price=round(high_price,6), high_idx=high_idx,
-                    search_from=max(0, high_idx-100))
+                    search_from=max(0, high_idx-200))
         return []
 
     pump_candles = c15m[pump_start_idx: high_idx + 1]
@@ -748,7 +866,7 @@ def _find_1m_near_zone_levels(
 
     zone_low  = current_price * (1 - near_zone_pct)
     zone_high = current_price * (1 + near_zone_pct)
-    radius    = max(atr * 2, current_price * 0.003)
+    radius    = max(atr * 0.5, current_price * 0.001)
 
     # Collect body touch points — include candle if any part of body is in zone
     touch_points: list[tuple[float, dict]] = []
@@ -992,6 +1110,18 @@ def _find_body_levels_simple(
             candle_count = len(touch_idxs)
 
         # FIX Bug-5: minimum weight 6, consistent with BODY_CLUSTER_MIN_WEIGHT
+        # LEVEL-04: skip cluster if every candle is pre-pump (all pre-pump bodies
+        # would pass weight=6 with enough candles, but they inflate strength without
+        # post-pump confirmation — must have at least 1 post-pump touch).
+        if pump_peak_time > 0:
+            has_post_pump = any(
+                c15m[idx]["open_time"] >= pump_peak_time
+                for idx in cluster_candle_idxs if idx < len(c15m)
+            )
+            if not has_post_pump:
+                used.add(i)
+                continue
+
         if cluster_weight >= 6:
             levels.append((avg_price, candle_count, {
                 "volume_at_level":    avg_candle_volume,
@@ -1105,7 +1235,12 @@ def _find_order_block_simple(
 
 
 def _deduplicate_simple(levels: list[dict], radius: float) -> list[dict]:
-    """Deduplicate nearby levels - pump_base wins over body_level, else keep more touches."""
+    """Deduplicate nearby levels - pump_base wins over body_level, else keep more touches.
+
+    LEVEL-05: pump_base and breakout_level are never replaced by a lower-priority
+    type even if the lower-priority level has more candle_count.  Equal-priority
+    ties are still broken by candle_count, but pump_base never loses to body_level.
+    """
     if not levels:
         return []
 
@@ -1131,7 +1266,12 @@ def _deduplicate_simple(levels: list[dict], radius: float) -> list[dict]:
             if curr_pri > prev_pri:
                 result[-1] = lvl
             elif curr_pri == prev_pri and lvl["candle_count"] > prev["candle_count"]:
-                result[-1] = lvl
+                # LEVEL-05: keep the existing entry if it's pump_base/breakout_level
+                # and the challenger is of equal priority but different type.
+                KEEP_TYPES = {"pump_base", "breakout_level"}
+                if prev["type"] not in KEEP_TYPES:
+                    result[-1] = lvl
+            # lower priority: keep existing (prev wins)
         else:
             result.append(lvl)
 

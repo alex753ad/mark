@@ -8,6 +8,7 @@
     - Только строки с outcome IN ('bounce', 'breakout')  ← partial исключён
     - Исключаем strength_claude = 0 (уровни без Claude-оценки, bounce 18% vs 40%+)
     - Исключаем записи до 2026-05-21 (аномальный медвежий режим, breakout 35% vs 14-17%)
+    - Исключаем touches_count = 0 (артефакты записи, 0% bounce, n=4 — не рыночный исход)
 
   ВАЖНО: partial — это артефакт прерванного мониторинга (duration=0), а не
   рыночный исход. Включение partial в обучение ухудшает качество модели, так как
@@ -24,7 +25,8 @@
     4. touches          — touches_count, обрезан до 5
     5. atr_capped       — atr_ratio, обрезан до 20
     6. style_enc        — approach_style (flash=0, impulse=1, bleed=2, unknown=3)
-    7. age_capped       — monitoring_age_minutes, обрезан до 300 (bounce ~5 мин, breakout ~131 мин)
+    7. age_capped       — monitoring_age_minutes, обрезан до 300 (breakout быстрее bounce;
+                          признак слаб если P75=0 — большинство записей без возраста)
 
 Выходные файлы (перезаписывают существующие):
     analysis/ml/clf.pkl            — RandomForestClassifier (bounce/breakout)
@@ -50,7 +52,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from analysis.ml_score import STYLE_MAP
 
-FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc"]
+FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc", "age_capped"]
 
 
 def load_data(db_path: str) -> pd.DataFrame:
@@ -62,6 +64,7 @@ def load_data(db_path: str) -> pd.DataFrame:
         WHERE outcome IN ('bounce', 'breakout')
           AND strength_claude != 0
           AND created_at >= '2026-05-21'
+          AND touches_count >= 1
         """,
         conn,
     )
@@ -101,6 +104,12 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     df["vol_capped"] = df["vol_ratio_at_touch"].clip(upper=20).fillna(1.0)
     df["atr_capped"] = df["atr_ratio"].clip(upper=20).fillna(1.0)
     df["touches"]    = df["touches_count"].fillna(0).clip(upper=5).astype(float)
+    # BUG-13: monitoring_age_minutes — bounce ~5 мин, breakout ~131 мин; cap=300
+    df["age_capped"] = df["monitoring_age_minutes"].fillna(0).clip(upper=300).astype(float)
+    age_nonzero_pct = (df["age_capped"] > 0).mean() * 100
+    if age_nonzero_pct < 30:
+        print(f"  ⚠️  age_capped: только {age_nonzero_pct:.1f}% записей ненулевые — признак слабый, "
+              f"собирается только при завершении монитора")
 
     X = df[FEATURES].copy()
 
@@ -201,7 +210,7 @@ def train(db_path: str, out_dir: str) -> None:
     body_enc = level_type_map.get("body_level", 0)
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 1, 2.0, style_code]],
+            [[4, body_enc, 1.5, 1, 2.0, style_code, 0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -211,11 +220,12 @@ def train(db_path: str, out_dir: str) -> None:
     print()
 
     # Тест 2: pump_base, touches=1 (второй по частоте тип)
-    print("Smoke-тест 2: pump_base, touches=1 (strength=5, vol=1.0, atr=2.0, age=0):")
+    # vol=1.5 — близко к среднему по датасету (mean=1.64), vol=1.0 давал ложный -1
+    print("Smoke-тест 2: pump_base, touches=1 (strength=5, vol=1.5, atr=2.0, age=0):")
     pump_enc = level_type_map.get("pump_base", 1)
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[5, pump_enc, 1.0, 1, 2.0, style_code]],
+            [[5, pump_enc, 1.5, 1, 2.0, style_code, 0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -228,7 +238,7 @@ def train(db_path: str, out_dir: str) -> None:
     print("Smoke-тест 3: touches=3 → ожидается ml_delta=-1 для всех:")
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 3, 2.0, style_code]],
+            [[4, body_enc, 1.5, 3, 2.0, style_code, 0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -238,6 +248,27 @@ def train(db_path: str, out_dir: str) -> None:
         print(f"  {style_name:<10} p_bounce={p_b:.3f}  ml_delta={delta} {ok}")
     print()
 
+    # Тест 4: age влияет — breakout происходит быстро (~131 мин median), bounce дольше.
+    # Ожидание: p_bounce РАСТЁТ с возрастом (дольше держится = скорее bounce).
+    # Если P75 age_capped=0 (большинство записей = 0), признак слаб — предупреждаем.
+    print("Smoke-тест 4: age=0 vs age=180 мин (ожидание: p_bounce растёт с возрастом):")
+    age_results = []
+    for age, label in [(0, "age=0min  "), (60, "age=60min "), (180, "age=180min")]:
+        x_test = pd.DataFrame(
+            [[4, body_enc, 1.5, 1, 2.0, STYLE_MAP["unknown"], age]],
+            columns=FEATURES,
+        )
+        proba = clf.predict_proba(x_test)[0]
+        p_b   = proba[bounce_idx]
+        delta = "+1" if p_b >= p75 else ("-1" if p_b <= p25 else " 0")
+        age_results.append(p_b)
+        print(f"  {label}  p_bounce={p_b:.3f}  ml_delta={delta}")
+    age_p75 = np.percentile(X["age_capped"], 75)
+    if age_p75 == 0:
+        print(f"  ⚠️  age_capped P75={age_p75:.0f} — 75%+ записей имеют age=0, признак слабый")
+    if age_results[0] > age_results[-1]:
+        print(f"  ⚠️  p_bounce убывает с возрастом — возможна инверсия сигнала в данных")
+    print()
 
     # ── Сохранение ─────────────────────────────────────────────────────
     pickle.dump(clf,            open(os.path.join(out_dir, "clf.pkl"),            "wb"))

@@ -151,12 +151,17 @@ async def get_approaching_levels(symbol: str, use_claude: bool = True) -> list[d
     levels = build_levels(symbol)
     approaching = []
 
-    for lvl in levels:
+    # LEVEL-06: sort by proximity so closer levels claim candles first
+    levels_sorted = sorted(levels, key=lambda l: abs(current_price - l["level"]))
+    claimed_times: set = set()
+    for lvl in levels_sorted:
         real, _ = find_real_level(symbol, lvl["level"])
         lvl["level"] = real
         distance = abs(current_price - lvl["level"])
         if distance <= threshold:
-            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr)
+            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr,
+                                                 exclude_open_times=claimed_times)
+            claimed_times |= getattr(_count_approaches, "_last_claimed", set())
             lvl["vol_ratio"] = _calc_vol_ratio(symbol)
             history = get_level_history(symbol, lvl["level"], atr)
             lvl.update(history)
@@ -226,14 +231,19 @@ async def get_approaching_levels(symbol: str, use_claude: bool = True) -> list[d
     return approaching
 
 
-def _count_approaches(symbol: str, level: float, atr: float) -> int:
-    """Count number of times price approached the level after pump peak."""
+def _count_approaches(symbol: str, level: float, atr: float,
+                       exclude_open_times: set = None) -> int:
+    """Count number of times price approached the level after pump peak.
+
+    exclude_open_times: set of candle open_times already claimed by a
+    neighbouring level (LEVEL-06 fix — prevents overlapping approach zones
+    from double-counting the same candles for two close levels).
+    """
     c1m = candles_1m.get(symbol, [])
     c15m = candles_15m.get(symbol, [])
     threshold = atr * LEVEL_APPROACH_THRESHOLD
 
     # Find pump peak time from 15M candles — limit to last 100 candles (~25h)
-    # to avoid picking up a stale pump from weeks ago.
     pump_high_time = None
     if c15m:
         recent_c15m = c15m[-100:]
@@ -245,34 +255,56 @@ def _count_approaches(symbol: str, level: float, atr: float) -> int:
 
     count = 0
     was_near = False
+    claimed: set = set()  # open_times of candles that belong to this approach
 
     for c in c1m:
-        # Count approaches only after pump peak
         if pump_high_time and c["open_time"] < pump_high_time:
+            was_near = False
+            continue
+        # Skip candles already claimed by a closer level
+        if exclude_open_times and c["open_time"] in exclude_open_times:
             was_near = False
             continue
         near = (
             abs(c["low"] - level) <= threshold or
             abs(c["close"] - level) <= threshold
         )
+        if near:
+            claimed.add(c["open_time"])
         if near and not was_near:
             count += 1
         was_near = near
 
+    # Expose claimed set so callers can pass it as exclude to the next level
+    _count_approaches._last_claimed = claimed
     return count
 
 
 def get_level_history(symbol: str, level: float, atr: float) -> dict:
-    """Get historical behavior of a level."""
+    """Get historical behavior of a level.
+
+    was_broken is set only when the candle CLOSES below level AND its low
+    is within 3×ATR of the level.  This prevents a neighbouring level's
+    confirmed breakout (e.g. 0.2068) from contaminating a lower level
+    (e.g. 0.1968) that has never been touched yet.
+    """
     c1m = candles_1m.get(symbol, [])
     c15m = candles_15m.get(symbol, [])
     threshold = atr * LEVEL_APPROACH_THRESHOLD
+    # Maximum distance from the level at which a candle is considered "related"
+    # to this specific level (not a neighbouring one).
+    # 3×ATR is wide enough to capture real wicks/sweeps but tight enough to
+    # exclude price action that occurred 10-15% above the level.
+    broken_zone = atr * 3.0
 
     # Filter: only consider candles after pump peak
+    # BUG-07: use same recent window (last 100 candles ≈ 25h) to avoid picking
+    # up a stale pump from weeks ago as the "peak" — identical to _count_approaches.
     pump_high_time = None
     if c15m:
-        pump_high = max(c["high"] for c in c15m[-50:])
-        pump_high_time = next((c["open_time"] for c in c15m if c["high"] >= pump_high * 0.999), None)
+        recent_c15m = c15m[-100:]
+        pump_high = max(c["high"] for c in recent_c15m)
+        pump_high_time = next((c["open_time"] for c in recent_c15m if c["high"] >= pump_high * 0.999), None)
 
     was_broken = False
     sweep_reclaimed = False
@@ -294,7 +326,11 @@ def get_level_history(symbol: str, level: float, atr: float) -> dict:
             if c["volume"] > max_vol_on_approach:
                 max_vol_on_approach = c["volume"]
 
-        if c["close"] < level:
+        # Breakout: close below level AND candle originated within broken_zone of level.
+        # This ensures that a full breakdown from a HIGHER level (e.g. 0.2068)
+        # where candles are 5-10% above THIS level do NOT set was_broken=True here.
+        candle_dist_from_level = abs(c["open"] - level)
+        if c["close"] < level and candle_dist_from_level <= broken_zone:
             was_broken = True
 
         if was_broken and c["close"] > level:

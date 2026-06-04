@@ -148,22 +148,6 @@ async def cb_remove(callback: CallbackQuery):
     if not token_registry.contains(symbol):
         await callback.answer(f"{symbol} не найден")
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Да, удалить", callback_data=f"remove_confirm:{symbol}"),
-        InlineKeyboardButton(text="Отмена",      callback_data="remove_cancel"),
-    ]])
-    await callback.message.edit_text(f"Удалить {symbol}?", reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("remove_confirm:"))
-async def cb_remove_confirm(callback: CallbackQuery):
-    if not _authorized_cb(callback):
-        return
-    symbol = callback.data.split(":", 1)[1]
-    if not token_registry.contains(symbol):
-        await callback.answer(f"{symbol} не найден")
-        return
     token_registry.remove(symbol)
     from data.collector import candles_1m as c1m_data, candles_15m as c15m_data
     from main import cancel_tasks_for_symbol, clear_analysis_cache
@@ -175,12 +159,6 @@ async def cb_remove_confirm(callback: CallbackQuery):
     state_manager.get_state(symbol).phase = "idle"
     await callback.answer()
     await callback.message.edit_text(f"🛑 {symbol} удалён")
-
-
-@router.callback_query(F.data == "remove_cancel")
-async def cb_remove_cancel(callback: CallbackQuery):
-    await callback.message.edit_text("Отмена")
-    await callback.answer()
 
 
 @router.message(F.text == "📋 Список")
@@ -327,8 +305,9 @@ async def btn_check_level(message: Message, state: FSMContext):
 async def btn_stop(message: Message, state: FSMContext):
     if not _authorized(message):
         return
-    from models import state_manager, SymbolState
+    from models import state_manager
 
+    from models import SymbolState
     all_tasks = state_manager.get_all_active_tasks()
     monitored_symbols = set()
     for k in all_tasks:
@@ -359,14 +338,15 @@ async def btn_stop(message: Message, state: FSMContext):
 async def cb_stop(callback: CallbackQuery):
     if not _authorized_cb(callback):
         return
-    from models import state_manager, SymbolState
+    from models import state_manager
     from main import cancel_tasks_for_symbol, clear_analysis_cache
 
     target = callback.data.split(":", 1)[1]
     if target == "__all__":
+        from models import SymbolState as _SS
         symbols = set()
         for k in state_manager.get_all_active_tasks():
-            parsed = SymbolState.parse_task_key(k)
+            parsed = _SS.parse_task_key(k)
             if parsed is not None:
                 symbols.add(parsed[0])
         for sym in symbols:
@@ -417,7 +397,7 @@ async def send_screener_with_buttons(text: str, rows: list[tuple]):
     try:
         await bot.send_message(
             TELEGRAM_CHAT_ID, text,
-            parse_mode="HTML",
+            parse_mode="Markdown",
             reply_markup=kb
         )
     except Exception:
@@ -450,8 +430,8 @@ async def btn_market(message: Message):
 
         symbols = [sym for _, _, _, _, sym in rows]
         kb = _build_analyze_keyboard(symbols)
-        await message.answer("<pre>" + "\n".join(lines) + "</pre>",
-                             parse_mode="HTML", reply_markup=kb)
+        await message.answer("```\n" + "\n".join(lines) + "\n```",
+                             parse_mode="Markdown", reply_markup=kb)
         logger.info("Market screener sent", symbols_count=len(rows))
 
     except Exception as e:
@@ -559,7 +539,12 @@ async def cmd_export_db(message: Message):
     from aiogram.types import BufferedInputFile
     from config import HISTORY_DB_FILE
 
-    db_path = HISTORY_DB_FILE
+    # Try volume path first, then local
+    db_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "")
+    if db_path:
+        db_path = os.path.join(db_path, "history.db")
+    else:
+        db_path = HISTORY_DB_FILE
 
     if not os.path.exists(db_path):
         await message.answer("❌ history.db не найден", reply_markup=get_main_keyboard())
@@ -686,7 +671,23 @@ async def _do_analyze(message: Message, symbol: str):
             pass
         return
     min_distance = atr * 1.5
-    filtered = [lvl for lvl in supports if (current_price - lvl["level"]) >= min_distance]
+
+    # Collect levels that are actively monitored for this symbol — they must
+    # always appear in the analysis output regardless of distance to price.
+    from models import state_manager as _sm_analyze, SymbolState as _SS_analyze
+    _sym_state_analyze = _sm_analyze.get_state(symbol)
+    monitored_levels_set: set[float] = set()
+    for _tk in _sym_state_analyze.tasks:
+        _p = _SS_analyze.parse_task_key(_tk)
+        if _p is not None:
+            monitored_levels_set.add(_p[1])
+
+    # Include a level if it passes the min_distance filter OR is actively monitored.
+    filtered = [
+        lvl for lvl in supports
+        if (current_price - lvl["level"]) >= min_distance
+        or lvl["level"] in monitored_levels_set
+    ]
 
     if not filtered:
         atr_pct = (atr / current_price) * 100
@@ -744,8 +745,9 @@ async def _do_analyze(message: Message, symbol: str):
             logger.error("Failed to use Claude for analyze, falling back to Python",
                         symbol=symbol,
                         error=str(e))
+            # Fallback to Python
             for lvl in filtered:
-                lvl["strength"] = lvl.get("python_strength", lvl.get("strength", 1))
+                calculate_strength(lvl)
     else:
         # Use Python calculation
         for lvl in filtered:
@@ -857,10 +859,10 @@ async def _do_analyze(message: Message, symbol: str):
         already_monitored = False
         threshold = atr * 1.5
         for task_key in sym_state.tasks:
-            parsed = SymbolState.parse_task_key(task_key)
-            if parsed is None:
+            parsed_tk = SymbolState.parse_task_key(task_key)
+            if parsed_tk is None:
                 continue
-            if abs(parsed[1] - nearest["level"]) <= threshold:
+            if abs(parsed_tk[1] - nearest["level"]) <= threshold:
                 already_monitored = True
                 break
 
@@ -879,12 +881,16 @@ async def _do_analyze(message: Message, symbol: str):
             logger.info("Auto-monitoring started from analyze",
                        symbol=symbol, level=nearest["level"])
         else:
+            # Find the actual level being monitored for the message
             m_level = nearest["level"]
             for task_key in sym_state.tasks:
-                p = SymbolState.parse_task_key(task_key)
-                if p is not None and abs(p[1] - nearest["level"]) <= threshold:
-                    m_level = p[1]
+                parsed_tk = SymbolState.parse_task_key(task_key)
+                if parsed_tk is None:
+                    continue
+                if abs(parsed_tk[1] - nearest["level"]) <= threshold:
+                    m_level = parsed_tk[1]
                     break
+                
             await message.answer(
                 f"👁 Мониторинг уже активен: {symbol} @ {m_level}",
                 reply_markup=get_main_keyboard()
@@ -949,7 +955,17 @@ async def _do_check(message: Message, symbol: str, level: float):
     zone_radius = atr_pct / 100 * current_price if current_price > 0 else 0
     all_levels = build_levels(symbol)
 
-    # find_real_level уже сделал кластерный поиск — второй поиск лишний
+    # Подсказка ближайшего уровня
+    if all_levels and level != 0:
+        nearest = min(all_levels, key=lambda l: abs(l["level"] - level))
+        distance_pct = abs(nearest["level"] - level) / level * 100
+
+        if distance_pct <= 2.0 and nearest["level"] != level:
+            await message.answer(
+                f"🔍 Ближайший уровень в данных: {nearest['level']}\n"
+                f"   Оцениваю {nearest['level']}..."
+            )
+            level = nearest["level"]
 
     match = None
     for lvl in all_levels:
@@ -1104,26 +1120,34 @@ async def _do_check(message: Message, symbol: str, level: float):
     await message.answer(text, reply_markup=get_main_keyboard())
 
     if r.get("strength", 0) >= 3:
-        from models import state_manager, SymbolState
+        from models import state_manager
         from main import _monitored
         current_price = c1m[-1]["close"]
         level_side = "support" if current_price > level else "resistance"
         sym_state = state_manager.get_state(symbol)
         
         # Check if we already have a monitor for this symbol near this price (within 1.5 ATR)
+        from models import SymbolState as _SS_check
         already_monitored = False
         threshold = atr * 1.5
-        m_level = level
         for task_key in sym_state.tasks:
-            parsed = SymbolState.parse_task_key(task_key)
-            if parsed is None:
+            parsed_tk = _SS_check.parse_task_key(task_key)
+            if parsed_tk is None:
                 continue
-            if abs(parsed[1] - level) <= threshold:
+            if abs(parsed_tk[1] - level) <= threshold:
                 already_monitored = True
-                m_level = parsed[1]
                 break
 
         if already_monitored:
+            # Find the actual level being monitored for the message
+            m_level = level
+            for task_key in sym_state.tasks:
+                parsed_tk = _SS_check.parse_task_key(task_key)
+                if parsed_tk is None:
+                    continue
+                if abs(parsed_tk[1] - level) <= threshold:
+                    m_level = parsed_tk[1]
+                    break
             await message.answer(f"⚠️ Мониторинг {symbol} @ {m_level} уже активен")
         else:
             task = asyncio.create_task(
@@ -1145,7 +1169,7 @@ async def _do_check(message: Message, symbol: str, level: float):
 async def cmd_monitors(message: Message):
     if not _authorized(message):
         return
-    from models import state_manager, SymbolState
+    from models import state_manager
     from data.collector import candles_1m
 
     all_tasks = state_manager.get_all_active_tasks()
@@ -1153,9 +1177,10 @@ async def cmd_monitors(message: Message):
         await message.answer("Нет активных мониторингов", reply_markup=get_main_keyboard())
         return
 
+    from models import SymbolState as _SS2
     lines = []
     for task_key in all_tasks:
-        parsed = SymbolState.parse_task_key(task_key)
+        parsed = _SS2.parse_task_key(task_key)
         if parsed is None:
             continue
         symbol, level = parsed
@@ -1198,16 +1223,12 @@ async def cmd_stop(message: Message):
 
 
 async def send_message(text: str):
-    if len(text) > 4096:
-        text = text[:4093] + "..."
-    for attempt in range(3):
-        try:
-            await bot.send_message(TELEGRAM_CHAT_ID, text, reply_markup=get_main_keyboard())
-            return
-        except Exception:
-            if attempt == 2:
-                logger.exception("Failed to send Telegram message after 3 attempts")
-            await asyncio.sleep(1)
+    try:
+        if len(text) > 4096:
+            text = text[:4093] + "..."
+        await bot.send_message(TELEGRAM_CHAT_ID, text, reply_markup=get_main_keyboard())
+    except Exception:
+        logger.exception("Failed to send Telegram message")
 
 
 async def start_bot():

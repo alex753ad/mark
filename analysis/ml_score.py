@@ -15,7 +15,7 @@ ML scoring for support levels.
     apply_ml_to_level(lvl)
     # lvl теперь содержит: p_bounce, expected_depth, ml_delta, strength_pre_ml
 
-Признаки модели (6 штук):
+Признаки модели (7 штук):
     1. strength        — Python-сила уровня (1-5)
     2. ltype_enc       — тип уровня (из level_type_map.pkl)
     3. vol_ratio       — объём / среднее (обрезается до 20)
@@ -23,6 +23,8 @@ ML scoring for support levels.
     5. atr_ratio       — расстояние до уровня в ATR (обрезается до 20)
     6. style_enc       — стиль подхода: flash=0, impulse=1, bleed=2, unknown=3
                          Доступен только в _monitored(); в _run_phase1 = "unknown"
+    7. age_capped      — время мониторинга в минутах (обрезается до 300)
+                         bounce медианно ~5 мин, breakout ~131 мин (BUG-13)
 
 Hard-filter (применяется в apply_ml_to_level ДО ML):
     touches >= 2 → ml_delta = -2, p_bounce = 0.0
@@ -144,6 +146,7 @@ def ml_score(lvl: dict) -> dict:
 
         ltype_enc = _type_map.get(ltype, 1)
         style_enc = STYLE_MAP.get(style, 3)
+        age_min   = min(float(lvl.get("monitoring_age_minutes") or 0), 300.0)
 
         x = np.array([[
             strength,
@@ -152,6 +155,7 @@ def ml_score(lvl: dict) -> dict:
             touches,
             min(atr_ratio, 20.0),
             style_enc,
+            age_min,
         ]])
 
         # Classifier

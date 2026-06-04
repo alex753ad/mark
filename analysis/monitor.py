@@ -104,12 +104,12 @@ async def start_monitor(
             outcome = "breakout"
         elif not _touched:
             outcome = "no_reach"
-        elif fdp < 1.0:
-            outcome = "partial_shallow"
         elif fdp >= 2.0:
             outcome = "partial_deep"
         elif fdp >= 1.0:
             outcome = "partial_mid"
+        elif fdp >= 0.1:
+            outcome = "partial_shallow"
         else:
             outcome = "bounce"
 
