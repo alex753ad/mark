@@ -221,13 +221,18 @@ class Strategy1Bounce(BaseStrategy):
         pnl_pct = (exit_price - ep) / ep * 100
         pnl_usdt = self.POSITION_SIZE_USDT * pnl_pct / 100
         icon = "✅" if pnl_pct >= 0 else "🔴"
+        max_fav  = trade.get("max_favorable_pct") or 0.0
+        max_adv  = trade.get("max_adverse_pct") or 0.0
+        max_profit_usdt = self.POSITION_SIZE_USDT * max_fav / 100
+        max_loss_usdt   = self.POSITION_SIZE_USDT * max_adv / 100
         text = (
             f"{icon} [S1 Bounce] {trade['symbol']} закрыт\n"
             f"   Причина: {reason}\n"
             f"   Вход: {ep} → Выход: {exit_price}\n"
             f"   PnL: {self._format_pct(pnl_pct)} ({self._format_pct(pnl_usdt, sign=True)} USDT)"
             f" | Время: {self._format_duration(trade['entry_time'])}\n"
-            f"   Max drawdown: {self._format_pct(-(trade.get('max_adverse_pct') or 0.0))}"
+            f"   📈 Max profit: +{max_fav:.2f}% (+{max_profit_usdt:.2f} USDT)\n"
+            f"   📉 Max drawdown: -{max_adv:.2f}% (-{max_loss_usdt:.2f} USDT)"
         )
         try:
             await send_message(text)
