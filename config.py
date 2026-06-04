@@ -20,6 +20,7 @@ TRIGGER_TIMES_FILE = "trigger_times.json"
 ACTIVE_MONITORS_FILE = "active_monitors.json"
 
 _DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "")
+RAILWAY_VOLUME_MOUNT_PATH: str = _DATA_DIR   # exported for trade_log.py and other modules
 HISTORY_DB_FILE = os.path.join(_DATA_DIR, "history.db") if _DATA_DIR else "history.db"
 
 

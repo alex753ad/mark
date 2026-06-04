@@ -229,7 +229,9 @@ async def _auto_screener_loop():
                                 task = asyncio.create_task(
                                     _monitored(sym, nearest["level"], "support",
                                               level_type=nearest["type"],
-                                              strength=nearest["strength"])
+                                              strength=nearest["strength"],
+                                              p_bounce=nearest.get("p_bounce", 0.0),
+                                              expected_depth=nearest.get("expected_depth", 0.0))
                                 )
                                 sym_state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
                                 sym_state.phase = "phase2"
@@ -574,7 +576,9 @@ async def _run_phase1(symbol: str):
         task = asyncio.create_task(
             _monitored(symbol, nearest["level"], level_side,
                        level_type=nearest["type"],
-                       strength=nearest["strength"])
+                       strength=nearest["strength"],
+                       p_bounce=nearest.get("p_bounce", 0.0),
+                       expected_depth=nearest.get("expected_depth", 0.0))
         )
         state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
         state.phase = "phase2"
@@ -582,7 +586,13 @@ async def _run_phase1(symbol: str):
         # Update analysis cache so breakout chain can find next levels
         from bot.telegram import _last_analysis_cache
         _last_analysis_cache[symbol] = [
-            {"level": l["level"], "strength": l["strength"], "type": l["type"]}
+            {
+                "level": l["level"],
+                "strength": l["strength"],
+                "type": l["type"],
+                "p_bounce": l.get("p_bounce", 0.0),
+                "expected_depth": l.get("expected_depth", 0.0),
+            }
             for l in sorted(levels, key=lambda x: x["level"])
         ]
 
@@ -604,7 +614,9 @@ async def _monitored(symbol: str, level: float, level_side: str,
                      level_type: str = "body_level",
                      strength: int = 0,
                      approach_style: str = None, atr_ratio: float = None,
-                     vol_ratio: float = None):
+                     vol_ratio: float = None,
+                     p_bounce: float = 0.0,
+                     expected_depth: float = 0.0):
     """Monitor a level until breakout or manual stop."""
     state = state_manager.get_state(symbol)
     task_key = state.make_task_key(level)
@@ -634,6 +646,8 @@ async def _monitored(symbol: str, level: float, level_side: str,
             vol_ratio=vol_ratio,
             level_type=level_type,
             strength=strength,
+            p_bounce=p_bounce,
+            expected_depth=expected_depth,
         )
         duration = int((time.time() - start_time) / 60)
 
@@ -805,7 +819,9 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
                 task = asyncio.create_task(
                     _monitored(symbol, nearest["level"], "support",
                                level_type=nearest["type"],
-                               strength=nearest["strength"])
+                               strength=nearest["strength"],
+                               p_bounce=nearest.get("p_bounce", 0.0),
+                               expected_depth=nearest.get("expected_depth", 0.0))
                 )
                 state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
                 state.phase = "phase2"
@@ -857,7 +873,9 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
                 task = asyncio.create_task(
                     _monitored(symbol, nearest["level"], "support",
                                level_type=nearest["type"],
-                               strength=nearest["strength"])
+                               strength=nearest["strength"],
+                               p_bounce=nearest.get("p_bounce", 0.0),
+                               expected_depth=nearest.get("expected_depth", 0.0))
                 )
                 state.add_task(nearest["level"], task)
                 state.phase = "phase2"
@@ -1135,6 +1153,40 @@ async def _proximity_loop():
                                symbol=symbol, 
                                level=level, 
                                distance_pct=distance_pct)
+                    # Publish proximity event to strategy event bus
+                    try:
+                        from trading.event_bus import publish as _eb_publish
+                        from analysis.trigger import calculate_atr as _calc_atr_prox
+                        from bot.telegram import _last_analysis_cache as _lac_prox
+                        _atr_prox = _calc_atr_prox(symbol)
+                        _cached_prox = {
+                            lvl["level"]: lvl
+                            for lvl in _lac_prox.get(symbol, [])
+                        }
+                        _lvl_info = min(
+                            _cached_prox.values(),
+                            key=lambda x: abs(x["level"] - level),
+                            default={},
+                        ) if _cached_prox else {}
+                        _avg_vol_prox = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
+                        _vr_prox = round(c1m[-1]["volume"] / _avg_vol_prox, 2) if _avg_vol_prox > 0 else 1.0
+                        await _eb_publish({
+                            "event_type": "proximity",
+                            "symbol": symbol,
+                            "level": level,
+                            "level_side": "support" if current_price > level else "resistance",
+                            "level_type": _lvl_info.get("type", "body_level"),
+                            "strength": state.level_strengths.get(task_key, _lvl_info.get("strength", 0)),
+                            "p_bounce": _lvl_info.get("p_bounce", 0.0),
+                            "expected_depth": _lvl_info.get("expected_depth", 0.0),
+                            "approach_style": detect_approach_style(symbol),
+                            "vol_ratio": _vr_prox,
+                            "atr": _atr_prox,
+                            "current_price": current_price,
+                            "timestamp": now,
+                        })
+                    except Exception as _eb_e:
+                        logger.debug("event_bus publish error (proximity): %s", _eb_e)
                 
                 # Reset cooldown if price moved far away (> 5% from level)
                 # This allows re-alerting if price comes back after leaving
@@ -1407,7 +1459,9 @@ async def _startup_monitoring():
                     task = asyncio.create_task(
                         _monitored(symbol, nearest["level"], "support",
                                   level_type=nearest["type"],
-                                  strength=nearest["strength"])
+                                  strength=nearest["strength"],
+                                  p_bounce=nearest.get("p_bounce", 0.0),
+                                  expected_depth=nearest.get("expected_depth", 0.0))
                     )
                     sym_state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
                     sym_state.phase = "phase2"
@@ -1472,7 +1526,9 @@ async def main():
         logger.warning("Signal handlers not available on this platform")
 
     logger.info("Starting trading bot...")
-    
+
+    from trading.strategy_runner import run_strategies
+
     # Start all components
     await asyncio.gather(
         start_collector(),
@@ -1483,6 +1539,7 @@ async def main():
         _startup_monitoring(),
         _stale_monitor_loop(),
         _ml_retrain_loop(),
+        run_strategies(),
     )
 
 

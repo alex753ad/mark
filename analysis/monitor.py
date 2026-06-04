@@ -59,6 +59,8 @@ async def start_monitor(
     vol_ratio: float = None,
     level_type: str = "body_level",
     strength: int = 0,
+    p_bounce: float = 0.0,
+    expected_depth: float = 0.0,
 ) -> str | None:
     """Monitor a level until body of 1M candle breaks it.
     level_side: 'support' or 'resistance'
@@ -125,6 +127,30 @@ async def start_monitor(
 
     _monitor_result = None
 
+    def _make_event(event_type: str, current_price: float, **extra) -> dict:
+        """Build event dict for the event bus from local monitor context."""
+        avg_vol_ctx = sum(
+            c["volume"] for c in candles_1m.get(symbol, [])[-20:]
+        ) / max(len(candles_1m.get(symbol, [])[-20:]), 1)
+        last_vol = candles_1m.get(symbol, [{}])[-1].get("volume", 0)
+        vr = round(last_vol / avg_vol_ctx, 2) if avg_vol_ctx > 0 else 1.0
+        return {
+            "event_type": event_type,
+            "symbol": symbol,
+            "level": level,
+            "level_side": level_side,
+            "level_type": level_type,
+            "strength": strength,
+            "p_bounce": p_bounce,
+            "expected_depth": expected_depth,
+            "approach_style": approach_style or "unknown",
+            "vol_ratio": vr,
+            "atr": atr,
+            "current_price": current_price,
+            "timestamp": time.time(),
+            **extra,
+        }
+
     while True:
         if stop_event and stop_event.is_set():
             _monitor_result = _make_result(None, touched)
@@ -157,6 +183,14 @@ async def start_monitor(
                     await send_message(
                         f"💥 {symbol} пробой {level} с объёмом ×{breakout_vol_ratio:.1f} — настоящий, выход"
                     )
+                    try:
+                        from trading.event_bus import publish as _eb_publish
+                        await _eb_publish(_make_event(
+                            "breakout", body_close,
+                            breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                        ))
+                    except Exception as _eb_e:
+                        logger.debug("event_bus publish error (breakout support): %s", _eb_e)
                     _monitor_result = _make_result("breakout", touched)
                     break
                 elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_below:
@@ -166,6 +200,14 @@ async def start_monitor(
                         await send_message(
                             f"⚠️ {symbol} закол {level} с объёмом ×{breakout_vol_ratio:.1f} — ждём подтверждения"
                         )
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event(
+                                "weak_breakout", body_close,
+                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                            ))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (weak_breakout support): %s", _eb_e)
                         weak_breakout_sent = True
                         weak_breakout_time = now
                 else:
@@ -174,6 +216,14 @@ async def start_monitor(
                         await send_message(
                             f"⚠️ {symbol} пробой {level} на слабом объёме (×{breakout_vol_ratio:.1f}) — возможен sweep, наблюдаем"
                         )
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event(
+                                "weak_breakout", body_close,
+                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                            ))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (weak_breakout support low vol): %s", _eb_e)
                         weak_breakout_sent = True
                         weak_breakout_time = now
             elif level_side == "support" and body_close >= level:
@@ -187,6 +237,14 @@ async def start_monitor(
                     await send_message(
                         f"💥 {symbol} пробой {level} с объёмом ×{breakout_vol_ratio:.1f} — настоящий, выход"
                     )
+                    try:
+                        from trading.event_bus import publish as _eb_publish
+                        await _eb_publish(_make_event(
+                            "breakout", body_close,
+                            breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                        ))
+                    except Exception as _eb_e:
+                        logger.debug("event_bus publish error (breakout resistance): %s", _eb_e)
                     _monitor_result = _make_result("breakout", touched)
                     break
                 elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_above:
@@ -195,6 +253,14 @@ async def start_monitor(
                         await send_message(
                             f"⚠️ {symbol} закол {level} с объёмом ×{breakout_vol_ratio:.1f} — ждём подтверждения"
                         )
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event(
+                                "weak_breakout", body_close,
+                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                            ))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (weak_breakout resistance): %s", _eb_e)
                         weak_breakout_sent = True
                         weak_breakout_time = now
                 else:
@@ -203,6 +269,14 @@ async def start_monitor(
                         await send_message(
                             f"⚠️ {symbol} пробой {level} на слабом объёме (×{breakout_vol_ratio:.1f}) — возможен sweep, наблюдаем"
                         )
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event(
+                                "weak_breakout", body_close,
+                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                            ))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (weak_breakout resistance low vol): %s", _eb_e)
                         weak_breakout_sent = True
                         weak_breakout_time = now
             elif level_side == "resistance" and body_close <= level:
@@ -304,6 +378,11 @@ async def start_monitor(
                             await send_message(
                                 f"✅ {symbol} отбой от {level} подтверждён — цена выкупается"
                             )
+                    try:
+                        from trading.event_bus import publish as _eb_publish
+                        await _eb_publish(_make_event("bounce", body_close))
+                    except Exception as _eb_e:
+                        logger.debug("event_bus publish error (bounce support): %s", _eb_e)
 
             if level_side == "resistance" and touched and body_close < body_open and body_close < level:
                 avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
@@ -339,6 +418,11 @@ async def start_monitor(
                             await send_message(
                                 f"✅ {symbol} отбой от {level} подтверждён — цена отбита вниз"
                             )
+                    try:
+                        from trading.event_bus import publish as _eb_publish
+                        await _eb_publish(_make_event("bounce", body_close))
+                    except Exception as _eb_e:
+                        logger.debug("event_bus publish error (bounce resistance): %s", _eb_e)
 
             current_price = last["close"]
             if atr > 0:
@@ -398,6 +482,17 @@ async def start_monitor(
                 await _handle_sweep(symbol, level, level_side, c1m)
                 sweep_sent = True
                 # Don't reset sweep_sent - it should only be sent once per monitoring session
+                try:
+                    from trading.event_bus import publish as _eb_publish
+                    _reclaim_vol = c1m[-1]["volume"]
+                    _avg_vol_sw = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
+                    _sweep_vr = round(_reclaim_vol / _avg_vol_sw, 2) if _avg_vol_sw > 0 else 1.0
+                    await _eb_publish(_make_event(
+                        "sweep", c1m[-1]["close"],
+                        sweep_vol_ratio=_sweep_vr,
+                    ))
+                except Exception as _eb_e:
+                    logger.debug("event_bus publish error (sweep): %s", _eb_e)
 
         alert, alert_type = _check_complications(symbol, level, level_side, approach_warned, volume_spike_notified, engulf_sent, level_broken_sent, weak_breakout_sent)
         if alert:
@@ -413,6 +508,25 @@ async def start_monitor(
             
             # Now send the message
             await send_message(alert)
+
+            # Publish to event bus
+            if alert_type == "pressure":
+                try:
+                    from trading.event_bus import publish as _eb_publish
+                    _cp_alert = candles_1m.get(symbol, [{}])[-1].get("close", 0.0)
+                    await _eb_publish(_make_event("pressure", _cp_alert))
+                except Exception as _eb_e:
+                    logger.debug("event_bus publish error (pressure): %s", _eb_e)
+            elif alert_type == "volume_spike":
+                try:
+                    from trading.event_bus import publish as _eb_publish
+                    _cp_vs = candles_1m.get(symbol, [{}])[-1].get("close", 0.0)
+                    _c1m_vs = candles_1m.get(symbol, [])
+                    _avg_vs = sum(c["volume"] for c in _c1m_vs[-60:]) / max(len(_c1m_vs[-60:]), 1) if _c1m_vs else 1
+                    _spike_r = int(_c1m_vs[-1]["volume"] / _avg_vs) if _c1m_vs and _avg_vs > 0 else 1
+                    await _eb_publish(_make_event("volume_spike", _cp_vs, spike_ratio=_spike_r))
+                except Exception as _eb_e:
+                    logger.debug("event_bus publish error (volume_spike): %s", _eb_e)
 
         await asyncio.sleep(COLLECTOR_UPDATE_INTERVAL_SECONDS)
 

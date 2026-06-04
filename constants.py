@@ -81,3 +81,27 @@ CONSOLIDATION_RANGE_ATR_MULTIPLIER = 4  # Множитель ATR для опре
 
 # Monitoring events
 LEVEL_BROKEN_MIN_CANDLES = 5  # Минимум свечей ниже уровня для алерта
+
+# ── Trading Strategies ────────────────────────────────────────────
+STRATEGY_POSITION_SIZE_USDT: float = 100.0    # размер позиции в USDT
+STRATEGY_MAX_OPEN_TRADES: int = 3             # макс. одновременных сделок на стратегию
+STRATEGY_TRADE_TIMEOUT_MINUTES: float = 120.0 # таймаут позиции в минутах
+
+# Strategy 1 (Bounce)
+S1_MIN_STRENGTH: int = 4
+S1_MIN_P_BOUNCE: float = 0.70
+S1_TP1_RR: float = 1.5    # risk:reward для TP1
+S1_TP2_RR: float = 3.0    # risk:reward для TP2
+
+# Strategy 2 (Grid)
+S2_MIN_STRENGTH: int = 3
+S2_MIN_P_BOUNCE: float = 0.60
+S2_PRESSURE_COOLDOWN_SECONDS: int = 300   # не входить N сек после pressure события
+S2_GRID_ORDERS: int = 5
+
+# Strategy 3 (Breakout)
+S3_MIN_BREAKOUT_VOL_RATIO: float = 2.4
+S3_SWEEP_COOLDOWN_SECONDS: int = 120      # не входить N сек после sweep
+S3_TP1_ATR_MULT: float = 2.0
+S3_TP2_ATR_MULT: float = 4.0
+S3_SL_ATR_MULT: float = 0.5

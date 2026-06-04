@@ -864,7 +864,13 @@ async def _do_analyze(message: Message, symbol: str):
 
     # Save all levels (strong + weak) to cache for quick check access
     _last_analysis_cache[symbol] = [
-        {"level": lvl["level"], "strength": lvl["strength"], "type": lvl["type"]}
+        {
+            "level": lvl["level"],
+            "strength": lvl["strength"],
+            "type": lvl["type"],
+            "p_bounce": lvl.get("p_bounce", 0.0),
+            "expected_depth": lvl.get("expected_depth", 0.0),
+        }
         for lvl in sorted(filtered, key=lambda l: l["level"])
     ]
 
@@ -908,7 +914,9 @@ async def _do_analyze(message: Message, symbol: str):
             task = asyncio.create_task(
                 _monitored(symbol, nearest["level"], level_side,
                            level_type=nearest["type"],
-                           strength=nearest["strength"])
+                           strength=nearest["strength"],
+                           p_bounce=nearest.get("p_bounce", 0.0),
+                           expected_depth=nearest.get("expected_depth", 0.0))
             )
             sym_state.add_task(nearest["level"], task)
             sym_state.phase = "phase2"
@@ -1191,7 +1199,9 @@ async def _do_check(message: Message, symbol: str, level: float):
             task = asyncio.create_task(
                 _monitored(symbol, level, level_side,
                            level_type=match["type"],
-                           strength=r.get("strength", 0))
+                           strength=r.get("strength", 0),
+                           p_bounce=r.get("p_bounce", 0.0),
+                           expected_depth=r.get("expected_depth", 0.0))
             )
             sym_state.add_task(level, task)
             sym_state.phase = "phase2"
@@ -1260,6 +1270,44 @@ async def cmd_stop(message: Message):
     await message.answer(f"🛑 Мониторинг {symbol} остановлен", reply_markup=get_main_keyboard())
 
 
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Show paper trading statistics for all three strategies."""
+    if not _authorized(message):
+        return
+
+    from trading.trade_log import get_trade_stats
+
+    lines = ["📊 Статистика стратегий\n"]
+    strategy_labels = [
+        (1, "S1 Bounce"),
+        (2, "S2 Grid"),
+        (3, "S3 Breakout"),
+    ]
+
+    for strategy_id, label in strategy_labels:
+        try:
+            s = await get_trade_stats(strategy_id)
+        except Exception as e:
+            lines.append(f"[{label}]\n  Ошибка: {e}\n")
+            continue
+
+        if s["total"] == 0:
+            lines.append(f"[{label}]\n  Сделок нет\n")
+            continue
+
+        lines.append(
+            f"[{label}]\n"
+            f"  Сделок: {s['total']} | Win rate: {s['win_rate']:.0f}%"
+            f" | PnL: {s['total_pnl_usdt']:+.2f} USDT\n"
+            f"  Avg win: {s['avg_win_pct']:+.1f}%"
+            f" | Avg loss: {s['avg_loss_pct']:+.1f}%"
+            f" | Avg time: {s['avg_duration_minutes']:.0f} мин\n"
+        )
+
+    await message.answer("\n".join(lines), reply_markup=get_main_keyboard())
+
+
 async def send_message(text: str):
     try:
         if len(text) > 4096:
@@ -1319,6 +1367,7 @@ async def start_bot():
         BotCommand(command="analyze", description="Запустить анализ — /analyze SYMBOL"),
         BotCommand(command="blacklist", description="Блэклист монет — /blacklist SYMBOL"),
         BotCommand(command="unblacklist", description="Убрать из блэклиста — /unblacklist SYMBOL"),
+        BotCommand(command="stats", description="Статистика paper trading стратегий"),
     ])
 
     await bot.send_message(TELEGRAM_CHAT_ID, "Бот запущен", reply_markup=get_main_keyboard())
