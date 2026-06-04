@@ -469,6 +469,28 @@ async def _run_phase1(symbol: str):
             state.phase = "phase2"
             return
 
+        # Проверка: уровень не должен быть уже пробит к моменту запуска монитора.
+        # Берём последние 30 свечей 1М и смотрим были ли закрытия ниже уровня.
+        # Если цена уже ниже уровня ИЛИ уровень пробивался телом свечи >= 2 раз — пропускаем.
+        _level_val = nearest["level"]
+        _broken_before_start = False
+        if current_price < _level_val:
+            # Цена уже ниже уровня — мониторить бессмысленно
+            _broken_before_start = True
+            logger.info("Level already below current price, skipping monitor",
+                        symbol=symbol, level=_level_val, current_price=current_price)
+        else:
+            _recent_1m = c1m[-30:] if len(c1m) >= 30 else c1m
+            _close_below = sum(1 for c in _recent_1m if c["close"] < _level_val)
+            if _close_below >= 2:
+                _broken_before_start = True
+                logger.info("Level broken in recent candles, skipping monitor",
+                            symbol=symbol, level=_level_val, close_below=_close_below)
+
+        if _broken_before_start:
+            state.phase = "phase2" if state.has_active_tasks() else "idle"
+            return
+
         zone_approaches = nearest.get("zone_approaches", 0)
         atr_pct = nearest.get("atr_pct", 0)
         stars = "⭐️" * nearest["strength"] if nearest["strength"] > 0 else "☆"
