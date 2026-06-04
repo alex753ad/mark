@@ -22,7 +22,16 @@ class SymbolState:
     weak_touch_state: dict = field(default_factory=dict)
     analyzed_levels: set[str] = field(default_factory=set)
     level_strengths: dict[str, int] = field(default_factory=dict)  # task_key -> strength
-    
+
+    # ── Pump Phase Detection ──────────────────────────────────────────
+    pump_high: float = 0.0              # peak price of current pump
+    pump_high_time: float = 0.0         # unix timestamp of peak candle
+    pump_base_price: float = 0.0        # base (origin) price of pump
+    broken_since_pump: int = 0          # levels broken without confirmed bounce
+    last_bounce_time: float = 0.0       # unix timestamp of last confirmed bounce
+    pump_phase: str = "unknown"         # active | caution | degraded | dead | unknown
+    pump_health: int = 0                # latest calculated health score 0-100
+
     def make_task_key(self, level: float) -> str:
         """Generate unique task key for symbol-level pair.
         

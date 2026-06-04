@@ -18,6 +18,8 @@ from constants import (
     COLLECTOR_UPDATE_INTERVAL_SECONDS,
     PROXIMITY_ALERT_DISTANCE_PCT,
     PROXIMITY_ALERT_COOLDOWN_SECONDS,
+    PUMP_HEALTH_MIN_SCORE,
+    PUMP_HEALTH_CAUTION_SCORE,
 )
 from models import state_manager
 from data.collector import start_collector, candles_1m
@@ -331,12 +333,44 @@ async def _run_phase1(symbol: str):
     try:
         from analysis.level_builder import build_levels
         from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
+        from analysis.pump_phase import detect_pump_peak, pump_health_score, get_pump_phase, calc_correction_pct
 
         c1m = candles_1m.get(symbol, [])
         current_price = c1m[-1]["close"] if c1m else 0
         if not current_price:
             state.phase = "phase2" if state.has_active_tasks() else "idle"
             return
+
+        # ── Pump Phase: record pump data and check health ─────────────
+        pump_high, pump_base, pump_high_time = detect_pump_peak(symbol)
+        if pump_high > 0:
+            state.pump_high = pump_high
+            state.pump_base_price = pump_base
+            state.pump_high_time = pump_high_time
+            # New trigger = new pump → reset broken-levels counter
+            state.broken_since_pump = 0
+
+        health = pump_health_score(state, current_price)
+        state.pump_health = health
+        state.pump_phase = get_pump_phase(health)
+
+        if health < PUMP_HEALTH_MIN_SCORE:
+            corr = calc_correction_pct(state)
+            logger.info("Pump degraded, skipping monitoring",
+                        symbol=symbol, health=health,
+                        broken=state.broken_since_pump, correction=f"{corr:.0%}")
+            await send_message(
+                f"⚠️ {symbol} памп деградировал (score={health}/100)\n"
+                f"   Пробито уровней: {state.broken_since_pump} | "
+                f"Коррекция: {corr:.0%}\n"
+                f"   Мониторинг пропущен."
+            )
+            state.phase = "phase2" if state.has_active_tasks() else "idle"
+            return
+
+        # In caution mode only monitor strength >= 4 levels
+        min_strength = 4 if health < PUMP_HEALTH_CAUTION_SCORE else 3
+        # ─────────────────────────────────────────────────────────────
 
         atr = calculate_atr(symbol)
         range_limit = current_price * 0.20
@@ -443,8 +477,8 @@ async def _run_phase1(symbol: str):
             state.phase = "phase2" if state.has_active_tasks() else "idle"
             return
 
-        # Filter by strength >= 3 (includes weak levels)
-        strong = [lvl for lvl in new_levels if lvl["strength"] >= 3]
+        # Filter by strength >= min_strength (3 normally, 4 in caution mode)
+        strong = [lvl for lvl in new_levels if lvl["strength"] >= min_strength]
 
         # Mark all as analyzed
         for lvl in new_levels:
@@ -567,6 +601,8 @@ async def _run_phase1(symbol: str):
         _vol_touch = nearest.get("vol_ratio_at_touch") or nearest.get("vol_ratio", 0)
         if _vol_touch and 2.0 <= _vol_touch <= 4.0:
             text += f"   🔒 Подтверждённый bounce (vol×{_vol_touch:.1f})\n"
+        # Pump health line
+        text += f"   💊 Pump health: {state.pump_health}/100 ({state.pump_phase})\n"
         text += f"\n   Жду цену на {nearest['level']}..."
 
         await send_message(text)
@@ -1144,7 +1180,9 @@ async def _proximity_loop():
                 # 1. In proximity zone
                 # 2. Approaching from above
                 # 3. Cooldown passed OR never sent before
-                if in_proximity_zone and approaching and cooldown_ok:
+                # 4. Pump is not dead (pump_phase guard)
+                _pump_phase_ok = state.pump_phase not in ("dead",)
+                if in_proximity_zone and approaching and cooldown_ok and _pump_phase_ok:
                     await send_message(
                         f"🎯 {symbol} цена в {distance_pct:.2f}% от уровня {level} — готовь ордер"
                     )

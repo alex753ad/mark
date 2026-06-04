@@ -105,3 +105,12 @@ S3_SWEEP_COOLDOWN_SECONDS: int = 120      # не входить N сек пос�
 S3_TP1_ATR_MULT: float = 2.0
 S3_TP2_ATR_MULT: float = 4.0
 S3_SL_ATR_MULT: float = 0.5
+
+# ── Pump Phase Detection ──────────────────────────────────────────
+PUMP_HEALTH_MIN_SCORE: int = 50           # min score to allow monitoring
+PUMP_HEALTH_CAUTION_SCORE: int = 70       # score below which only strength>=4 levels are monitored
+PUMP_MAX_AGE_HOURS: float = 8.0           # max pump age before -40 freshness penalty
+PUMP_MAX_CORRECTION_PCT: float = 0.65     # correction > 65% of pump body → -40 penalty
+PUMP_MAX_BROKEN_LEVELS: int = 2           # broken levels without bounce → pump dead
+PUMP_BLEED_MIN_RED_CANDLES: int = 5       # red candles required to flag bleed structure
+PUMP_BLEED_MIN_VOL_TREND: int = 4         # rising-volume steps required to confirm bleed

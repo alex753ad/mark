@@ -17,6 +17,7 @@ from constants import (
     PRESSURE_ZONE_MAX_DISTANCE_PCT,
     PRESSURE_VOLUME_MIN_RATIO,
     LEVEL_BROKEN_MIN_CANDLES,
+    PUMP_MAX_BROKEN_LEVELS,
 )
 from logger import logger
 
@@ -191,6 +192,27 @@ async def start_monitor(
                         ))
                     except Exception as _eb_e:
                         logger.debug("event_bus publish error (breakout support): %s", _eb_e)
+                    # ── Pump Phase: count broken level ────────────────
+                    try:
+                        from models import state_manager as _sm
+                        _st = _sm.get_state(symbol)
+                        _st.broken_since_pump += 1
+                        from analysis.pump_phase import pump_health_score, get_pump_phase, calc_correction_pct
+                        if _st.broken_since_pump >= PUMP_MAX_BROKEN_LEVELS:
+                            _st.pump_phase = "dead"
+                            _corr = calc_correction_pct(_st)
+                            await send_message(
+                                f"🚫 {symbol} — памп завершён\n"
+                                f"   Пробито уровней без отскока: {_st.broken_since_pump}\n"
+                                f"   Коррекция от пика: {_corr:.0%}\n"
+                                f"   Мониторинг остановлен. Жду новый памп."
+                            )
+                        else:
+                            _st.pump_health = pump_health_score(_st, body_close)
+                            _st.pump_phase = get_pump_phase(_st.pump_health)
+                    except Exception as _pp_e:
+                        logger.debug("pump_phase update error (breakout support): %s", _pp_e)
+                    # ─────────────────────────────────────────────────
                     _monitor_result = _make_result("breakout", touched)
                     break
                 elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_below:
@@ -245,6 +267,27 @@ async def start_monitor(
                         ))
                     except Exception as _eb_e:
                         logger.debug("event_bus publish error (breakout resistance): %s", _eb_e)
+                    # ── Pump Phase: count broken level ────────────────
+                    try:
+                        from models import state_manager as _sm
+                        _st = _sm.get_state(symbol)
+                        _st.broken_since_pump += 1
+                        from analysis.pump_phase import pump_health_score, get_pump_phase, calc_correction_pct
+                        if _st.broken_since_pump >= PUMP_MAX_BROKEN_LEVELS:
+                            _st.pump_phase = "dead"
+                            _corr = calc_correction_pct(_st)
+                            await send_message(
+                                f"🚫 {symbol} — памп завершён\n"
+                                f"   Пробито уровней без отскока: {_st.broken_since_pump}\n"
+                                f"   Коррекция от пика: {_corr:.0%}\n"
+                                f"   Мониторинг остановлен. Жду новый памп."
+                            )
+                        else:
+                            _st.pump_health = pump_health_score(_st, body_close)
+                            _st.pump_phase = get_pump_phase(_st.pump_health)
+                    except Exception as _pp_e:
+                        logger.debug("pump_phase update error (breakout resistance): %s", _pp_e)
+                    # ─────────────────────────────────────────────────
                     _monitor_result = _make_result("breakout", touched)
                     break
                 elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_above:
@@ -383,6 +426,18 @@ async def start_monitor(
                         await _eb_publish(_make_event("bounce", body_close))
                     except Exception as _eb_e:
                         logger.debug("event_bus publish error (bounce support): %s", _eb_e)
+                    # ── Pump Phase: reset broken counter on confirmed bounce ──
+                    try:
+                        from models import state_manager as _sm
+                        _st = _sm.get_state(symbol)
+                        _st.broken_since_pump = 0
+                        _st.last_bounce_time = time.time()
+                        from analysis.pump_phase import pump_health_score, get_pump_phase
+                        _st.pump_health = pump_health_score(_st, body_close)
+                        _st.pump_phase = get_pump_phase(_st.pump_health)
+                    except Exception as _pp_e:
+                        logger.debug("pump_phase reset error (bounce support): %s", _pp_e)
+                    # ────────────────────────────────────────────────────────
 
             if level_side == "resistance" and touched and body_close < body_open and body_close < level:
                 avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
@@ -423,6 +478,18 @@ async def start_monitor(
                         await _eb_publish(_make_event("bounce", body_close))
                     except Exception as _eb_e:
                         logger.debug("event_bus publish error (bounce resistance): %s", _eb_e)
+                    # ── Pump Phase: reset broken counter on confirmed bounce ──
+                    try:
+                        from models import state_manager as _sm
+                        _st = _sm.get_state(symbol)
+                        _st.broken_since_pump = 0
+                        _st.last_bounce_time = time.time()
+                        from analysis.pump_phase import pump_health_score, get_pump_phase
+                        _st.pump_health = pump_health_score(_st, body_close)
+                        _st.pump_phase = get_pump_phase(_st.pump_health)
+                    except Exception as _pp_e:
+                        logger.debug("pump_phase reset error (bounce resistance): %s", _pp_e)
+                    # ────────────────────────────────────────────────────────
 
             current_price = last["close"]
             if atr > 0:
