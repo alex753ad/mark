@@ -36,9 +36,9 @@ def normalize_symbol(raw: str) -> str:
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📜 История"), KeyboardButton(text="➖ Убрать")],
+            [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="➖ Убрать")],
             [KeyboardButton(text="📋 Список"), KeyboardButton(text="👁 Мониторинги")],
-            [KeyboardButton(text="🔍 Проверить уровень"), KeyboardButton(text="🛑 Стоп")],
+            [KeyboardButton(text="🔍 Проверить уровень"), KeyboardButton(text="📊 Статистика")],
             [KeyboardButton(text="📊 Анализ"), KeyboardButton(text="📊 Рынок")],
         ],
         resize_keyboard=True,
@@ -49,6 +49,10 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
 class CheckLevel(StatesGroup):
     waiting_for_symbol = State()
     waiting_for_level = State()
+
+
+class AddSymbol(StatesGroup):
+    waiting_for_input = State()
 
 
 class StopMonitor(StatesGroup):
@@ -74,6 +78,44 @@ def _tokens_inline_keyboard(prefix: str) -> InlineKeyboardMarkup | None:
     if row:
         buttons.append(row)
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(F.text == "➕ Добавить")
+async def btn_add_symbol(message: Message, state: FSMContext):
+    if not _authorized(message):
+        return
+    await message.answer("Введи символ монеты (например BTCUSDT):", reply_markup=get_main_keyboard())
+    await state.set_state(AddSymbol.waiting_for_input)
+
+
+@router.message(AddSymbol.waiting_for_input)
+async def btn_add_symbol_input(message: Message, state: FSMContext):
+    if not _authorized(message):
+        return
+    await state.clear()
+    symbol = normalize_symbol(message.text.strip())
+    if token_registry.contains(symbol):
+        await message.answer(f"{symbol} уже в списке", reply_markup=get_main_keyboard())
+        return
+    token_registry.add(symbol)
+    from data.history import log_event
+    await log_event(symbol, "added_manual")
+    await message.answer(f"✅ {symbol} добавлен — загружаю данные...", reply_markup=get_main_keyboard())
+    try:
+        from binance import AsyncClient
+        from data.collector import _parse_kline, candles_1m, candles_15m
+        client = await AsyncClient.create()
+        try:
+            raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=500)
+            raw_1m  = await client.futures_klines(symbol=symbol, interval="1m",  limit=300)
+            candles_15m[symbol] = [_parse_kline(k) for k in raw_15m]
+            candles_1m[symbol]  = [_parse_kline(k) for k in raw_1m]
+        finally:
+            await client.close_connection()
+        await message.answer(f"✅ {symbol} готов к анализу", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.exception("Failed to load candles for added symbol", symbol=symbol, error=str(e))
+        await message.answer(f"⚠️ {symbol} добавлен, но данные не загрузились: {e}", reply_markup=get_main_keyboard())
 
 
 @router.message(F.text == "📜 История")
@@ -299,6 +341,32 @@ async def btn_check_level(message: Message, state: FSMContext):
         await message.answer("Уровень должен быть числом", reply_markup=get_main_keyboard())
         return
     await _do_check(message, symbol, level)
+
+
+@router.message(F.text == "📊 Статистика")
+async def btn_stats(message: Message):
+    if not _authorized(message):
+        return
+    from trading.trade_log import get_trade_stats
+    lines = ["📊 Статистика стратегий\n"]
+    for strategy_id, label in [(1, "S1 Bounce"), (2, "S2 Grid"), (3, "S3 Breakout")]:
+        try:
+            s = await get_trade_stats(strategy_id)
+        except Exception as e:
+            lines.append(f"[{label}]\n  Ошибка: {e}\n")
+            continue
+        if s["total"] == 0:
+            lines.append(f"[{label}]\n  Сделок нет\n")
+            continue
+        lines.append(
+            f"[{label}]\n"
+            f"  Сделок: {s['total']} | Win rate: {s['win_rate']:.0f}%"
+            f" | PnL: {s['total_pnl_usdt']:+.2f} USDT\n"
+            f"  Avg win: {s['avg_win_pct']:+.1f}%"
+            f" | Avg loss: {s['avg_loss_pct']:+.1f}%"
+            f" | Avg time: {s['avg_duration_minutes']:.0f} мин\n"
+        )
+    await message.answer("\n".join(lines), reply_markup=get_main_keyboard())
 
 
 @router.message(F.text == "🛑 Стоп")
