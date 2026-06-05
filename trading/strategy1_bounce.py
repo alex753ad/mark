@@ -43,6 +43,14 @@ class Strategy1Bounce(BaseStrategy):
             return
         if approach_style == "bleed":
             return
+        # Не входить при flash/impulse если объём ниже нормы — слабый сигнал.
+        vol_ratio = event.get("vol_ratio", 1.0)
+        if vol_ratio < 1.0 and approach_style in ("flash", "impulse"):
+            logger.debug(
+                "S1 skip: low vol_ratio on flash/impulse",
+                symbol=symbol, vol_ratio=vol_ratio, style=approach_style,
+            )
+            return
         if not await self._can_open_trade(symbol):
             return
 

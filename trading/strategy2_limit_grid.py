@@ -323,8 +323,29 @@ class Strategy2LimitGrid(BaseStrategy):
                 logger.error("S2 cancel grid orders failed", error=str(e))
 
             if fill_count == 0:
-                await close_trade(trade_id, current_price, "cancelled_breakout")
-                await self._send_close_message(trade, current_price, "cancelled_breakout")
+                # Позиции не было — ни один ордер сетки не исполнен.
+                # Не вызываем close_trade: она считает pnl от entry_price=level,
+                # хотя реальной позиции не существовало — это ложный убыток.
+                # Закрываем запись напрямую с нулевым PnL.
+                async with aiosqlite.connect(DB_PATH) as _db:
+                    await _db.execute(
+                        """UPDATE trades
+                           SET exit_price = ?, exit_time = ?, exit_reason = ?,
+                               pnl_pct = 0.0, pnl_usdt = 0.0, duration_minutes = ?,
+                               status = 'closed', updated_at = ?
+                           WHERE trade_id = ?""",
+                        (
+                            trade["entry_price"],
+                            time.time(),
+                            "cancelled_no_fill",
+                            round((time.time() - trade["entry_time"]) / 60, 2),
+                            time.time(),
+                            trade_id,
+                        ),
+                    )
+                    await _db.commit()
+                await self._send_close_message(trade, trade["entry_price"], "cancelled_no_fill")
+                logger.info("S2 grid cancelled (no fills), pnl=0", trade_id=trade_id)
             else:
                 await close_trade(trade_id, current_price, "breakout_confirmed")
                 await self._send_close_message(trade, current_price, "breakout_confirmed")

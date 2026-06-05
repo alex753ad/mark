@@ -92,6 +92,7 @@ async def start_monitor(
     max_price_during = None
     touch_start_time: float = 0.0
     vol_ratio_captured: float = 1.0  # vol_ratio captured at moment of first touch
+    _monitoring_start_time = time.time()
 
     def _make_result(reason, _touched=False):
         """Build result dict with outcome info."""
@@ -149,6 +150,7 @@ async def start_monitor(
             "atr": atr,
             "current_price": current_price,
             "timestamp": time.time(),
+            "monitoring_start_time": _monitoring_start_time,
             **extra,
         }
 

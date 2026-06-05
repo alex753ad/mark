@@ -52,7 +52,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from analysis.ml_score import STYLE_MAP
 
-FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc", "age_capped"]
+FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc", "age_capped", "monitoring_age_hours"]
 
 
 def load_data(db_path: str) -> pd.DataFrame:
@@ -106,6 +106,11 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     df["touches"]    = df["touches_count"].fillna(0).clip(upper=5).astype(float)
     # BUG-13: monitoring_age_minutes — bounce ~5 мин, breakout ~131 мин; cap=300
     df["age_capped"] = df["monitoring_age_minutes"].fillna(0).clip(upper=300).astype(float)
+    # monitoring_age_hours: если в данных нет — ставим 0 (старые записи)
+    if "monitoring_age_hours" not in df.columns:
+        df["monitoring_age_hours"] = 0.0
+    else:
+        df["monitoring_age_hours"] = df["monitoring_age_hours"].fillna(0.0)
     age_nonzero_pct = (df["age_capped"] > 0).mean() * 100
     if age_nonzero_pct < 30:
         print(f"  ⚠️  age_capped: только {age_nonzero_pct:.1f}% записей ненулевые — признак слабый, "
@@ -210,7 +215,7 @@ def train(db_path: str, out_dir: str) -> None:
     body_enc = level_type_map.get("body_level", 0)
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 1, 2.0, style_code, 0]],
+            [[4, body_enc, 1.5, 1, 2.0, style_code, 0, 0.0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -225,7 +230,7 @@ def train(db_path: str, out_dir: str) -> None:
     pump_enc = level_type_map.get("pump_base", 1)
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[5, pump_enc, 1.5, 1, 2.0, style_code, 0]],
+            [[5, pump_enc, 1.5, 1, 2.0, style_code, 0, 0.0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -238,7 +243,7 @@ def train(db_path: str, out_dir: str) -> None:
     print("Smoke-тест 3: touches=3 → ожидается ml_delta=-1 для всех:")
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 3, 2.0, style_code, 0]],
+            [[4, body_enc, 1.5, 3, 2.0, style_code, 0, 0.0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -255,7 +260,7 @@ def train(db_path: str, out_dir: str) -> None:
     age_results = []
     for age, label in [(0, "age=0min  "), (60, "age=60min "), (180, "age=180min")]:
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 1, 2.0, STYLE_MAP["unknown"], age]],
+            [[4, body_enc, 1.5, 1, 2.0, STYLE_MAP["unknown"], age, 0.0]],
             columns=FEATURES,
         )
         proba = clf.predict_proba(x_test)[0]

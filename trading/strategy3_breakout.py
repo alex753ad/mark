@@ -59,6 +59,15 @@ class Strategy3Breakout(BaseStrategy):
         if level_side != "support":
             return
 
+        # Не входить в short если BTC растёт в эту минуту (контртренд).
+        btc_change = event.get("btc_change_1m", 0.0)
+        if btc_change is not None and btc_change > 0.002:  # BTC +0.2% за минуту
+            logger.debug(
+                "S3 skip: BTC counter-trend on breakout",
+                symbol=symbol, btc_change=btc_change,
+            )
+            return
+
         # Не торговать если был sweep незадолго до пробоя (ложный пробой)
         last_sweep = self._recent_sweep.get(symbol, 0.0)
         if time.time() - last_sweep < S3_SWEEP_COOLDOWN_SECONDS:
@@ -161,6 +170,24 @@ class Strategy3Breakout(BaseStrategy):
             await add_trade_event(trade_id, "params_updated", current_price, json.dumps(params))
             logger.info("S3 TP1 hit, stop moved to breakeven", trade_id=trade_id)
             return
+
+        # Трейлинг-стоп: после TP1 подтягиваем стоп вслед за ценой.
+        # Для short: чем ниже цена, тем ниже опускаем стоп.
+        if tp1_hit:
+            atr = trade.get("atr_at_entry") or 0.0
+            if atr > 0:
+                # Новый трейлинг-стоп = текущая цена + 1.5 × ATR (для short стоп выше цены)
+                new_trailing_stop = current_price + atr * 1.5
+                # Обновляем только если новый стоп ниже текущего effective_stop
+                # (для short: тянем стоп вниз, не вверх)
+                if new_trailing_stop < effective_stop:
+                    params["stop_loss"] = round(new_trailing_stop, 8)
+                    params["stop_moved_to_breakeven"] = True  # флаг уже стоит
+                    await add_trade_event(
+                        trade_id, "trailing_stop_updated", current_price,
+                        json.dumps({"new_stop": round(new_trailing_stop, 8), "atr": atr})
+                    )
+                    await add_trade_event(trade_id, "params_updated", current_price, json.dumps(params))
 
         # Stop loss (для short: цена ушла вверх выше стопа)
         if current_price >= effective_stop:

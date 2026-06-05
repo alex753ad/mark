@@ -148,6 +148,13 @@ def ml_score(lvl: dict) -> dict:
         style_enc = STYLE_MAP.get(style, 3)
         age_min   = min(float(lvl.get("monitoring_age_minutes") or 0), 300.0)
 
+        import time as _time
+        monitoring_age_hours = (
+            (_time.time() - lvl["monitoring_start_time"]) / 3600
+            if lvl.get("monitoring_start_time")
+            else 0.0
+        )
+
         x = np.array([[
             strength,
             ltype_enc,
@@ -156,15 +163,21 @@ def ml_score(lvl: dict) -> dict:
             min(atr_ratio, 20.0),
             style_enc,
             age_min,
+            monitoring_age_hours,
         ]])
 
         # Classifier
-        proba      = _clf.predict_proba(x)[0]
-        bounce_idx = list(_le.classes_).index("bounce")
-        p_bounce   = float(proba[bounce_idx])
+        try:
+            proba      = _clf.predict_proba(x)[0]
+            bounce_idx = list(_le.classes_).index("bounce")
+            p_bounce   = float(proba[bounce_idx])
 
-        # Regressor
-        expected_depth = float(_reg.predict(x)[0])
+            # Regressor
+            expected_depth = float(_reg.predict(x)[0])
+        except Exception as e:
+            logger.warning("ML predict failed (model mismatch?), using defaults", extra={"error": str(e)})
+            p_bounce = 0.5
+            expected_depth = 1.0
         expected_depth = max(0.1, round(expected_depth, 2))
 
         if p_bounce >= THRESHOLD_HIGH:

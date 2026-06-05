@@ -287,12 +287,10 @@ def _build_levels_no_pump(
     """
     support_range_low  = current_price * 0.80 if current_price > 0 else 0
     support_range_high = current_price * 1.05 if current_price > 0 else float("inf")
-    cluster_radius = atr_15m * 0.3 if atr_15m > 0 else max(atr * 0.5, current_price * 0.003)
+    cluster_radius = max(atr_15m * 0.3, current_price * 0.001) if atr_15m > 0 else max(atr * 0.5, current_price * 0.003)
     # BUG-35: cap at 0.5% of current_price
     if current_price > 0:
         cluster_radius = min(cluster_radius, current_price * 0.005)
-
-    all_levels: list[dict] = []
 
     # Consolidation zones from 15M
     for price, candle_count, metadata in _find_consolidation_zones(c15m, support_range_low, support_range_high, atr_15m if atr_15m > 0 else atr):
@@ -396,7 +394,7 @@ def build_levels(symbol: str, c1m_override: list[dict] = None, c15m_override: li
 
     # Cluster radius based on 15M ATR
     # BUG-35: cap at 0.5% of current_price to prevent over-merging on cheap altcoins
-    cluster_radius = atr_15m * 0.3 if atr_15m > 0 else max(atr * 0.5, current_price * 0.003)
+    cluster_radius = max(atr_15m * 0.3, current_price * 0.001) if atr_15m > 0 else max(atr * 0.5, current_price * 0.003)
     if current_price > 0:
         cluster_radius = min(cluster_radius, current_price * 0.005)
 

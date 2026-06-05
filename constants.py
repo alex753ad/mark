@@ -85,7 +85,7 @@ LEVEL_BROKEN_MIN_CANDLES = 5  # Минимум свечей ниже уровн�
 # ── Trading Strategies ────────────────────────────────────────────
 STRATEGY_POSITION_SIZE_USDT: float = 100.0    # размер позиции в USDT
 STRATEGY_MAX_OPEN_TRADES: int = 3             # макс. одновременных сделок на стратегию
-STRATEGY_TRADE_TIMEOUT_MINUTES: float = 120.0 # таймаут позиции в минутах
+STRATEGY_TRADE_TIMEOUT_MINUTES: float = 60.0  # таймаут позиции в минутах
 
 # Strategy 1 (Bounce)
 S1_MIN_STRENGTH: int = 4
