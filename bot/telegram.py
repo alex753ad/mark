@@ -245,7 +245,9 @@ async def btn_monitors(message: Message):
         if level != 0:
             distance_pct = (current_price - level) / level * 100
             strength = state_manager.get_state(sym).level_strengths.get(task_key, 0)
-            stars = "⭐️" * strength if strength > 0 else "☆"
+            if strength < 3:
+                continue
+            stars = "⭐️" * strength
             lines.append(f"  {sym} @ {level} {stars} — цена {current_price} ({distance_pct:+.2f}%)")
         else:
             lines.append(f"  {sym} @ {level} — цена {current_price}")
@@ -986,7 +988,7 @@ async def _do_analyze(message: Message, symbol: str):
                            p_bounce=nearest.get("p_bounce", 0.0),
                            expected_depth=nearest.get("expected_depth", 0.0))
             )
-            sym_state.add_task(nearest["level"], task)
+            sym_state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
             sym_state.phase = "phase2"
             await message.answer(
                 f"👁 Мониторинг запущен: {symbol} @ {nearest['level']}",
@@ -1271,7 +1273,7 @@ async def _do_check(message: Message, symbol: str, level: float):
                            p_bounce=r.get("p_bounce", 0.0),
                            expected_depth=r.get("expected_depth", 0.0))
             )
-            sym_state.add_task(level, task)
+            sym_state.add_task(level, task, strength=r.get("strength", 0))
             sym_state.phase = "phase2"
             await message.answer(
                 f"👁 Мониторинг запущен: {symbol} @ {level}",
