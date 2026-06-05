@@ -17,6 +17,7 @@ from constants import (
     S2_PRESSURE_COOLDOWN_SECONDS,
     S2_GRID_ORDERS,
 )
+from data.collector import candles_1m
 from logger import logger
 
 
@@ -212,18 +213,30 @@ class Strategy2LimitGrid(BaseStrategy):
                 await self._send_close_message(updated, current_price, "stop_loss")
 
     async def _process_grid_fills(self, trade: dict, current_price: float) -> None:
-        """Исполнить ордера сетки, до цены которых дошёл рынок."""
+        """Исполнить ордера сетки, до цены которых дошёл рынок.
+
+        Проверяем не current_price, а low последних 2 свечей 1М — это решает
+        проблему sweep: быстрое движение вниз с возвратом укладывается в 1–3 сек
+        и не попадает в поллинг event bus (~5 сек), но всегда отражается в low свечи.
+        fill_price = order["price"] — лимитный ордер исполняется по своей цене.
+        """
         trade_id = trade["trade_id"]
+        symbol = trade["symbol"]
         try:
             grid_orders = json.loads(trade["grid_orders_json"] or "[]")
         except Exception:
             return
 
+        # Low последних 2 закрытых свечей 1М как прокси реального минимума цены.
+        # default=current_price — фолбэк на старое поведение если свечей нет.
+        _c1m = candles_1m.get(symbol, [])
+        _last_low = min((c["low"] for c in _c1m[-2:]), default=current_price)
+
         changed = False
         for order in grid_orders:
             if order["filled"] or order.get("cancelled"):
                 continue
-            if current_price <= order["price"]:
+            if _last_low <= order["price"]:
                 order["filled"] = True
                 order["fill_time"] = time.time()
                 changed = True
