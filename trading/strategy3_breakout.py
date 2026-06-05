@@ -16,6 +16,7 @@ from constants import (
     S3_TP2_ATR_MULT,
     S3_SL_ATR_MULT,
 )
+from data.collector import candles_1m, get_delta
 from logger import logger
 
 
@@ -120,6 +121,34 @@ class Strategy3Breakout(BaseStrategy):
         })
         await add_trade_event(trade_id, "params_set", entry_price, params_note)
 
+        # Записываем контекст входа для последующего анализа ложных пробоев.
+        # delta_at_entry: агрессия продавца в момент пробоя (отрицательная = продавцы доминировали).
+        # candle_body_ratio: отношение тела к диапазону последней 1М свечи (0 = закол, 1 = чистое тело).
+        try:
+            delta_data = get_delta(symbol)
+            delta_at_entry = round(delta_data.get("delta", 0.0), 4)
+
+            c1m = candles_1m.get(symbol, [])
+            if c1m:
+                last_c = c1m[-1]
+                candle_range = last_c["high"] - last_c["low"]
+                if candle_range > 0:
+                    candle_body_ratio = round(abs(last_c["close"] - last_c["open"]) / candle_range, 4)
+                else:
+                    candle_body_ratio = 0.0
+            else:
+                candle_body_ratio = 0.0
+
+            await add_trade_event(
+                trade_id, "entry_context", entry_price,
+                json.dumps({
+                    "delta_at_entry": delta_at_entry,
+                    "candle_body_ratio": candle_body_ratio,
+                })
+            )
+        except Exception as e:
+            logger.warning("S3 entry_context logging failed", trade_id=trade_id, error=str(e))
+
         await self._send_open_message(trade, stop_loss, take_profit_1, take_profit_2)
 
         logger.info(
@@ -139,8 +168,17 @@ class Strategy3Breakout(BaseStrategy):
         trade_id = trade["trade_id"]
         entry_price = trade["entry_price"]
 
+        # Защита: events_json может быть None если БД вернула NULL
+        if trade.get("events_json") is None:
+            trade["events_json"] = "[]"
+
         params = self._extract_params(trade)
         if params is None:
+            logger.warning(
+                "S3 _check_exit: params not found in events_json",
+                trade_id=trade_id,
+                events_json_preview=(trade.get("events_json") or "")[:200],
+            )
             return
 
         stop_loss = params["stop_loss"]

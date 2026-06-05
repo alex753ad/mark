@@ -75,7 +75,8 @@ class Strategy2LimitGrid(BaseStrategy):
             expected_depth_abs = atr if atr > 0 else level * 0.005
 
         step = expected_depth_abs * 1.2 / (S2_GRID_ORDERS - 1)
-        grid_prices = [level - step * i for i in range(S2_GRID_ORDERS)]
+        grid_anchor = level * 1.0015  # первый ордер на 0.15% выше уровня (front-run)
+        grid_prices = [grid_anchor - step * i for i in range(S2_GRID_ORDERS)]
         order_size = round(self.POSITION_SIZE_USDT / S2_GRID_ORDERS, 4)
 
         grid_orders = [
