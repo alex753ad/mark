@@ -123,7 +123,7 @@ async def start_monitor(
             "fill_depth_pct": round(fdp, 4),
             "approach_style": approach_style,
             "atr_ratio": atr_ratio,
-            "vol_ratio_at_touch": vol_ratio,
+            "vol_ratio_at_touch": vol_ratio_captured if vol_ratio_captured != 1.0 else vol_ratio,
             "outcome_saved": _outcome_saved[0],
         }
 

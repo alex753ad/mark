@@ -1,9 +1,13 @@
 """
 ML scoring for support levels.
 
-Два выхода:
+Два выхода основного классификатора:
   - p_bounce: float 0..1  — вероятность отбоя
   - expected_depth: float — ожидаемый прокол под уровень в %
+
+Дополнительный выход clf2 (только при ml_blocked=False):
+  - p_fast_breakout: float 0..1 — вероятность быстрого пробоя (touches≤3)
+    Полезен для решения "продолжать мониторить или нет"
 
 Использование:
     from analysis.ml_score import ml_score, apply_ml_to_level
@@ -13,23 +17,31 @@ ML scoring for support levels.
 
     calculate_strength(lvl)
     apply_ml_to_level(lvl)
-    # lvl теперь содержит: p_bounce, expected_depth, ml_delta, strength_pre_ml
+    # lvl теперь содержит: p_bounce, expected_depth, ml_delta, strength_pre_ml,
+    #                       p_fast_breakout (если clf2 загружен)
 
-Признаки модели (7 штук):
+Признаки модели (6 штук, touches убран):
     1. strength        — Python-сила уровня (1-5)
     2. ltype_enc       — тип уровня (из level_type_map.pkl)
     3. vol_ratio       — объём / среднее (обрезается до 20)
-    4. touches         — число касаний / подходов (обрезается до 5)
-    5. atr_ratio       — расстояние до уровня в ATR (обрезается до 20)
-    6. style_enc       — стиль подхода: flash=0, impulse=1, bleed=2, unknown=3
+    4. atr_ratio       — расстояние до уровня в ATR (обрезается до 20)
+    5. style_enc       — стиль подхода: flash=0, impulse=1, bleed=2, unknown=3
                          Доступен только в _monitored(); в _run_phase1 = "unknown"
-    7. age_capped      — время мониторинга в минутах (обрезается до 300)
-                         bounce медианно ~5 мин, breakout ~131 мин (BUG-13)
+    6. age_capped      — время мониторинга в минутах (обрезается до 300)
+                         bounce медианно ~5 мин, breakout ~131 мин
+
+  touches убран из признаков: доминировал (importance 0.542) и делал модель
+  тривиальной. touches >= 2 = 0% bounce → полностью закрыто хард-фильтром ниже.
 
 Hard-filter (применяется в apply_ml_to_level ДО ML):
     touches >= 2 → ml_delta = -2, p_bounce = 0.0
     Данные: touches>=2 даёт 0% bounce из 113 случаев — детерминированное правило,
     ML не нужен.
+
+Регрессор fill_depth:
+    Обучен на bounce + breakout с признаком is_breakout.
+    При инференсе is_breakout=0 (мы ещё не знаем исход — прогнозируем ожидаемую глубину
+    при отбое). Это консервативная оценка; реальная глубина при пробое выше.
 """
 
 from __future__ import annotations
@@ -45,6 +57,7 @@ logger = logging.getLogger(__name__)
 _BASE = os.path.join(os.path.dirname(__file__), "ml")
 
 _clf = None
+_clf2 = None   # классификатор скорости breakout (fast/slow), опциональный
 _reg = None
 _le  = None
 _type_map = None
@@ -69,7 +82,7 @@ STYLE_MAP: dict[str, int] = {
 # Пороги p_bounce для ml_delta.
 # Откалиброваны по P25/P75 на датасете outcome IN ('bounce','breakout'),
 # strength!=0, created_at >= 2026-05-21 (partial исключён).
-# Обновлять после каждого переобучения через train_ml.py (он печатает новые значения).
+# Обновляются автоматически из thresholds.json после каждого переобучения.
 THRESHOLD_HIGH: float = 0.97   # p_bounce >= HIGH → ml_delta = +1
 THRESHOLD_LOW:  float = 0.60   # p_bounce <= LOW  → ml_delta = -1
 
@@ -79,7 +92,7 @@ TOUCHES_BLOCK: int = 2
 
 
 def _load() -> bool:
-    global _clf, _reg, _le, _type_map, THRESHOLD_HIGH, THRESHOLD_LOW
+    global _clf, _clf2, _reg, _le, _type_map, THRESHOLD_HIGH, THRESHOLD_LOW
     if _clf is not None:
         return True
     try:
@@ -91,6 +104,14 @@ def _load() -> bool:
             _le = pickle.load(f)
         with open(os.path.join(_BASE, "level_type_map.pkl"), "rb") as f:
             _type_map = pickle.load(f)
+
+        # clf2 — опциональный, не ломает загрузку если отсутствует
+        clf2_path = os.path.join(_BASE, "clf2.pkl")
+        if os.path.exists(clf2_path):
+            with open(clf2_path, "rb") as f:
+                _clf2 = pickle.load(f)
+            logger.debug("ml_score: clf2 (fast/slow breakout) загружен")
+
         # Load thresholds saved by train_ml.py, if available.
         _thr_path = os.path.join(_BASE, "thresholds.json")
         if os.path.exists(_thr_path):
@@ -109,8 +130,9 @@ def _load() -> bool:
 async def reload_models() -> None:
     """Hot-reload models after train_ml.py finishes. Thread-safe via asyncio.Lock."""
     async with _get_lock():
-        global _clf, _reg, _le, _type_map
+        global _clf, _clf2, _reg, _le, _type_map
         _clf = None
+        _clf2 = None
         _reg = None
         _le = None
         _type_map = None
@@ -124,23 +146,23 @@ async def reload_models() -> None:
 def ml_score(lvl: dict) -> dict:
     """
     Принимает lvl-словарь (тот же что в calculate_strength).
-    Использует 6 признаков; approach_style читается из lvl["approach_style"]
-    (fallback: "unknown").
+    Использует 6 признаков (touches убран, закрыт хард-фильтром).
+    approach_style читается из lvl["approach_style"] (fallback: "unknown").
 
     Возвращает dict с ключами:
-        p_bounce       — вероятность отбоя (0..1)
-        expected_depth — ожидаемый прокол под уровень в %
-        ml_delta       — поправка к strength: +1 / 0 / -1
+        p_bounce          — вероятность отбоя (0..1)
+        expected_depth    — ожидаемый прокол под уровень в % (консервативно, is_breakout=0)
+        ml_delta          — поправка к strength: +1 / 0 / -1
+        p_fast_breakout   — вероятность быстрого пробоя (0..1), None если clf2 не загружен
     При ошибке загрузки возвращает нейтральный результат.
     """
     if not _load():
-        return {"p_bounce": 0.5, "expected_depth": 1.5, "ml_delta": 0}
+        return {"p_bounce": 0.5, "expected_depth": 1.5, "ml_delta": 0, "p_fast_breakout": None}
 
     try:
         ltype     = lvl.get("type", "body_level")
         strength  = float(lvl.get("strength", 3) or 3)
         vol       = float(lvl.get("vol_ratio", 1.0) or 1.0)
-        touches   = min(float(lvl.get("touches_count") or lvl.get("approach", 1) or 1), 5.0)
         atr_ratio = float(lvl.get("atr_ratio", 2.0) or 2.0)
         style     = lvl.get("approach_style", "unknown") or "unknown"
 
@@ -155,30 +177,42 @@ def ml_score(lvl: dict) -> dict:
             else 0.0
         )
 
+        # Вектор признаков: touches убран
         x = np.array([[
             strength,
             ltype_enc,
             min(vol, 20.0),
-            touches,
             min(atr_ratio, 20.0),
             style_enc,
             age_min,
             monitoring_age_hours,
         ]])
 
-        # Classifier
+        # ── Классификатор bounce/breakout ──────────────────────────────
         try:
             proba      = _clf.predict_proba(x)[0]
             bounce_idx = list(_le.classes_).index("bounce")
             p_bounce   = float(proba[bounce_idx])
-
-            # Regressor
-            expected_depth = float(_reg.predict(x)[0])
         except Exception as e:
-            logger.warning("ML predict failed (model mismatch?), using defaults", extra={"error": str(e)})
+            logger.warning("clf predict failed (model mismatch?): %s", e)
             p_bounce = 0.5
+
+        # ── Регрессор fill_depth (is_breakout=0 — консервативная оценка) ──
+        try:
+            x_reg = np.append(x, [[0.0]], axis=1)  # is_breakout=0
+            expected_depth = float(_reg.predict(x_reg)[0])
+        except Exception as e:
+            logger.warning("reg predict failed (model mismatch?): %s", e)
             expected_depth = 1.0
         expected_depth = max(0.1, round(expected_depth, 2))
+
+        # ── clf2: скорость breakout (fast/slow) ───────────────────────
+        p_fast_breakout = None
+        if _clf2 is not None:
+            try:
+                p_fast_breakout = round(float(_clf2.predict_proba(x)[0][1]), 3)
+            except Exception as e:
+                logger.warning("clf2 predict failed: %s", e)
 
         if p_bounce >= THRESHOLD_HIGH:
             ml_delta = 1
@@ -188,14 +222,15 @@ def ml_score(lvl: dict) -> dict:
             ml_delta = 0
 
         return {
-            "p_bounce":       round(p_bounce, 3),
-            "expected_depth": expected_depth,
-            "ml_delta":       ml_delta,
+            "p_bounce":         round(p_bounce, 3),
+            "expected_depth":   expected_depth,
+            "ml_delta":         ml_delta,
+            "p_fast_breakout":  p_fast_breakout,
         }
 
     except Exception as e:
         logger.warning("ml_score error: %s", e)
-        return {"p_bounce": 0.5, "expected_depth": 1.5, "ml_delta": 0}
+        return {"p_bounce": 0.5, "expected_depth": 1.5, "ml_delta": 0, "p_fast_breakout": None}
 
 
 def apply_ml_to_level(lvl: dict) -> None:
@@ -214,22 +249,24 @@ def apply_ml_to_level(lvl: dict) -> None:
     — ML не корректирует вверх (только вниз или 0), чтобы не обходить штраф calculate_strength.
 
     Добавляет в lvl:
-        p_bounce        — вероятность отбоя
-        expected_depth  — ожидаемый прокол %
-        ml_delta        — применённая поправка
-        strength_pre_ml — strength до ML (для логов и Claude cap)
-        ml_blocked      — True если сработал hard-filter по touches
+        p_bounce          — вероятность отбоя
+        expected_depth    — ожидаемый прокол %
+        ml_delta          — применённая поправка
+        strength_pre_ml   — strength до ML (для логов и Claude cap)
+        ml_blocked        — True если сработал hard-filter по touches
+        p_fast_breakout   — вероятность быстрого пробоя (None если clf2 не загружен)
     """
     lvl["strength_pre_ml"] = lvl.get("strength", 3)
 
     # ── Hard-filter: touches >= TOUCHES_BLOCK ──────────────────────────
     touches = int(lvl.get("touches_count") or lvl.get("approach", 1) or 1)
     if touches >= TOUCHES_BLOCK:
-        lvl["p_bounce"]       = 0.0
-        lvl["expected_depth"] = 0.0
-        lvl["ml_delta"]       = -2
-        lvl["ml_blocked"]     = True
-        lvl["strength"]       = max(1, lvl["strength_pre_ml"] - 2)
+        lvl["p_bounce"]         = 0.0
+        lvl["expected_depth"]   = 0.0
+        lvl["ml_delta"]         = -2
+        lvl["ml_blocked"]       = True
+        lvl["p_fast_breakout"]  = None
+        lvl["strength"]         = max(1, lvl["strength_pre_ml"] - 2)
         logger.debug(
             "ml_score BLOCKED touches=%d level=%s strength %d→%d",
             touches,
@@ -250,13 +287,15 @@ def apply_ml_to_level(lvl: dict) -> None:
     if was_broken and not sweep:
         result["ml_delta"] = min(result["ml_delta"], 0)
 
-    lvl["p_bounce"]       = result["p_bounce"]
-    lvl["expected_depth"] = result["expected_depth"]
-    lvl["ml_delta"]       = result["ml_delta"]
-    lvl["strength"]       = max(1, min(5, lvl["strength_pre_ml"] + result["ml_delta"]))
+    lvl["p_bounce"]         = result["p_bounce"]
+    lvl["expected_depth"]   = result["expected_depth"]
+    lvl["ml_delta"]         = result["ml_delta"]
+    lvl["p_fast_breakout"]  = result["p_fast_breakout"]
+    lvl["strength"]         = max(1, min(5, lvl["strength_pre_ml"] + result["ml_delta"]))
 
     logger.debug(
-        "ml_score applied level=%s style=%s touches=%d p_bounce=%.2f depth=%.2f%% delta=%+d strength %d→%d",
+        "ml_score applied level=%s style=%s touches=%d p_bounce=%.2f depth=%.2f%% "
+        "delta=%+d strength %d→%d p_fast_breakout=%s",
         lvl.get("level"),
         lvl.get("approach_style", "unknown"),
         touches,
@@ -265,4 +304,5 @@ def apply_ml_to_level(lvl: dict) -> None:
         result["ml_delta"],
         lvl["strength_pre_ml"],
         lvl["strength"],
+        f"{result['p_fast_breakout']:.2f}" if result["p_fast_breakout"] is not None else "n/a",
     )
