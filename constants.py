@@ -105,6 +105,7 @@ S3_SWEEP_COOLDOWN_SECONDS: int = 120      # не входить N сек пос�
 S3_TP1_ATR_MULT: float = 2.0
 S3_TP2_ATR_MULT: float = 4.0
 S3_SL_ATR_MULT: float = 0.5
+S3_MIN_TRADE_DURATION_MINUTES: float = 45.0  # не закрывать по SL/TP раньше этого времени
 
 # ── Pump Phase Detection ──────────────────────────────────────────
 PUMP_HEALTH_MIN_SCORE: int = 50           # min score to allow monitoring
