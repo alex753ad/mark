@@ -9,7 +9,7 @@ import uuid
 from trading.base_strategy import BaseStrategy
 from trading.trade_log import open_trade, close_trade, add_trade_event, get_open_trades
 from bot.telegram import send_message
-from constants import S1_MIN_STRENGTH, S1_MIN_P_BOUNCE, S1_TP1_RR, S1_TP2_RR
+from constants import S1_MIN_STRENGTH, S1_MIN_P_BOUNCE, S1_MIN_VOL_RATIO, S1_TP1_RR, S1_TP2_RR
 from logger import logger
 
 
@@ -43,14 +43,14 @@ class Strategy1Bounce(BaseStrategy):
             return
         if approach_style == "bleed":
             return
-        if event.get("level_type") == "pump_base":
-            return
-        # Не входить при flash/impulse если объём ниже нормы — слабый сигнал.
+        # Не входить если объём на касании ниже порога — главный предиктор bounce.
+        # Данные history.db (3223 исходов): vol<1x → bounce 34%, vol≥1.5x → bounce 50%+,
+        # vol≥2x → bounce 56–72%, vol≥3x → bounce 91.5%.
         vol_ratio = event.get("vol_ratio", 1.0)
-        if vol_ratio < 1.0 and approach_style in ("flash", "impulse"):
+        if vol_ratio < S1_MIN_VOL_RATIO:
             logger.debug(
-                "S1 skip: low vol_ratio on flash/impulse",
-                symbol=symbol, vol_ratio=vol_ratio, style=approach_style,
+                "S1 skip: vol_ratio below threshold",
+                symbol=symbol, vol_ratio=vol_ratio, threshold=S1_MIN_VOL_RATIO,
             )
             return
         if not await self._can_open_trade(symbol):

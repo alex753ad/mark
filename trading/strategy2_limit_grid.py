@@ -155,17 +155,20 @@ class Strategy2LimitGrid(BaseStrategy):
     async def _check_exit(self, trade: dict, current_price: float) -> None:
         trade_id = trade["trade_id"]
 
-        # Проверить заполнение ордеров в любом случае — в т.ч. при fill_count == 0
+        # Проверить заполнение ордеров в любом случае — включая первый fill при fill_count==0.
+        # Раньше этот вызов был защищён условием fill_count > 0, из-за чего первый ордер
+        # никогда не исполнялся: _process_grid_fills не вызывался пока fill_count == 0,
+        # а fill_count оставался 0 потому что _process_grid_fills не вызывался.
         await self._process_grid_fills(trade, current_price)
 
-        # Таймаут только если так и не заполнилось ни одного ордера
+        # Таймаут без единого fill — проверяем после попытки заполнить
         if trade["grid_fill_count"] == 0:
             if time.time() - trade["entry_time"] > 3600:
                 await close_trade(trade_id, trade["entry_price"], "timeout_no_fill")
                 await self._send_close_message(trade, trade["entry_price"], "timeout_no_fill")
             return
 
-        # Перечитать trade из БД после возможного обновления
+        # Перечитать trade из БД после возможного обновления в _process_grid_fills
         updated = await self._reload_trade(trade_id)
         if updated is None or updated["status"] != "open":
             return

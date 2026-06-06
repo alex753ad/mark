@@ -11,6 +11,7 @@ from trading.trade_log import open_trade, close_trade, add_trade_event, get_open
 from bot.telegram import send_message
 from constants import (
     S3_MIN_BREAKOUT_VOL_RATIO,
+    S3_MIN_BREAKOUT_VOL_RATIO_STRONG,
     S3_SWEEP_COOLDOWN_SECONDS,
     S3_TP1_ATR_MULT,
     S3_TP2_ATR_MULT,
@@ -64,7 +65,7 @@ class Strategy3Breakout(BaseStrategy):
             return
 
         # Не входить в short если BTC растёт в эту минуту (контртренд).
-        btc_change = event.get("btc_change_1m", 0.0)
+        btc_change = event.get("btc_change_1m")
         if btc_change is not None and btc_change > 0.002:  # BTC +0.2% за минуту
             logger.debug(
                 "S3 skip: BTC counter-trend on breakout",
@@ -87,6 +88,8 @@ class Strategy3Breakout(BaseStrategy):
         stop_loss = level + atr * S3_SL_ATR_MULT
         take_profit_1 = entry_price - atr * S3_TP1_ATR_MULT
         take_profit_2 = entry_price - atr * S3_TP2_ATR_MULT
+
+        is_strong_breakout = breakout_vol_ratio >= S3_MIN_BREAKOUT_VOL_RATIO_STRONG
 
         trade_id = str(uuid.uuid4())
         trade = {
@@ -121,6 +124,7 @@ class Strategy3Breakout(BaseStrategy):
             "tp1_hit": False,
             "stop_moved_to_breakeven": False,
             "breakout_vol_ratio": breakout_vol_ratio,
+            "is_strong_breakout": is_strong_breakout,
         })
         await add_trade_event(trade_id, "params_set", entry_price, params_note)
 
@@ -176,6 +180,8 @@ class Strategy3Breakout(BaseStrategy):
             trade["events_json"] = "[]"
 
         age_minutes = (time.time() - trade["entry_time"]) / 60
+        params_check = self._extract_params(trade)
+        is_strong = params_check.get("is_strong_breakout", False) if params_check else False
         if age_minutes < S3_MIN_TRADE_DURATION_MINUTES:
             return
 
