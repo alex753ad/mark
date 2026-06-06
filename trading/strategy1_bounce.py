@@ -43,6 +43,8 @@ class Strategy1Bounce(BaseStrategy):
             return
         if approach_style == "bleed":
             return
+        if event.get("level_type") == "pump_base":
+            return
         # Не входить при flash/impulse если объём ниже нормы — слабый сигнал.
         vol_ratio = event.get("vol_ratio", 1.0)
         if vol_ratio < 1.0 and approach_style in ("flash", "impulse"):

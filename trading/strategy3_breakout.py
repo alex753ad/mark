@@ -15,6 +15,7 @@ from constants import (
     S3_TP1_ATR_MULT,
     S3_TP2_ATR_MULT,
     S3_SL_ATR_MULT,
+    S3_MIN_TRADE_DURATION_MINUTES,
 )
 from data.collector import candles_1m, get_delta
 from logger import logger
@@ -58,6 +59,8 @@ class Strategy3Breakout(BaseStrategy):
         if breakout_vol_ratio < S3_MIN_BREAKOUT_VOL_RATIO:
             return
         if level_side != "support":
+            return
+        if event.get("level_type") == "pump_base":
             return
 
         # Не входить в short если BTC растёт в эту минуту (контртренд).
@@ -171,6 +174,10 @@ class Strategy3Breakout(BaseStrategy):
         # Защита: events_json может быть None если БД вернула NULL
         if trade.get("events_json") is None:
             trade["events_json"] = "[]"
+
+        age_minutes = (time.time() - trade["entry_time"]) / 60
+        if age_minutes < S3_MIN_TRADE_DURATION_MINUTES:
+            return
 
         params = self._extract_params(trade)
         if params is None:
