@@ -90,6 +90,7 @@ STRATEGY_TRADE_TIMEOUT_MINUTES: float = 60.0  # таймаут позиции в
 # Strategy 1 (Bounce)
 S1_MIN_STRENGTH: int = 4
 S1_MIN_P_BOUNCE: float = 0.70
+S1_MIN_VOL_RATIO: float = 1.5   # минимальный vol_ratio при любом approach_style для входа
 S1_TP1_RR: float = 1.5    # risk:reward для TP1
 S1_TP2_RR: float = 3.0    # risk:reward для TP2
 
@@ -101,11 +102,12 @@ S2_GRID_ORDERS: int = 5
 
 # Strategy 3 (Breakout)
 S3_MIN_BREAKOUT_VOL_RATIO: float = 2.4
+S3_MIN_BREAKOUT_VOL_RATIO_STRONG: float = 3.5  # порог для «сильного» пробоя (быстрый TP)
 S3_SWEEP_COOLDOWN_SECONDS: int = 120      # не входить N сек после sweep
 S3_TP1_ATR_MULT: float = 2.0
 S3_TP2_ATR_MULT: float = 4.0
 S3_SL_ATR_MULT: float = 0.5
-S3_MIN_TRADE_DURATION_MINUTES: float = 45.0  # не закрывать по SL/TP раньше этого времени
+S3_MIN_TRADE_DURATION_MINUTES: float = 5.0   # не закрывать по SL/TP раньше этого времени (было 45.0)
 
 # ── Pump Phase Detection ──────────────────────────────────────────
 PUMP_HEALTH_MIN_SCORE: int = 50           # min score to allow monitoring
