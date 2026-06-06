@@ -362,7 +362,7 @@ async def btn_stats(message: Message):
             continue
         lines.append(
             f"[{label}]\n"
-            f"  Сделок: {s['total']} | Win rate: {s['win_rate']:.0f}%"
+            f"  Сделок: {s['total']} ({s['total_with_fills']}) | Win rate: {s['win_rate']:.0f}%"
             f" | PnL: {s['total_pnl_usdt']:+.2f} USDT\n"
             f"  Avg win: {s['avg_win_pct']:+.1f}%"
             f" | Avg loss: {s['avg_loss_pct']:+.1f}%"
@@ -1368,7 +1368,7 @@ async def cmd_stats(message: Message):
 
         lines.append(
             f"[{label}]\n"
-            f"  Сделок: {s['total']} | Win rate: {s['win_rate']:.0f}%"
+            f"  Сделок: {s['total']} ({s['total_with_fills']}) | Win rate: {s['win_rate']:.0f}%"
             f" | PnL: {s['total_pnl_usdt']:+.2f} USDT\n"
             f"  Avg win: {s['avg_win_pct']:+.1f}%"
             f" | Avg loss: {s['avg_loss_pct']:+.1f}%"
