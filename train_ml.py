@@ -14,25 +14,34 @@
   рыночный исход. Включение partial в обучение ухудшает качество модели, так как
   она начинает предсказывать его как легитимный класс и занижает p_bounce без причины.
 
-  Hard-filter по touches делается в telegram.py ДО вызова ML:
+  Hard-filter по touches делается в apply_ml_to_level() ДО вызова ML:
     touches >= 2 → 0% bounce из 113 случаев → блокируем без ML.
-  В обучении touches остаётся признаком — модель учится на полном диапазоне.
+  touches УБРАН из признаков модели — он доминировал (importance 0.542) и делал
+  классификатор тривиальным. Вся логика touches закрыта хард-фильтром.
 
-Признаки (7 штук, порядок должен совпадать с ml_score.py):
+Признаки (6 штук, порядок должен совпадать с ml_score.py):
     1. strength_claude  — сила уровня (1-5)
     2. ltype_enc        — тип уровня (pump_base / body_level / wick_level / order_block)
     3. vol_capped       — vol_ratio_at_touch, обрезан до 20
-    4. touches          — touches_count, обрезан до 5
-    5. atr_capped       — atr_ratio, обрезан до 20
-    6. style_enc        — approach_style (flash=0, impulse=1, bleed=2, unknown=3)
-    7. age_capped       — monitoring_age_minutes, обрезан до 300 (breakout быстрее bounce;
-                          признак слаб если P75=0 — большинство записей без возраста)
+    4. atr_capped       — atr_ratio, обрезан до 20
+    5. style_enc        — approach_style (flash=0, impulse=1, bleed=2, unknown=3)
+    6. age_capped       — monitoring_age_minutes, обрезан до 300
+
+Модели:
+    clf  — RandomForestClassifier (bounce/breakout при touches=1)
+    clf2 — RandomForestClassifier (быстрый breakout: touches≤3 vs медленный: touches>10)
+           обучается только на breakout-записях с touches >= 1
+           Полезен для решения "продолжать мониторить или нет"
+    reg  — RandomForestRegressor (fill_depth_pct, улучшен: обучается раздельно
+           по bounce и breakout, предсказывает на смеси)
 
 Выходные файлы (перезаписывают существующие):
-    analysis/ml/clf.pkl            — RandomForestClassifier (bounce/breakout)
-    analysis/ml/reg.pkl            — RandomForestRegressor (expected fill_depth_pct)
-    analysis/ml/label_encoder.pkl  — LabelEncoder классов
+    analysis/ml/clf.pkl            — RandomForest классификатор (bounce/breakout)
+    analysis/ml/clf2.pkl           — классификатор скорости breakout (fast/slow)
+    analysis/ml/reg.pkl            — RandomForest регрессор (fill_depth_pct)
+    analysis/ml/label_encoder.pkl  — LabelEncoder классов clf
     analysis/ml/level_type_map.pkl — маппинг level_type → int
+    analysis/ml/thresholds.json    — пороги p_bounce для ml_delta
 """
 
 import argparse
@@ -43,7 +52,7 @@ import sqlite3
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, mean_absolute_error
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import LabelEncoder
 
@@ -52,7 +61,9 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from analysis.ml_score import STYLE_MAP
 
-FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "touches", "atr_capped", "style_enc", "age_capped", "monitoring_age_hours"]
+# touches убран: доминировал (importance 0.542), тривиализировал модель.
+# Логика touches полностью закрыта хард-фильтром в apply_ml_to_level().
+FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "atr_capped", "style_enc", "age_capped", "monitoring_age_hours"]
 
 
 def load_data(db_path: str) -> pd.DataFrame:
@@ -78,11 +89,19 @@ def load_data(db_path: str) -> pd.DataFrame:
     print(df["outcome"].value_counts(normalize=True).mul(100).round(1).to_string())
     print()
 
-    # Диагностика touches — показываем что touches>=2 = 0% bounce
+    # Диагностика: touches >= 2 = 0% bounce (подтверждаем хард-фильтр)
     print("bounce% по touches_count (первые 6 значений):")
     for tc, grp in list(df.groupby("touches_count"))[:6]:
         b = round((grp["outcome"] == "bounce").mean() * 100, 1)
         print(f"  touches={int(tc)}  bounce={b}%  n={len(grp)}")
+    print()
+
+    # Диагностика: NULL vol_ratio_at_touch у breakout при touches=1
+    t1_break = df[(df["touches_count"] == 1) & (df["outcome"] == "breakout")]
+    null_vol = t1_break["vol_ratio_at_touch"].isna().sum()
+    if null_vol > 0:
+        print(f"  ⚠️  vol_ratio_at_touch=NULL у {null_vol}/{len(t1_break)} breakout при touches=1 "
+              f"— главный сигнал breakout теряется. Починить запись в monitor.py.")
     print()
 
     return df
@@ -103,14 +122,14 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     )
     df["vol_capped"] = df["vol_ratio_at_touch"].clip(upper=20).fillna(1.0)
     df["atr_capped"] = df["atr_ratio"].clip(upper=20).fillna(1.0)
-    df["touches"]    = df["touches_count"].fillna(0).clip(upper=5).astype(float)
-    # BUG-13: monitoring_age_minutes — bounce ~5 мин, breakout ~131 мин; cap=300
+    # monitoring_age_minutes — bounce ~5 мин, breakout ~131 мин; cap=300
     df["age_capped"] = df["monitoring_age_minutes"].fillna(0).clip(upper=300).astype(float)
     # monitoring_age_hours: если в данных нет — ставим 0 (старые записи)
     if "monitoring_age_hours" not in df.columns:
         df["monitoring_age_hours"] = 0.0
     else:
         df["monitoring_age_hours"] = df["monitoring_age_hours"].fillna(0.0)
+
     age_nonzero_pct = (df["age_capped"] > 0).mean() * 100
     if age_nonzero_pct < 30:
         print(f"  ⚠️  age_capped: только {age_nonzero_pct:.1f}% записей ненулевые — признак слабый, "
@@ -148,7 +167,7 @@ def train(db_path: str, out_dir: str) -> None:
     df = load_data(db_path)
     X, level_type_map = build_features(df)
 
-    # ── Классификатор ──────────────────────────────────────────────────
+    # ── Классификатор bounce/breakout ──────────────────────────────────
     le = LabelEncoder()
     y_clf = le.fit_transform(df["outcome"])
 
@@ -167,7 +186,6 @@ def train(db_path: str, out_dir: str) -> None:
 
     bounce_idx = list(le.classes_).index("bounce")
 
-    # Cross-val
     cv_scores = cross_val_score(clf, X, y_clf, cv=5, scoring="f1_macro")
     print(f"CV F1-macro: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
     print()
@@ -175,15 +193,14 @@ def train(db_path: str, out_dir: str) -> None:
     print("Классификация на трейне:")
     print(classification_report(y_clf, clf.predict(X), target_names=le.classes_))
 
-    print("Важность признаков (классификатор):")
+    print("Важность признаков (классификатор bounce/breakout):")
     for feat, imp in sorted(
         zip(FEATURES, clf.feature_importances_), key=lambda x: -x[1]
     ):
         print(f"  {feat:<20} {imp:.3f}")
     print()
 
-    # ── Калибровка порогов по OOB / cross-val ────────────────────────
-    # Используем predict_proba на трейне для оценки распределения.
+    # ── Калибровка порогов ────────────────────────────────────────────
     # Пороги выставляем по P25/P75 чтобы ~25% записей получали +1 и ~25% получали -1.
     all_proba = clf.predict_proba(X)[:, bounce_idx]
     p25 = np.percentile(all_proba, 25)
@@ -194,43 +211,88 @@ def train(db_path: str, out_dir: str) -> None:
         print(f"  ⚠️  P75={p75:.3f} за пределами ожидаемого диапазона 0.50–0.99")
     print()
 
-    # ── Регрессор ──────────────────────────────────────────────────────
+    # ── Классификатор скорости breakout (clf2) ────────────────────────
+    # Задача: предсказать, будет ли breakout быстрым (touches≤3) или медленным (touches>10).
+    # Обучается только на breakout-записях. Полезен для решения "продолжать мониторить или нет":
+    # если clf2 предсказывает fast → уровень слабый, можно не тратить ресурсы на долгий монитор.
+    df_break = df[df["outcome"] == "breakout"].copy()
+    clf2 = None
+    if len(df_break) >= 30:
+        # Метки: fast = touches ≤ 3, slow = touches > 10; средние (4-10) исключаем как шум
+        df_break2 = df_break[
+            (df_break["touches_count"] <= 3) | (df_break["touches_count"] > 10)
+        ].copy()
+        df_break2["speed"] = (df_break2["touches_count"] <= 3).astype(int)  # 1=fast, 0=slow
+        X2 = df_break2[FEATURES]
+        y2 = df_break2["speed"]
+
+        if y2.nunique() == 2 and len(df_break2) >= 20:
+            clf2 = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=4,
+                min_samples_leaf=3,
+                random_state=42,
+                class_weight="balanced",
+                n_jobs=-1,
+            )
+            clf2.fit(X2, y2)
+            cv2 = cross_val_score(clf2, X2, y2, cv=min(5, len(df_break2) // 4), scoring="f1_macro")
+            print(f"clf2 (fast/slow breakout): CV F1-macro={cv2.mean():.3f} ± {cv2.std():.3f}")
+            print(f"  fast(≤3 touches): n={y2.sum()}  slow(>10 touches): n={(y2==0).sum()}")
+            print("  Важность признаков (clf2):")
+            for feat, imp in sorted(zip(FEATURES, clf2.feature_importances_), key=lambda x: -x[1]):
+                print(f"    {feat:<20} {imp:.3f}")
+            print()
+        else:
+            print(f"clf2: недостаточно данных (fast={y2.sum()}, slow={(y2==0).sum()}, n={len(df_break2)}), пропуск")
+            print()
+    else:
+        print(f"clf2: слишком мало breakout-записей ({len(df_break)}), пропуск")
+        print()
+
+    # ── Регрессор fill_depth_pct ──────────────────────────────────────
+    # Улучшение: обучаем на всех записях (bounce + breakout), но добавляем флаг is_breakout
+    # как дополнительный признак — модель учится, что у breakout глубина системно выше.
+    # fill_depth для bounce: медиана 0.34%, max 7.25%
+    # fill_depth для breakout: медиана 2.17%, max 18.7%
+    X_reg = X.copy()
+    X_reg["is_breakout"] = (df["outcome"] == "breakout").astype(float).values
     y_reg = df["fill_depth_pct"].fillna(0).clip(lower=0)
+
     reg = RandomForestRegressor(
         n_estimators=200,
-        max_depth=6,
-        min_samples_leaf=5,
+        max_depth=8,          # глубже, чем clf — регрессия требует точности
+        min_samples_leaf=3,
         random_state=42,
         n_jobs=-1,
     )
-    reg.fit(X, y_reg)
-    preds = reg.predict(X)
-    mae = np.mean(np.abs(preds - y_reg))
-    print(f"Регрессор MAE на трейне: {mae:.3f}%")
+    reg.fit(X_reg, y_reg)
+    preds = reg.predict(X_reg)
+    mae = mean_absolute_error(y_reg, preds)
+    print(f"Регрессор fill_depth MAE на трейне: {mae:.3f}%")
+
+    # MAE раздельно по bounce и breakout
+    mask_b = df["outcome"] == "bounce"
+    print(f"  bounce   MAE: {mean_absolute_error(y_reg[mask_b], preds[mask_b]):.3f}%  "
+          f"(медиана actual={y_reg[mask_b].median():.2f}%)")
+    print(f"  breakout MAE: {mean_absolute_error(y_reg[~mask_b], preds[~mask_b]):.3f}%  "
+          f"(медиана actual={y_reg[~mask_b].median():.2f}%)")
+
+    print("  Важность признаков (регрессор):")
+    reg_features = FEATURES + ["is_breakout"]
+    for feat, imp in sorted(zip(reg_features, reg.feature_importances_), key=lambda x: -x[1]):
+        print(f"    {feat:<20} {imp:.3f}")
     print()
 
-    # ── Smoke-тест порогов ─────────────────────────────────────────────
-    # Тест 1: body_level, touches=1 (типичный первый подход)
-    print("Smoke-тест 1: body_level, touches=1 (strength=4, vol=1.5, atr=2.0, age=0):")
+    # ── Smoke-тесты ────────────────────────────────────────────────────
     body_enc = level_type_map.get("body_level", 0)
-    for style_name, style_code in STYLE_MAP.items():
-        x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 1, 2.0, style_code, 0, 0.0]],
-            columns=FEATURES,
-        )
-        proba  = clf.predict_proba(x_test)[0]
-        p_b    = proba[bounce_idx]
-        delta  = "+1" if p_b >= p75 else ("-1" if p_b <= p25 else " 0")
-        print(f"  {style_name:<10} p_bounce={p_b:.3f}  ml_delta={delta}")
-    print()
-
-    # Тест 2: pump_base, touches=1 (второй по частоте тип)
-    # vol=1.5 — близко к среднему по датасету (mean=1.64), vol=1.0 давал ложный -1
-    print("Smoke-тест 2: pump_base, touches=1 (strength=5, vol=1.5, atr=2.0, age=0):")
     pump_enc = level_type_map.get("pump_base", 1)
+
+    # Тест 1: body_level, touches=1 (типичный первый подход)
+    print("Smoke-тест 1: body_level (strength=4, vol=1.5, atr=2.0, age=0):")
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[5, pump_enc, 1.5, 1, 2.0, style_code, 0, 0.0]],
+            [[4, body_enc, 1.5, 2.0, style_code, 0, 0.0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -239,28 +301,39 @@ def train(db_path: str, out_dir: str) -> None:
         print(f"  {style_name:<10} p_bounce={p_b:.3f}  ml_delta={delta}")
     print()
 
-    # Тест 3: touches=3 — должен давать -1 для всех стилей
-    print("Smoke-тест 3: touches=3 → ожидается ml_delta=-1 для всех:")
+    # Тест 2: pump_base (второй по частоте тип)
+    print("Smoke-тест 2: pump_base (strength=5, vol=1.5, atr=2.0, age=0):")
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 3, 2.0, style_code, 0, 0.0]],
+            [[5, pump_enc, 1.5, 2.0, style_code, 0, 0.0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
         p_b    = proba[bounce_idx]
         delta  = "+1" if p_b >= p75 else ("-1" if p_b <= p25 else " 0")
-        ok = "✅" if delta == "-1" else "❌"
-        print(f"  {style_name:<10} p_bounce={p_b:.3f}  ml_delta={delta} {ok}")
+        print(f"  {style_name:<10} p_bounce={p_b:.3f}  ml_delta={delta}")
+    print()
+
+    # Тест 3: vol высокий (×5) — сигнал breakout
+    print("Smoke-тест 3: высокий объём vol=5.0 vs низкий vol=0.8 (body_level, bleed):")
+    for vol, label in [(0.8, "vol=0.8 (тихий) "), (5.0, "vol=5.0 (спайк)  ")]:
+        x_test = pd.DataFrame(
+            [[4, body_enc, vol, 2.0, STYLE_MAP["bleed"], 0, 0.0]],
+            columns=FEATURES,
+        )
+        proba = clf.predict_proba(x_test)[0]
+        p_b   = proba[bounce_idx]
+        delta = "+1" if p_b >= p75 else ("-1" if p_b <= p25 else " 0")
+        print(f"  {label}  p_bounce={p_b:.3f}  ml_delta={delta}")
     print()
 
     # Тест 4: age влияет — breakout происходит быстро (~131 мин median), bounce дольше.
     # Ожидание: p_bounce РАСТЁТ с возрастом (дольше держится = скорее bounce).
-    # Если P75 age_capped=0 (большинство записей = 0), признак слаб — предупреждаем.
     print("Smoke-тест 4: age=0 vs age=180 мин (ожидание: p_bounce растёт с возрастом):")
     age_results = []
     for age, label in [(0, "age=0min  "), (60, "age=60min "), (180, "age=180min")]:
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 1, 2.0, STYLE_MAP["unknown"], age, 0.0]],
+            [[4, body_enc, 1.5, 2.0, STYLE_MAP["unknown"], age, 0.0]],
             columns=FEATURES,
         )
         proba = clf.predict_proba(x_test)[0]
@@ -280,6 +353,9 @@ def train(db_path: str, out_dir: str) -> None:
     pickle.dump(reg,            open(os.path.join(out_dir, "reg.pkl"),            "wb"))
     pickle.dump(le,             open(os.path.join(out_dir, "label_encoder.pkl"),  "wb"))
     pickle.dump(level_type_map, open(os.path.join(out_dir, "level_type_map.pkl"), "wb"))
+    if clf2 is not None:
+        pickle.dump(clf2, open(os.path.join(out_dir, "clf2.pkl"), "wb"))
+        print(f"   clf2.pkl сохранён")
 
     import json as _json
     thresholds = {"THRESHOLD_HIGH": round(float(p75), 4), "THRESHOLD_LOW": round(float(p25), 4)}
