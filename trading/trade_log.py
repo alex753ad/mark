@@ -260,7 +260,7 @@ async def get_trade_stats(strategy_id: int) -> dict:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            """SELECT pnl_pct, pnl_usdt, duration_minutes, max_adverse_pct
+            """SELECT pnl_pct, pnl_usdt, duration_minutes, max_adverse_pct, grid_fill_count
                FROM trades
                WHERE status = 'closed' AND strategy_id = ?""",
             (strategy_id,),
@@ -269,29 +269,37 @@ async def get_trade_stats(strategy_id: int) -> dict:
 
     if not rows:
         return {
-            "total": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+            "total": 0, "total_with_fills": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
             "avg_pnl_pct": 0.0, "avg_win_pct": 0.0, "avg_loss_pct": 0.0,
             "total_pnl_usdt": 0.0, "avg_duration_minutes": 0.0,
             "max_drawdown_pct": 0.0,
         }
 
     total      = len(rows)
-    wins       = [r[0] for r in rows if (r[0] or 0) > 0]
-    losses     = [r[0] for r in rows if (r[0] or 0) <= 0]
-    all_pnl    = [r[0] or 0.0 for r in rows]
-    all_usdt   = [r[1] or 0.0 for r in rows]
-    all_dur    = [r[2] or 0.0 for r in rows]
-    all_adverse = [r[3] or 0.0 for r in rows]
+    # Сделки с реальными fills (grid_fill_count может быть None для S1/S3)
+    filled     = [r for r in rows if (r[4] or 0) > 0 or r[4] is None]
+    total_with_fills = len(filled)
+
+    # PnL считаем только по реальным сделкам
+    wins       = [r[0] for r in filled if (r[0] or 0) > 0]
+    losses     = [r[0] for r in filled if (r[0] or 0) <= 0]
+    all_pnl    = [r[0] or 0.0 for r in filled]
+    all_usdt   = [r[1] or 0.0 for r in filled]
+    all_dur    = [r[2] or 0.0 for r in filled]
+    all_adverse = [r[3] or 0.0 for r in filled]
+
+    base = total_with_fills if total_with_fills > 0 else 1
 
     return {
         "total":               total,
+        "total_with_fills":    total_with_fills,
         "wins":                len(wins),
         "losses":              len(losses),
-        "win_rate":            round(len(wins) / total * 100, 1),
-        "avg_pnl_pct":         round(sum(all_pnl) / total, 3),
+        "win_rate":            round(len(wins) / base * 100, 1),
+        "avg_pnl_pct":         round(sum(all_pnl) / base, 3),
         "avg_win_pct":         round(sum(wins) / len(wins), 3) if wins else 0.0,
         "avg_loss_pct":        round(sum(losses) / len(losses), 3) if losses else 0.0,
         "total_pnl_usdt":      round(sum(all_usdt), 4),
-        "avg_duration_minutes": round(sum(all_dur) / total, 1),
-        "max_drawdown_pct":    round(max(all_adverse), 3),
+        "avg_duration_minutes": round(sum(all_dur) / base, 1),
+        "max_drawdown_pct":    round(max(all_adverse), 3) if all_adverse else 0.0,
     }
