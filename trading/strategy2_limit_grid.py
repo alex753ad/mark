@@ -365,7 +365,8 @@ class Strategy2LimitGrid(BaseStrategy):
                 logger.info("S2 grid cancelled (no fills), pnl=0", trade_id=trade_id)
             else:
                 await close_trade(trade_id, current_price, "breakout_confirmed")
-                await self._send_close_message(trade, current_price, "breakout_confirmed")
+                updated_trade = await self._reload_trade_closed(trade_id) or trade
+                await self._send_close_message(updated_trade, current_price, "breakout_confirmed")
 
             logger.info("S2 grid closed on breakout", trade_id=trade_id, fill_count=fill_count)
 
@@ -390,6 +391,20 @@ class Strategy2LimitGrid(BaseStrategy):
             if t["trade_id"] == trade_id:
                 return t
         return None
+
+    async def _reload_trade_closed(self, trade_id: str) -> dict | None:
+        """Перечитать трейд из БД по trade_id независимо от статуса (нужно после close_trade)."""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT * FROM trades WHERE trade_id = ?", (trade_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    return dict(row) if row else None
+        except Exception as e:
+            logger.error("_reload_trade_closed failed", trade_id=trade_id, error=str(e))
+            return None
 
     # ── Telegram ──────────────────────────────────────────────────────
 
@@ -427,13 +442,24 @@ class Strategy2LimitGrid(BaseStrategy):
         max_adv  = trade.get("max_adverse_pct") or 0.0
         max_profit_usdt = filled_size * max_fav / 100
         max_loss_usdt   = filled_size * max_adv / 100
+
+        # Время с первого fill до закрытия
+        first_fill_duration = ""
+        try:
+            grid_orders = json.loads(trade.get("grid_orders_json") or "[]")
+            fill_times = [o["fill_time"] for o in grid_orders if o.get("filled") and o.get("fill_time")]
+            if fill_times:
+                first_fill_duration = " | С 1-го fill: " + self._format_duration(min(fill_times))
+        except Exception:
+            pass
+
         text = (
             f"{icon} [S2 Grid] {trade['symbol']} закрыт\n"
             f"   Заполнено ордеров: {fill_count}/{S2_GRID_ORDERS}"
             f" | Ср. вход: {ep} → Выход: {exit_price}\n"
             f"   Причина: {reason}\n"
             f"   PnL: {self._format_pct(pnl_pct)} ({self._format_pct(pnl_usdt, sign=True)} USDT)"
-            f" | Время: {self._format_duration(trade['entry_time'])}\n"
+            f" | Время: {self._format_duration(trade['entry_time'])}{first_fill_duration}\n"
             f"   📈 Max profit: +{max_fav:.2f}% (+{max_profit_usdt:.2f} USDT)\n"
             f"   📉 Max drawdown: -{max_adv:.2f}% (-{max_loss_usdt:.2f} USDT)"
         )
