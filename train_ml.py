@@ -219,11 +219,13 @@ def train(db_path: str, out_dir: str) -> None:
     clf2 = None
     if len(df_break) >= 30:
         # Метки: fast = touches ≤ 3, slow = touches > 10; средние (4-10) исключаем как шум
-        df_break2 = df_break[
-            (df_break["touches_count"] <= 3) | (df_break["touches_count"] > 10)
-        ].copy()
+        mask_break2 = (
+            ((df["outcome"] == "breakout") & (df["touches_count"] <= 3)) |
+            ((df["outcome"] == "breakout") & (df["touches_count"] > 10))
+        )
+        df_break2 = df[mask_break2].copy()
         df_break2["speed"] = (df_break2["touches_count"] <= 3).astype(int)  # 1=fast, 0=slow
-        X2 = df_break2[FEATURES]
+        X2 = X.loc[df_break2.index]
         y2 = df_break2["speed"]
 
         if y2.nunique() == 2 and len(df_break2) >= 20:
