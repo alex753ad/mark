@@ -1387,6 +1387,36 @@ async def send_message(text: str):
         logger.exception("Failed to send Telegram message")
 
 
+async def send_photo_with_caption(image_bytes: bytes, caption: str):
+    try:
+        if len(caption) > 1024:
+            caption = caption[:1021] + "..."
+        from aiogram.types import BufferedInputFile
+        photo = BufferedInputFile(image_bytes, filename="chart.png")
+        await bot.send_photo(TELEGRAM_CHAT_ID, photo, caption=caption)
+    except Exception:
+        logger.exception("Failed to send Telegram photo")
+        await send_message(caption)
+
+
+async def send_close_with_chart(text: str, symbol: str, entry_price=None, exit_price=None, level=None):
+    try:
+        from data.collector import candles_1m
+        from bot.chart import generate_close_chart
+        c1m = candles_1m.get(symbol, [])
+        if c1m:
+            img = generate_close_chart(
+                symbol=symbol, candles=c1m,
+                entry_price=entry_price, exit_price=exit_price, level=level,
+            )
+            if img:
+                await send_photo_with_caption(img, caption=text)
+                return
+    except Exception:
+        logger.exception("Failed to generate close chart")
+    await send_message(text)
+
+
 async def start_bot():
     global bot
     from aiogram.types import BotCommand
