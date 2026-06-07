@@ -7,8 +7,8 @@ import time
 import uuid
 
 from trading.base_strategy import BaseStrategy
-from trading.trade_log import open_trade, close_trade, add_trade_event, get_open_trades
-from bot.telegram import send_message
+from trading.trade_log import open_trade, add_trade_event, get_open_trades
+from bot.telegram import send_message, send_close_with_chart
 from constants import (
     S3_MIN_BREAKOUT_VOL_RATIO,
     S3_MIN_BREAKOUT_VOL_RATIO_STRONG,
@@ -206,7 +206,7 @@ class Strategy3Breakout(BaseStrategy):
         # TP2 — цена ушла достаточно вниз
         if current_price <= take_profit_2:
             avg_exit = (take_profit_1 + take_profit_2) / 2 if tp1_hit else take_profit_2
-            await close_trade(trade_id, avg_exit, "take_profit_2")
+            await self._close_and_track(trade_id, trade["symbol"], avg_exit, "take_profit_2")
             await self._send_close_message(trade, avg_exit, "take_profit_2")
             return
 
@@ -244,10 +244,10 @@ class Strategy3Breakout(BaseStrategy):
         if current_price >= effective_stop:
             if tp1_hit:
                 avg_exit = (take_profit_1 + entry_price) / 2
-                await close_trade(trade_id, avg_exit, "stop_loss")
+                await self._close_and_track(trade_id, trade["symbol"], avg_exit, "stop_loss")
                 await self._send_close_message(trade, avg_exit, "stop_loss")
             else:
-                await close_trade(trade_id, current_price, "stop_loss")
+                await self._close_and_track(trade_id, trade["symbol"], current_price, "stop_loss")
                 await self._send_close_message(trade, current_price, "stop_loss")
 
     async def _handle_bounce(self, event: dict) -> None:
@@ -259,7 +259,7 @@ class Strategy3Breakout(BaseStrategy):
             if abs(trade["level"] - event["level"]) / max(trade["level"], 1) > 0.005:
                 continue
             current_price = event["current_price"]
-            await close_trade(trade["trade_id"], current_price, "breakout_failed_bounce")
+            await self._close_and_track(trade["trade_id"], trade["symbol"], current_price, "breakout_failed_bounce")
             await self._send_close_message(trade, current_price, "breakout_failed_bounce")
             logger.info(
                 "S3 trade closed — breakout failed (bounce)",
@@ -340,6 +340,7 @@ class Strategy3Breakout(BaseStrategy):
             f"   📉 Max drawdown: -{max_adv:.2f}% (-{max_loss_usdt:.2f} USDT)"
         )
         try:
-            await send_message(text)
+            await send_close_with_chart(text, trade["symbol"],
+                entry_price=trade["entry_price"], exit_price=exit_price, level=trade.get("level"))
         except Exception as e:
             logger.error("S3 send_close_message failed", error=str(e))

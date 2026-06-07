@@ -8,7 +8,8 @@ from trading.event_bus import subscribe
 from trading.strategy1_bounce import Strategy1Bounce
 from trading.strategy2_limit_grid import Strategy2LimitGrid
 from trading.strategy3_breakout import Strategy3Breakout
-from trading.trade_log import init_trades_db
+from trading.trade_log import init_trades_db, get_open_trades
+from data.collector import candles_1m
 from logger import logger
 
 
@@ -19,17 +20,19 @@ async def run_strategies() -> None:
     1. Инициализирует trades.db.
     2. Создаёт по одному экземпляру каждой стратегии.
     3. Запускает фоновый _timeout_checker (раз в 60 сек).
-    4. Главный цикл: ждёт событие из event bus → on_event → _update_open_trades.
+    4. Запускает фоновый _price_loop (раз в 5 сек) — независимый от event bus.
+    5. Главный цикл: ждёт событие из event bus → on_event → _update_open_trades.
     """
     await init_trades_db()
     logger.info("trades.db initialized")
 
     strategies = [Strategy1Bounce(), Strategy2LimitGrid(), Strategy3Breakout()]
     asyncio.create_task(_timeout_checker(strategies))
+    asyncio.create_task(_price_loop(strategies))
 
     while True:
         event = await subscribe()
-        symbol       = event.get("symbol")
+        symbol        = event.get("symbol")
         current_price = event.get("current_price")
 
         for strategy in strategies:
@@ -54,6 +57,37 @@ async def run_strategies() -> None:
                         symbol=symbol,
                         error=str(e),
                     )
+
+
+async def _price_loop(strategies: list) -> None:
+    """
+    Каждые 5 сек берёт текущую цену из candles_1m для всех символов
+    с открытыми сделками и вызывает _update_open_trades.
+    Работает независимо от event bus — стоп/ТП срабатывают даже если
+    monitor.py уже завершил наблюдение за уровнем.
+    """
+    while True:
+        await asyncio.sleep(5)
+        try:
+            open_trades = await get_open_trades()
+            symbols = {t["symbol"] for t in open_trades}
+            for symbol in symbols:
+                c1m = candles_1m.get(symbol)
+                if not c1m:
+                    continue
+                current_price = c1m[-1]["close"]
+                for strategy in strategies:
+                    try:
+                        await strategy._update_open_trades(symbol, current_price)
+                    except Exception as e:
+                        logger.error(
+                            "price_loop _update_open_trades error",
+                            strategy_id=strategy.strategy_id,
+                            symbol=symbol,
+                            error=str(e),
+                        )
+        except Exception as e:
+            logger.error("price_loop error", error=str(e))
 
 
 async def _timeout_checker(strategies: list) -> None:

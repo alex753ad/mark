@@ -9,8 +9,8 @@ import uuid
 import aiosqlite
 
 from trading.base_strategy import BaseStrategy
-from trading.trade_log import open_trade, close_trade, add_trade_event, get_open_trades, DB_PATH
-from bot.telegram import send_message
+from trading.trade_log import open_trade, add_trade_event, get_open_trades, DB_PATH
+from bot.telegram import send_message, send_close_with_chart
 from constants import (
     S2_MIN_STRENGTH,
     S2_MIN_P_BOUNCE,
@@ -164,7 +164,7 @@ class Strategy2LimitGrid(BaseStrategy):
         # Таймаут без единого fill — проверяем после попытки заполнить
         if trade["grid_fill_count"] == 0:
             if time.time() - trade["entry_time"] > 3600:
-                await close_trade(trade_id, trade["entry_price"], "timeout_no_fill")
+                await self._close_and_track(trade_id, trade["symbol"], trade["entry_price"], "timeout_no_fill")
                 await self._send_close_message(trade, trade["entry_price"], "timeout_no_fill")
             return
 
@@ -189,7 +189,7 @@ class Strategy2LimitGrid(BaseStrategy):
         # TP2
         if current_price >= take_profit_2:
             avg_exit = (take_profit_1 + take_profit_2) / 2 if tp1_hit else take_profit_2
-            await close_trade(trade_id, avg_exit, "take_profit_2")
+            await self._close_and_track(trade_id, updated["symbol"], avg_exit, "take_profit_2")
             await self._send_close_message(updated, avg_exit, "take_profit_2")
             return
 
@@ -209,10 +209,10 @@ class Strategy2LimitGrid(BaseStrategy):
         if current_price <= effective_stop:
             if tp1_hit:
                 avg_exit = (take_profit_1 + entry_price) / 2
-                await close_trade(trade_id, avg_exit, "stop_loss")
+                await self._close_and_track(trade_id, updated["symbol"], avg_exit, "stop_loss")
                 await self._send_close_message(updated, avg_exit, "stop_loss")
             else:
-                await close_trade(trade_id, current_price, "stop_loss")
+                await self._close_and_track(trade_id, updated["symbol"], current_price, "stop_loss")
                 await self._send_close_message(updated, current_price, "stop_loss")
 
     async def _process_grid_fills(self, trade: dict, current_price: float) -> None:
@@ -364,7 +364,7 @@ class Strategy2LimitGrid(BaseStrategy):
                 await self._send_close_message(trade, trade["entry_price"], "cancelled_no_fill")
                 logger.info("S2 grid cancelled (no fills), pnl=0", trade_id=trade_id)
             else:
-                await close_trade(trade_id, current_price, "breakout_confirmed")
+                await self._close_and_track(trade_id, trade["symbol"], current_price, "breakout_confirmed")
                 updated_trade = await self._reload_trade_closed(trade_id) or trade
                 await self._send_close_message(updated_trade, current_price, "breakout_confirmed")
 
@@ -464,6 +464,7 @@ class Strategy2LimitGrid(BaseStrategy):
             f"   📉 Max drawdown: -{max_adv:.2f}% (-{max_loss_usdt:.2f} USDT)"
         )
         try:
-            await send_message(text)
+            await send_close_with_chart(text, trade["symbol"],
+                entry_price=trade["entry_price"], exit_price=exit_price, level=trade.get("level"))
         except Exception as e:
             logger.error("S2 send_close_message failed", error=str(e))

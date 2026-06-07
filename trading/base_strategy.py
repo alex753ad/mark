@@ -30,6 +30,9 @@ class BaseStrategy(ABC):
     MAX_OPEN_TRADES: int = STRATEGY_MAX_OPEN_TRADES
     TRADE_TIMEOUT_MINUTES: float = STRATEGY_TRADE_TIMEOUT_MINUTES
 
+    def __init__(self) -> None:
+        self._tracker_tasks: set[asyncio.Task] = set()
+
     # ── Публичный интерфейс ───────────────────────────────────────────
 
     @abstractmethod
@@ -65,7 +68,7 @@ class BaseStrategy(ABC):
             )
 
             try:
-                await close_trade(trade["trade_id"], current_price, "timeout")
+                await self._close_and_track(trade["trade_id"], symbol, current_price, "timeout")
                 await self._send_close_message(trade, current_price, "timeout")
                 logger.info(
                     "Trade closed by timeout",
@@ -136,6 +139,42 @@ class BaseStrategy(ABC):
           1. await close_trade(trade["trade_id"], exit_price, exit_reason)
           2. await self._send_close_message(trade, exit_price, exit_reason)
         """
+
+    # ── Трекинг цены после закрытия ──────────────────────────────────
+
+    async def _close_and_track(
+        self,
+        trade_id: str,
+        symbol: str,
+        exit_price: float,
+        exit_reason: str,
+    ) -> None:
+        """
+        Закрыть сделку и запустить 30-минутный трекинг цены после закрытия.
+
+        Использовать вместо прямого вызова close_trade() во всех стратегиях.
+        Порядок строго: сначала close_trade, потом запуск трекера.
+        exit_time фиксируется здесь — сразу после close_trade, до await asyncio.sleep.
+        """
+        await close_trade(trade_id, exit_price, exit_reason)
+        exit_time = time.time()
+        self._start_post_exit_tracker(trade_id, symbol, exit_time)
+
+    def _start_post_exit_tracker(
+        self,
+        trade_id: str,
+        symbol: str,
+        exit_time: float,
+    ) -> None:
+        """Запустить фоновую задачу трекинга цены после закрытия сделки."""
+        from trading.price_tracker import track_post_exit_price
+        task = asyncio.create_task(
+            track_post_exit_price(trade_id, symbol, exit_time),
+            name=f"post_exit_tracker::{trade_id}",
+        )
+        # Сохранить ссылку на задачу — без этого GC может её уничтожить до завершения
+        self._tracker_tasks.add(task)
+        task.add_done_callback(self._tracker_tasks.discard)
 
     # ── Вспомогательные методы ────────────────────────────────────────
 

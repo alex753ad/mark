@@ -77,6 +77,16 @@ async def init_trades_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(_CREATE_TABLE)
         await db.commit()
+        for col_sql in [
+            "ALTER TABLE trades ADD COLUMN post_exit_high_30m REAL",
+            "ALTER TABLE trades ADD COLUMN post_exit_low_30m REAL",
+            "ALTER TABLE trades ADD COLUMN post_exit_tracked_until REAL",
+        ]:
+            try:
+                await db.execute(col_sql)
+                await db.commit()
+            except Exception:
+                pass  # колонка уже существует
 
 
 async def open_trade(trade: dict) -> str:

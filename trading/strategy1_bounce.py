@@ -7,9 +7,9 @@ import time
 import uuid
 
 from trading.base_strategy import BaseStrategy
-from trading.trade_log import open_trade, close_trade, add_trade_event, get_open_trades
-from bot.telegram import send_message
-from constants import S1_MIN_STRENGTH, S1_MIN_P_BOUNCE, S1_MIN_VOL_RATIO, S1_TP1_RR, S1_TP2_RR
+from trading.trade_log import open_trade, add_trade_event, get_open_trades
+from bot.telegram import send_message, send_close_with_chart
+from constants import S1_MIN_STRENGTH, S1_MIN_P_BOUNCE, S1_MAX_VOL_RATIO, S1_TP1_RR, S1_TP2_RR
 from logger import logger
 
 
@@ -43,14 +43,14 @@ class Strategy1Bounce(BaseStrategy):
             return
         if approach_style == "bleed":
             return
-        # Не входить если объём на касании ниже порога — главный предиктор bounce.
-        # Данные history.db (3223 исходов): vol<1x → bounce 34%, vol≥1.5x → bounce 50%+,
-        # vol≥2x → bounce 56–72%, vol≥3x → bounce 91.5%.
+        # Не входить если объём на касании выше порога — S1 ловит тихие отбои.
+        # Данные history.db: vol 0.8–3.0× даёт одинаковый bounce rate ~41%.
+        # Высокий vol (>1.2×) — уже активное движение, для S2/S3, не S1.
         vol_ratio = event.get("vol_ratio", 1.0)
-        if vol_ratio < S1_MIN_VOL_RATIO:
+        if vol_ratio > S1_MAX_VOL_RATIO:
             logger.debug(
-                "S1 skip: vol_ratio below threshold",
-                symbol=symbol, vol_ratio=vol_ratio, threshold=S1_MIN_VOL_RATIO,
+                "S1 skip: vol_ratio above threshold (noisy touch)",
+                symbol=symbol, vol_ratio=vol_ratio, threshold=S1_MAX_VOL_RATIO,
             )
             return
         if not await self._can_open_trade(symbol):
@@ -147,7 +147,7 @@ class Strategy1Bounce(BaseStrategy):
                 avg_exit = (take_profit_1 + take_profit_2) / 2
             else:
                 avg_exit = take_profit_2
-            await close_trade(trade_id, avg_exit, "take_profit_2")
+            await self._close_and_track(trade_id, trade["symbol"], avg_exit, "take_profit_2")
             await self._send_close_message(trade, avg_exit, "take_profit_2")
             return
 
@@ -169,10 +169,10 @@ class Strategy1Bounce(BaseStrategy):
             if tp1_hit:
                 # Половина уже зафиксирована по TP1, вторая половина по стопу (= безубыток)
                 avg_exit = (take_profit_1 + entry_price) / 2
-                await close_trade(trade_id, avg_exit, "stop_loss")
+                await self._close_and_track(trade_id, trade["symbol"], avg_exit, "stop_loss")
                 await self._send_close_message(trade, avg_exit, "stop_loss")
             else:
-                await close_trade(trade_id, current_price, "stop_loss")
+                await self._close_and_track(trade_id, trade["symbol"], current_price, "stop_loss")
                 await self._send_close_message(trade, current_price, "stop_loss")
 
     async def _handle_breakout(self, event: dict) -> None:
@@ -184,7 +184,7 @@ class Strategy1Bounce(BaseStrategy):
             if abs(trade["level"] - event["level"]) / max(trade["level"], 1) > 0.005:
                 continue
             current_price = event["current_price"]
-            await close_trade(trade["trade_id"], current_price, "breakout_confirmed")
+            await self._close_and_track(trade["trade_id"], trade["symbol"], current_price, "breakout_confirmed")
             await self._send_close_message(trade, current_price, "breakout_confirmed")
             logger.info("S1 trade closed on breakout", trade_id=trade["trade_id"])
 
@@ -245,6 +245,7 @@ class Strategy1Bounce(BaseStrategy):
             f"   📉 Max drawdown: -{max_adv:.2f}% (-{max_loss_usdt:.2f} USDT)"
         )
         try:
-            await send_message(text)
+            await send_close_with_chart(text, trade["symbol"],
+                entry_price=trade["entry_price"], exit_price=exit_price, level=trade.get("level"))
         except Exception as e:
             logger.error("S1 send_close_message failed", error=str(e))
