@@ -90,7 +90,8 @@ STRATEGY_TRADE_TIMEOUT_MINUTES: float = 60.0  # таймаут позиции в
 # Strategy 1 (Bounce)
 S1_MIN_STRENGTH: int = 4
 S1_MIN_P_BOUNCE: float = 0.70
-S1_MIN_VOL_RATIO: float = 1.5   # минимальный vol_ratio при любом approach_style для входа
+S1_MIN_VOL_RATIO: float = 1.5   # минимальный vol_ratio при любом approach_style для входа (не используется, оставлен для совместимости)
+S1_MAX_VOL_RATIO: float = 1.2   # S1 входит только при тихом касании уровня
 S1_TP1_RR: float = 1.5    # risk:reward для TP1
 S1_TP2_RR: float = 3.0    # risk:reward для TP2
 
