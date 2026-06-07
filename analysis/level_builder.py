@@ -292,6 +292,8 @@ def _build_levels_no_pump(
     if current_price > 0:
         cluster_radius = min(cluster_radius, current_price * 0.005)
 
+    all_levels = []
+
     # Consolidation zones from 15M
     for price, candle_count, metadata in _find_consolidation_zones(c15m, support_range_low, support_range_high, atr_15m if atr_15m > 0 else atr):
         all_levels.append({
