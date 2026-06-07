@@ -91,7 +91,7 @@ async def start_monitor(
     min_price_during = None
     max_price_during = None
     touch_start_time: float = 0.0
-    vol_ratio_captured: float = 1.0  # vol_ratio captured at moment of first touch
+    vol_ratio_captured: float = vol_ratio if vol_ratio is not None else 1.0  # vol_ratio captured at moment of first touch
     _monitoring_start_time = time.time()
 
     def _make_result(reason, _touched=False):
