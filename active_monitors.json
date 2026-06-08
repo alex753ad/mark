@@ -1,18 +1,38 @@
 [
   {
-    "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
-    "level": 0.61678
-  },
-  {
-    "symbol": "HOMEUSDT",
-    "level": 0.048109
+    "symbol": "BEATUSDT",
+    "level": 4.0494
   },
   {
     "symbol": "HUSDT",
-    "level": 0.66789
+    "level": 0.69892
   },
   {
-    "symbol": "SIRENUSDT",
-    "level": 0.58392
+    "symbol": "BSBUSDT",
+    "level": 0.32123
+  },
+  {
+    "symbol": "HOMEUSDT",
+    "level": 0.02984
+  },
+  {
+    "symbol": "VELVETUSDT",
+    "level": 0.31632
+  },
+  {
+    "symbol": "ESPORTSUSDT",
+    "level": 0.06423
+  },
+  {
+    "symbol": "SOXLUSDT",
+    "level": 196.39
+  },
+  {
+    "symbol": "PIPPINUSDT",
+    "level": 0.01879
+  },
+  {
+    "symbol": "ALLOUSDT",
+    "level": 0.50922
   }
 ]

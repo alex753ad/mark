@@ -15,11 +15,15 @@
   она начинает предсказывать его как легитимный класс и занижает p_bounce без причины.
 
   Hard-filter по touches делается в apply_ml_to_level() ДО вызова ML:
-    touches >= 2 → 0% bounce из 113 случаев → блокируем без ML.
+    touches >= 2 → 0% bounce → блокируем без ML.
   touches УБРАН из признаков модели — он доминировал (importance 0.542) и делал
   классификатор тривиальным. Вся логика touches закрыта хард-фильтром.
 
-Признаки (6 штук, порядок должен совпадать с ml_score.py):
+  Строки с touches >= 2 ВКЛЮЧЕНЫ в обучение как валидные breakout-метки (+445 строк, ~20% breakout).
+  Это не противоречие: модель учится на всех исходах, но touches не является признаком.
+  На инференсе хард-фильтр срабатывает ДО ML — модель при touches>=2 не вызывается.
+
+Признаки (6 штук, порядок должен совпадать с ml_score.py):  # FIX BUG-5: monitoring_age_hours удалён
     1. strength_claude  — сила уровня (1-5)
     2. ltype_enc        — тип уровня (pump_base / body_level / wick_level / order_block)
     3. vol_capped       — vol_ratio_at_touch, обрезан до 20
@@ -63,7 +67,9 @@ from analysis.ml_score import STYLE_MAP
 
 # touches убран: доминировал (importance 0.542), тривиализировал модель.
 # Логика touches полностью закрыта хард-фильтром в apply_ml_to_level().
-FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "atr_capped", "style_enc", "age_capped", "monitoring_age_hours"]
+# FIX BUG-5: monitoring_age_hours удалён — дублировал age_capped, при обучении
+# отсутствовал у 95% записей (= 0) → train/inference skew.
+FEATURES = ["strength_claude", "ltype_enc", "vol_capped", "atr_capped", "style_enc", "age_capped"]
 
 
 def load_data(db_path: str) -> pd.DataFrame:
@@ -76,6 +82,9 @@ def load_data(db_path: str) -> pd.DataFrame:
           AND strength_claude != 0
           AND created_at >= '2026-05-21'
           AND touches_count >= 1
+          -- touches_count >= 2 включены: 445 реальных breakout-меток которые модель не видела.
+          -- touches убран из признаков (был dominant feature, importance=0.542).
+          -- Хард-фильтр в apply_ml_to_level закрывает touches>=2 на инференсе — обучение не ломает логику.
         """,
         conn,
     )
@@ -124,11 +133,9 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     df["atr_capped"] = df["atr_ratio"].clip(upper=20).fillna(1.0)
     # monitoring_age_minutes — bounce ~5 мин, breakout ~131 мин; cap=300
     df["age_capped"] = df["monitoring_age_minutes"].fillna(0).clip(upper=300).astype(float)
-    # monitoring_age_hours: если в данных нет — ставим 0 (старые записи)
-    if "monitoring_age_hours" not in df.columns:
-        df["monitoring_age_hours"] = 0.0
-    else:
-        df["monitoring_age_hours"] = df["monitoring_age_hours"].fillna(0.0)
+    # FIX BUG-5: monitoring_age_hours удалён из признаков — дублировал age_capped (age_min/60),
+    # при этом в history.db отсутствовал у ~95% записей → всегда 0 при обучении,
+    # но считался реально при инференсе → train/inference skew.
 
     age_nonzero_pct = (df["age_capped"] > 0).mean() * 100
     if age_nonzero_pct < 30:
@@ -294,7 +301,7 @@ def train(db_path: str, out_dir: str) -> None:
     print("Smoke-тест 1: body_level (strength=4, vol=1.5, atr=2.0, age=0):")
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 2.0, style_code, 0, 0.0]],
+            [[4, body_enc, 1.5, 2.0, style_code, 0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -307,7 +314,7 @@ def train(db_path: str, out_dir: str) -> None:
     print("Smoke-тест 2: pump_base (strength=5, vol=1.5, atr=2.0, age=0):")
     for style_name, style_code in STYLE_MAP.items():
         x_test = pd.DataFrame(
-            [[5, pump_enc, 1.5, 2.0, style_code, 0, 0.0]],
+            [[5, pump_enc, 1.5, 2.0, style_code, 0]],
             columns=FEATURES,
         )
         proba  = clf.predict_proba(x_test)[0]
@@ -320,7 +327,7 @@ def train(db_path: str, out_dir: str) -> None:
     print("Smoke-тест 3: высокий объём vol=5.0 vs низкий vol=0.8 (body_level, bleed):")
     for vol, label in [(0.8, "vol=0.8 (тихий) "), (5.0, "vol=5.0 (спайк)  ")]:
         x_test = pd.DataFrame(
-            [[4, body_enc, vol, 2.0, STYLE_MAP["bleed"], 0, 0.0]],
+            [[4, body_enc, vol, 2.0, STYLE_MAP["bleed"], 0]],
             columns=FEATURES,
         )
         proba = clf.predict_proba(x_test)[0]
@@ -335,7 +342,7 @@ def train(db_path: str, out_dir: str) -> None:
     age_results = []
     for age, label in [(0, "age=0min  "), (60, "age=60min "), (180, "age=180min")]:
         x_test = pd.DataFrame(
-            [[4, body_enc, 1.5, 2.0, STYLE_MAP["unknown"], age, 0.0]],
+            [[4, body_enc, 1.5, 2.0, STYLE_MAP["unknown"], age]],
             columns=FEATURES,
         )
         proba = clf.predict_proba(x_test)[0]

@@ -189,7 +189,7 @@ async def _auto_screener_loop():
 
                             for lvl in supports:
                                 lvl["symbol"] = sym
-                                lvl["approach"] = _count_approaches(sym, lvl["level"], atr) if atr > 0 else 0
+                                lvl["approach"] = _count_approaches(sym, lvl["level"], atr)[0] if atr > 0 else 0  # FIX BUG-6: tuple[0]=count
                                 if atr > 0:
                                     lvl.update(get_level_history(sym, lvl["level"], atr))
                                 calculate_strength(lvl)
@@ -203,18 +203,12 @@ async def _auto_screener_loop():
                                 if lvl.get("approach", 0) >= 2 or (lvl.get("was_broken") and not lvl.get("sweep_reclaimed")):
                                     lvl["strength"] = min(lvl["strength"], py)
 
-                            try:
+                            try:  # FIX BUG-15: убран мёртвый if-блок (strength==0 после calculate_strength невозможен)
                                 from analysis.ml_score import apply_ml_to_level
                                 _style_screener = detect_approach_style(sym)
                                 for lvl in supports:
                                     lvl["approach_style"] = _style_screener
-                                    if _style_screener == "impulse" and lvl.get("strength", 0) == 0:
-                                        lvl["p_bounce"] = 0.0
-                                        lvl["ml_delta"] = -2
-                                        lvl["ml_blocked"] = True
-                                        lvl["strength_pre_ml"] = lvl.get("strength", 0)
-                                    else:
-                                        apply_ml_to_level(lvl)
+                                    apply_ml_to_level(lvl)
                             except Exception as _e:
                                 logger.warning("ml_score failed in screener: %s", _e)
 
@@ -386,23 +380,17 @@ async def _run_phase1(symbol: str):
         for lvl in levels:
             lvl["symbol"] = symbol
             lvl["level_side"] = "support"
-            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr) if atr > 0 else 0
+            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr)[0] if atr > 0 else 0  # FIX BUG-6: tuple[0]=count
             if atr > 0:
                 lvl.update(get_level_history(symbol, lvl["level"], atr))
             calculate_strength(lvl)
 
-        try:
+        try:  # FIX BUG-15: убран мёртвый if-блок (strength==0 после calculate_strength невозможен)
             from analysis.ml_score import apply_ml_to_level
             _style_phase = detect_approach_style(symbol)
             for lvl in levels:
                 lvl["approach_style"] = _style_phase
-                if _style_phase == "impulse" and lvl.get("strength", 0) == 0:
-                    lvl["p_bounce"] = 0.0
-                    lvl["ml_delta"] = -2
-                    lvl["ml_blocked"] = True
-                    lvl["strength_pre_ml"] = lvl.get("strength", 0)
-                else:
-                    apply_ml_to_level(lvl)
+                apply_ml_to_level(lvl)
         except Exception as _e:
             logger.warning("ml_score failed in phase loop: %s", _e)
 
@@ -564,19 +552,14 @@ async def _run_phase1(symbol: str):
         dist_pct = (current_price - nearest["level"]) / current_price * 100
 
         # Пересчитываем ML с реальными значениями прямо перед отправкой
-        try:
+        try:  # FIX BUG-15: убран мёртвый if-блок (strength==0 после calculate_strength невозможен)
             real_atr_ratio = calculate_atr_ratio(symbol, nearest["level"])
             real_vol_ratio = get_vol_ratio_current(symbol)
             nearest["atr_ratio"] = real_atr_ratio
             nearest["vol_ratio"] = real_vol_ratio
-            nearest["approach_style"] = detect_approach_style(symbol)  # 1.4: стиль до ML
+            nearest["approach_style"] = detect_approach_style(symbol)
             from analysis.ml_score import apply_ml_to_level
-            if nearest.get("approach_style") == "impulse" and nearest.get("strength", 0) == 0:
-                nearest["p_bounce"] = 0.0
-                nearest["ml_delta"] = -2
-                nearest["ml_blocked"] = True
-            else:
-                apply_ml_to_level(nearest)
+            apply_ml_to_level(nearest)
         except Exception as _e:
             logger.warning("ml_score pre-message recalc failed: %s", _e)
 
@@ -713,7 +696,7 @@ async def _monitored(symbol: str, level: float, level_side: str,
             from analysis.trigger import _calc_vol_ratio, _count_approaches, calculate_atr
             atr = calculate_atr(symbol)
             vol_ratio_old = _calc_vol_ratio(symbol)
-            touches = _count_approaches(symbol, level, atr) if atr > 0 else 1
+            touches = _count_approaches(symbol, level, atr)[0] if atr > 0 else 1  # FIX BUG-6: tuple[0]=count
             if outcome_already_saved:
                 logger.debug("Outcome already saved by monitor, skipping duplicate",
                              symbol=symbol, level=level, outcome=outcome)
@@ -730,6 +713,7 @@ async def _monitored(symbol: str, level: float, level_side: str,
                     fill_depth_pct=fill_depth_pct,
                     btc_change_1m=btc_change,
                     funding_rate=funding,
+                    monitoring_age_minutes=float(duration),
                 )
             await update_symbol_profile(symbol)
             logger.info("Level outcome saved",
@@ -835,7 +819,7 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
         task_key = state.make_task_key(nearest["level"])
         if task_key not in state.tasks:
             # BUG-05: recalculate strength with fresh data — cache may be hours old
-            nearest["approach"] = _count_approaches(symbol, nearest["level"], atr) if atr > 0 else 0
+            nearest["approach"] = _count_approaches(symbol, nearest["level"], atr)[0] if atr > 0 else 0  # FIX BUG-6: tuple[0]=count
             if atr > 0:
                 from analysis.trigger import get_level_history
                 nearest.update(get_level_history(symbol, nearest["level"], atr))
@@ -881,23 +865,17 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
         rebuild_candidates = [lvl for lvl in all_levels if _in_range(lvl["level"])]
         for lvl in rebuild_candidates:
             lvl["symbol"] = symbol
-            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr) if atr > 0 else 0
+            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr)[0] if atr > 0 else 0  # FIX BUG-6: tuple[0]=count
             if atr > 0:
                 lvl.update(get_level_history(symbol, lvl["level"], atr))
             calculate_strength(lvl)
 
-        try:
+        try:  # FIX BUG-15: убран мёртвый if-блок (strength==0 после calculate_strength невозможен)
             from analysis.ml_score import apply_ml_to_level
             _style_rebuild = detect_approach_style(symbol)
             for lvl in rebuild_candidates:
                 lvl["approach_style"] = _style_rebuild
-                if _style_rebuild == "impulse" and lvl.get("strength", 0) == 0:
-                    lvl["p_bounce"] = 0.0
-                    lvl["ml_delta"] = -2
-                    lvl["ml_blocked"] = True
-                    lvl["strength_pre_ml"] = lvl.get("strength", 0)
-                else:
-                    apply_ml_to_level(lvl)
+                apply_ml_to_level(lvl)
         except Exception as _e:
             logger.warning("ml_score failed in rebuild: %s", _e)
 
@@ -1174,7 +1152,9 @@ async def _proximity_loop():
                 cooldown_ok = (now - last_sent) > PROXIMITY_ALERT_COOLDOWN_SECONDS
                 
                 # Check if we're in proximity zone
-                in_proximity_zone = distance_pct <= PROXIMITY_ALERT_DISTANCE_PCT * 100
+                # FIX BUG-9: PROXIMITY_ALERT_DISTANCE_PCT=0.02 (доля), distance_pct в %; убрано *100 — используем долю напрямую
+                distance_fraction = abs(current_price - level) / current_price
+                in_proximity_zone = distance_fraction <= PROXIMITY_ALERT_DISTANCE_PCT
 
                 # Only send alert if:
                 # 1. In proximity zone
@@ -1457,24 +1437,18 @@ async def _startup_monitoring():
 
                 for lvl in supports:
                     lvl["symbol"] = symbol
-                    lvl["approach"] = _count_approaches(symbol, lvl["level"], atr) if atr > 0 else 0
+                    lvl["approach"] = _count_approaches(symbol, lvl["level"], atr)[0] if atr > 0 else 0  # FIX BUG-6: tuple[0]=count
                     if atr > 0:
                         lvl.update(get_level_history(symbol, lvl["level"], atr))
                     calculate_strength(lvl)
                     lvl["python_strength"] = lvl["strength"]
 
-                try:
+                try:  # FIX BUG-15: убран мёртвый if-блок (strength==0 после calculate_strength невозможен)
                     from analysis.ml_score import apply_ml_to_level
                     _style_startup = detect_approach_style(symbol)
                     for lvl in supports:
                         lvl["approach_style"] = _style_startup
-                        if _style_startup == "impulse" and lvl.get("strength", 0) == 0:
-                            lvl["p_bounce"] = 0.0
-                            lvl["ml_delta"] = -2
-                            lvl["ml_blocked"] = True
-                            lvl["strength_pre_ml"] = lvl.get("strength", 0)
-                        else:
-                            apply_ml_to_level(lvl)
+                        apply_ml_to_level(lvl)
                 except Exception as _e:
                     logger.warning("ml_score failed in startup: %s", _e)
 
