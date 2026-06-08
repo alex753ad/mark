@@ -67,6 +67,13 @@ class Strategy1Bounce(BaseStrategy):
         expected_depth_abs = entry_price * (expected_depth / 100)
         stop_loss = event["level"] - expected_depth_abs * 1.5
         risk = entry_price - stop_loss
+        # FIX BUG-8: при нулевом/отрицательном risk TP окажется ниже entry — не открывать
+        if risk <= 0:
+            logger.warning(
+                "S1 skip: non-positive risk",
+                symbol=symbol, entry=entry_price, sl=stop_loss, level=event["level"],
+            )
+            return
         take_profit_1 = entry_price + risk * S1_TP1_RR
         take_profit_2 = entry_price + risk * S1_TP2_RR
 

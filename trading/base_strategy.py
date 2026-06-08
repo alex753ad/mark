@@ -68,6 +68,26 @@ class BaseStrategy(ABC):
             )
 
             try:
+                # FIX-EXTREMES: принудительно обновить экстремумы перед закрытием.
+                # _check_timeout закрывает сделку минуя _update_open_trades,
+                # поэтому если _price_loop пропустил тики (рестарт, пустые свечи),
+                # max_favorable/max_adverse остаются нулями.
+                await update_trade_extremes(
+                    trade["trade_id"],
+                    current_price,
+                    trade["entry_price"],
+                    trade["direction"],
+                )
+                ep = trade["entry_price"]
+                if ep > 0:
+                    if trade["direction"] == "long":
+                        fav = (current_price - ep) / ep * 100
+                        adv = (ep - current_price) / ep * 100
+                    else:
+                        fav = (ep - current_price) / ep * 100
+                        adv = (current_price - ep) / ep * 100
+                    trade["max_favorable_pct"] = max(trade.get("max_favorable_pct") or 0.0, fav)
+                    trade["max_adverse_pct"]   = max(trade.get("max_adverse_pct") or 0.0, adv)
                 await self._close_and_track(trade["trade_id"], symbol, current_price, "timeout")
                 await self._send_close_message(trade, current_price, "timeout")
                 logger.info(
@@ -148,6 +168,7 @@ class BaseStrategy(ABC):
         symbol: str,
         exit_price: float,
         exit_reason: str,
+        filled_size: float | None = None,
     ) -> None:
         """
         Закрыть сделку и запустить 30-минутный трекинг цены после закрытия.
@@ -155,8 +176,11 @@ class BaseStrategy(ABC):
         Использовать вместо прямого вызова close_trade() во всех стратегиях.
         Порядок строго: сначала close_trade, потом запуск трекера.
         exit_time фиксируется здесь — сразу после close_trade, до await asyncio.sleep.
+
+        filled_size — реальный размер позиции в USDT (передаётся S2 для
+        корректного pnl_usdt при частичном заполнении сетки).
         """
-        await close_trade(trade_id, exit_price, exit_reason)
+        await close_trade(trade_id, exit_price, exit_reason, filled_size)
         exit_time = time.time()
         self._start_post_exit_tracker(trade_id, symbol, exit_time)
 

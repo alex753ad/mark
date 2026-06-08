@@ -9,6 +9,7 @@ from trading.strategy1_bounce import Strategy1Bounce
 from trading.strategy2_limit_grid import Strategy2LimitGrid
 from trading.strategy3_breakout import Strategy3Breakout
 from trading.trade_log import init_trades_db, get_open_trades
+from trading.price_tracker import resume_post_exit_trackers
 from data.collector import candles_1m
 from logger import logger
 
@@ -25,6 +26,7 @@ async def run_strategies() -> None:
     """
     await init_trades_db()
     logger.info("trades.db initialized")
+    await resume_post_exit_trackers()
 
     strategies = [Strategy1Bounce(), Strategy2LimitGrid(), Strategy3Breakout()]
     asyncio.create_task(_timeout_checker(strategies))

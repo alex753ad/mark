@@ -27,6 +27,7 @@ class Strategy3Breakout(BaseStrategy):
     strategy_name = "breakout"
 
     def __init__(self) -> None:
+        super().__init__()  # FIX BUG-1: создаёт _tracker_tasks, иначе AttributeError при _close_and_track
         # symbol → timestamp последнего события "sweep"
         self._recent_sweep: dict[str, float] = {}
 
@@ -35,8 +36,10 @@ class Strategy3Breakout(BaseStrategy):
     async def on_event(self, event: dict) -> None:
         event_type = event.get("event_type")
 
+        # FIX BUG-2: два блока sweep объединены — второй (_handle_sweep_warning) никогда не достигался
         if event_type == "sweep":
             self._recent_sweep[event["symbol"]] = time.time()
+            await self._handle_sweep_warning(event)  # проверяет открытые сделки внутри
             return
 
         if event_type == "breakout":
@@ -46,11 +49,6 @@ class Strategy3Breakout(BaseStrategy):
         # Bounce по уровню — признак ложного пробоя, закрыть short
         if event_type == "bounce":
             await self._handle_bounce(event)
-            return
-
-        # Sweep пришёл уже после открытия — предупреждение
-        if event_type == "sweep":
-            await self._handle_sweep_warning(event)
 
     async def _try_open(self, event: dict) -> None:
         symbol = event["symbol"]
@@ -85,7 +83,10 @@ class Strategy3Breakout(BaseStrategy):
         level = event["level"]
         atr = event.get("atr", 0.0)
 
-        stop_loss = level + atr * S3_SL_ATR_MULT
+        # FIX-SL: SL считается от entry_price, а не от level.
+        # Раньше: level + 0.5*ATR → SL был в ~0.5% от level, но entry на 2-7% ниже,
+        # итого реальный риск ~3-8% от entry вместо задуманных ~0.5%.
+        stop_loss = entry_price + atr * S3_SL_ATR_MULT
         take_profit_1 = entry_price - atr * S3_TP1_ATR_MULT
         take_profit_2 = entry_price - atr * S3_TP2_ATR_MULT
 

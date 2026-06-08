@@ -26,6 +26,7 @@ class Strategy2LimitGrid(BaseStrategy):
     strategy_name = "limit_grid"
 
     def __init__(self) -> None:
+        super().__init__()  # FIX BUG-1: создаёт _tracker_tasks, иначе AttributeError при _close_and_track
         # symbol → timestamp последнего события "pressure"
         self._recent_pressure: dict[str, float] = {}
 
@@ -186,10 +187,13 @@ class Strategy2LimitGrid(BaseStrategy):
 
         effective_stop = entry_price if stop_moved else stop_loss
 
+        fill_count = updated.get("grid_fill_count") or 0
+        filled_usdt = self._filled_usdt(fill_count)
+
         # TP2
         if current_price >= take_profit_2:
             avg_exit = (take_profit_1 + take_profit_2) / 2 if tp1_hit else take_profit_2
-            await self._close_and_track(trade_id, updated["symbol"], avg_exit, "take_profit_2")
+            await self._close_and_track(trade_id, updated["symbol"], avg_exit, "take_profit_2", filled_usdt)
             await self._send_close_message(updated, avg_exit, "take_profit_2")
             return
 
@@ -209,10 +213,10 @@ class Strategy2LimitGrid(BaseStrategy):
         if current_price <= effective_stop:
             if tp1_hit:
                 avg_exit = (take_profit_1 + entry_price) / 2
-                await self._close_and_track(trade_id, updated["symbol"], avg_exit, "stop_loss")
+                await self._close_and_track(trade_id, updated["symbol"], avg_exit, "stop_loss", filled_usdt)
                 await self._send_close_message(updated, avg_exit, "stop_loss")
             else:
-                await self._close_and_track(trade_id, updated["symbol"], current_price, "stop_loss")
+                await self._close_and_track(trade_id, updated["symbol"], current_price, "stop_loss", filled_usdt)
                 await self._send_close_message(updated, current_price, "stop_loss")
 
     async def _process_grid_fills(self, trade: dict, current_price: float) -> None:
@@ -268,7 +272,11 @@ class Strategy2LimitGrid(BaseStrategy):
             # Пересчитать TP/SL от нового entry_price
             fill_count = sum(1 for o in grid_orders if o["filled"])
             weighted_entry = sum(o["price"] for o in grid_orders if o["filled"]) / fill_count
-            await self._recalculate_params(trade_id, weighted_entry, trade)
+            # FIX BUG-10: перечитываем trade из БД — исходный dict не содержит params_updated
+            # событий, добавленных в этой же сессии, _extract_params вернул бы устаревшие TP/SL
+            fresh_trade = await self._reload_trade(trade_id)
+            if fresh_trade:
+                await self._recalculate_params(trade_id, weighted_entry, fresh_trade)
 
     async def _update_grid_in_db(
         self,
@@ -364,11 +372,83 @@ class Strategy2LimitGrid(BaseStrategy):
                 await self._send_close_message(trade, trade["entry_price"], "cancelled_no_fill")
                 logger.info("S2 grid cancelled (no fills), pnl=0", trade_id=trade_id)
             else:
-                await self._close_and_track(trade_id, trade["symbol"], current_price, "breakout_confirmed")
+                await self._close_and_track(trade_id, trade["symbol"], current_price, "breakout_confirmed", self._filled_usdt(fill_count))
                 updated_trade = await self._reload_trade_closed(trade_id) or trade
                 await self._send_close_message(updated_trade, current_price, "breakout_confirmed")
 
             logger.info("S2 grid closed on breakout", trade_id=trade_id, fill_count=fill_count)
+
+    def _filled_usdt(self, fill_count: int) -> float:
+        """Реальный размер позиции в USDT по числу исполненных ордеров."""
+        return self.POSITION_SIZE_USDT * fill_count / S2_GRID_ORDERS
+
+    # ── Таймаут ───────────────────────────────────────────────────────
+
+    async def _check_timeout(self) -> None:
+        """
+        Переопределяем базовый _check_timeout чтобы при fill_count=0
+        закрывать с pnl=0, а не считать фантомный PnL от entry_price=level.
+        Сделки с fill_count>0 обрабатываются как обычно через базовый метод.
+        """
+        from data.collector import candles_1m
+        from trading.trade_log import update_trade_extremes
+        import time as _time
+
+        trades = await get_open_trades(self.strategy_id)
+        now = _time.time()
+        for trade in trades:
+            age_minutes = (now - trade["entry_time"]) / 60
+            if age_minutes < self.TRADE_TIMEOUT_MINUTES:
+                continue
+
+            fill_count = trade.get("grid_fill_count") or 0
+            trade_id = trade["trade_id"]
+            symbol = trade["symbol"]
+
+            if fill_count == 0:
+                # Позиции не было — закрываем с нулевым PnL без вызова close_trade
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        """UPDATE trades
+                           SET exit_price = ?, exit_time = ?, exit_reason = ?,
+                               pnl_pct = 0.0, pnl_usdt = 0.0, duration_minutes = ?,
+                               status = 'closed', updated_at = ?
+                           WHERE trade_id = ?""",
+                        (
+                            trade["entry_price"],
+                            now,
+                            "timeout_no_fill",
+                            round(age_minutes, 2),
+                            now,
+                            trade_id,
+                        ),
+                    )
+                    await db.commit()
+                await self._send_close_message(trade, trade["entry_price"], "timeout_no_fill")
+                logger.info("S2 timeout_no_fill (zero PnL)", trade_id=trade_id, symbol=symbol)
+            else:
+                # Есть реальная позиция — стандартная логика базового класса
+                c1m = candles_1m.get(symbol, [])
+                current_price = c1m[-1]["close"] if c1m else trade["entry_price"]
+                try:
+                    await update_trade_extremes(
+                        trade_id, current_price, trade["entry_price"], trade["direction"]
+                    )
+                    ep = trade["entry_price"]
+                    if ep > 0:
+                        fav = (current_price - ep) / ep * 100
+                        adv = (ep - current_price) / ep * 100
+                        trade["max_favorable_pct"] = max(trade.get("max_favorable_pct") or 0.0, fav)
+                        trade["max_adverse_pct"]   = max(trade.get("max_adverse_pct") or 0.0, adv)
+                    await self._close_and_track(trade_id, symbol, current_price, "timeout", self._filled_usdt(fill_count))
+                    await self._send_close_message(trade, current_price, "timeout")
+                    logger.info(
+                        "S2 timeout with fills",
+                        trade_id=trade_id, symbol=symbol,
+                        fill_count=fill_count, age_minutes=round(age_minutes, 1),
+                    )
+                except Exception as e:
+                    logger.error("S2 _check_timeout error", trade_id=trade_id, error=str(e))
 
     # ── Вспомогательные ───────────────────────────────────────────────
 

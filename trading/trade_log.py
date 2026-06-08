@@ -203,10 +203,15 @@ async def close_trade(
     trade_id: str,
     exit_price: float,
     exit_reason: str,
+    filled_size: Optional[float] = None,
 ) -> None:
     """
     Закрыть сделку: вычислить pnl, duration и записать в БД.
     Для short: прибыль если цена упала ниже entry_price.
+
+    filled_size — реальный размер позиции в USDT (для S2, где исполнено
+    только fill_count из S2_GRID_ORDERS ордеров). Если None, используется
+    полный position_size из БД.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -224,7 +229,8 @@ async def close_trade(
         else:
             pnl_pct = (entry_price - exit_price) / entry_price * 100
 
-        pnl_usdt        = position_size * pnl_pct / 100
+        effective_size  = filled_size if filled_size is not None else position_size
+        pnl_usdt        = effective_size * pnl_pct / 100
         duration_minutes = (time.time() - entry_time) / 60
         now              = time.time()
 
