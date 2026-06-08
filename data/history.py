@@ -49,6 +49,7 @@ _NEW_COLUMNS = [
     ("outcome", "TEXT"),
     ("btc_change_1m", "REAL"),
     ("funding_rate", "REAL"),
+    ("monitoring_age_minutes", "REAL"),
 ]
 
 
@@ -126,6 +127,7 @@ async def save_level_outcome(
     fill_depth_pct: float = None,
     btc_change_1m: float = None,
     funding_rate: float = None,
+    monitoring_age_minutes: float = None,
 ) -> None:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -134,12 +136,12 @@ async def save_level_outcome(
                 (symbol, level, level_type, strength_claude, approach_type,
                  vol_ratio_on_approach, touches_count, result, duration_minutes,
                  outcome, approach_style, vol_ratio_at_touch, atr_ratio,
-                 fill_depth_pct, btc_change_1m, funding_rate)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 fill_depth_pct, btc_change_1m, funding_rate, monitoring_age_minutes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (symbol, level, level_type, strength, approach_type,
                  vol_ratio, touches, result, duration,
                  outcome, approach_style, vol_ratio_at_touch, atr_ratio,
-                 fill_depth_pct, btc_change_1m, funding_rate),
+                 fill_depth_pct, btc_change_1m, funding_rate, monitoring_age_minutes),
             )
             await db.commit()
     except Exception:

@@ -137,7 +137,13 @@ def get_delta(symbol: str, window_seconds: int = 30) -> dict:
 async def _stream_agg_trades(symbol: str):
     """Stream aggTrades for a symbol and update delta buffer. Reconnects on error."""
     while symbol in agg_trades:
-        client = await AsyncClient.create()
+        # FIX BUG-14: оборачиваем create() отдельно — иначе finally не вызовется при ошибке создания
+        try:
+            client = await AsyncClient.create()
+        except Exception as e:
+            logger.warning("Failed to create aggTrades client", symbol=symbol, error=str(e))
+            await asyncio.sleep(5)
+            continue
         try:
             bm = client.futures_multiplex_socket([f"{symbol.lower()}@aggTrade"])
             async with bm as stream:
