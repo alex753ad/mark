@@ -35,11 +35,12 @@ def find_real_level(symbol: str, level: float) -> tuple[float, int]:
     zone_radius = atr * 0.3  # Fixed radius: 0.3 ATR
 
     # Find pump peak time - count touches only after pump (use recent candles, not all-time)
-    pump_high = max(c["high"] for c in c15m[-50:])
-    pump_peak_time = next((c["open_time"] for c in c15m if c["high"] >= pump_high * 0.999), None)
+    recent_c15m = c15m[-50:]  # FIX BUG-13: pump_high взят из [-50:], искать peak_time тоже в нём
+    pump_high = max(c["high"] for c in recent_c15m)
+    pump_peak_time = next((c["open_time"] for c in recent_c15m if c["high"] >= pump_high * 0.999), None)
 
     touches = []
-    for c in c15m:
+    for c in recent_c15m:  # FIX BUG-13: итерировать по тому же срезу, что и pump_peak_time
         # Only count after pump peak
         if pump_peak_time and c["open_time"] < pump_peak_time:
             continue
@@ -159,9 +160,11 @@ async def get_approaching_levels(symbol: str, use_claude: bool = True) -> list[d
         lvl["level"] = real
         distance = abs(current_price - lvl["level"])
         if distance <= threshold:
-            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr,
-                                                 exclude_open_times=claimed_times)
-            claimed_times |= getattr(_count_approaches, "_last_claimed", set())
+            # FIX BUG-6: _count_approaches возвращает (count, claimed) — распаковываем tuple
+            approach_count, new_claimed = _count_approaches(symbol, lvl["level"], atr,
+                                                             exclude_open_times=claimed_times)
+            lvl["approach"] = approach_count
+            claimed_times |= new_claimed
             lvl["vol_ratio"] = _calc_vol_ratio(symbol)
             history = get_level_history(symbol, lvl["level"], atr)
             lvl.update(history)
@@ -177,7 +180,7 @@ async def get_approaching_levels(symbol: str, use_claude: bool = True) -> list[d
             and abs(other["level"] - lvl["level"]) <= zone_radius
         ]
         zone_approaches = sum(
-            _count_approaches(symbol, other["level"], atr)
+            _count_approaches(symbol, other["level"], atr)[0]  # FIX BUG-6: [0] = count из tuple
             for other in nearby
         )
         lvl["zone_approaches"] = zone_approaches
@@ -232,12 +235,14 @@ async def get_approaching_levels(symbol: str, use_claude: bool = True) -> list[d
 
 
 def _count_approaches(symbol: str, level: float, atr: float,
-                       exclude_open_times: set = None) -> int:
+                       exclude_open_times: set = None) -> tuple[int, set]:
     """Count number of times price approached the level after pump peak.
 
     exclude_open_times: set of candle open_times already claimed by a
     neighbouring level (LEVEL-06 fix — prevents overlapping approach zones
     from double-counting the same candles for two close levels).
+
+    Returns (count, claimed) tuple.  # FIX BUG-6: было return int + атрибут на функции → race condition в asyncio
     """
     c1m = candles_1m.get(symbol, [])
     c15m = candles_15m.get(symbol, [])
@@ -248,7 +253,9 @@ def _count_approaches(symbol: str, level: float, atr: float,
     if c15m:
         recent_c15m = c15m[-100:]
         pump_high = max(c["high"] for c in recent_c15m)
-        for c in recent_c15m:
+        # FIX BUG-13: итерируем в обратном порядке чтобы взять ПОСЛЕДНИЙ пик,
+        # а не первый — иначе старый памп с тем же high обнуляет все касания
+        for c in reversed(recent_c15m):
             if c["high"] >= pump_high * 0.999:
                 pump_high_time = c["open_time"]
                 break
@@ -275,9 +282,8 @@ def _count_approaches(symbol: str, level: float, atr: float,
             count += 1
         was_near = near
 
-    # Expose claimed set so callers can pass it as exclude to the next level
-    _count_approaches._last_claimed = claimed
-    return count
+    # FIX BUG-6: убран _count_approaches._last_claimed — не потокобезопасно в asyncio
+    return count, claimed
 
 
 def get_level_history(symbol: str, level: float, atr: float) -> dict:
@@ -304,7 +310,8 @@ def get_level_history(symbol: str, level: float, atr: float) -> dict:
     if c15m:
         recent_c15m = c15m[-100:]
         pump_high = max(c["high"] for c in recent_c15m)
-        pump_high_time = next((c["open_time"] for c in recent_c15m if c["high"] >= pump_high * 0.999), None)
+        # FIX BUG-13: reversed() — берём ПОСЛЕДНИЙ пик, не первый
+        pump_high_time = next((c["open_time"] for c in reversed(recent_c15m) if c["high"] >= pump_high * 0.999), None)
 
     was_broken = False
     sweep_reclaimed = False

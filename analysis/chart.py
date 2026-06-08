@@ -111,7 +111,8 @@ def generate_chart(symbol: str, levels: list[dict], broken_levels: list[dict] = 
     for lv in sorted_levels:
         ax.axhline(y=lv, color="#26a69a", linewidth=0.8, linestyle="-", alpha=0.7)
         if last_labeled is None or abs(lv - last_labeled) / lv > 0.005:
-            ax.text(0.5, lv, f" {lv}", fontsize=7, color="#26a69a", va="bottom")
+            # FIX BUG-16: x=0.5 при xlim[-1..n+1] рисовало метки на первых свечах; n-1 = правый край
+            ax.text(n - 1, lv, f" {lv}", fontsize=7, color="#26a69a", va="bottom", ha="right")
             last_labeled = lv
 
     # Broken levels (пробитые уровни)
@@ -125,7 +126,8 @@ def generate_chart(symbol: str, levels: list[dict], broken_levels: list[dict] = 
             color = "#00ff88" if lvl.get("breakout_type") == "zakol" else "#ff4444"
             ax.axhline(y=lv, color=color, linewidth=0.8, linestyle="--", alpha=0.7)
             if last_broken_labeled is None or abs(lv - last_broken_labeled) / lv > 0.005:
-                ax.text(0.5, lv, f" {lv}", fontsize=7, color=color, va="bottom")
+                # FIX BUG-16: x=0.5 рисовало метки на первых свечах; n-1 = правый край
+                ax.text(n - 1, lv, f" {lv}", fontsize=7, color=color, va="bottom", ha="right")
                 last_broken_labeled = lv
 
     # POC

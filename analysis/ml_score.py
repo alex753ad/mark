@@ -20,7 +20,7 @@ ML scoring for support levels.
     # lvl теперь содержит: p_bounce, expected_depth, ml_delta, strength_pre_ml,
     #                       p_fast_breakout (если clf2 загружен)
 
-Признаки модели (6 штук, touches убран):
+Признаки модели (6 штук, touches убран):  # FIX BUG-4: было написано "6 штук", реально было 7; FIX BUG-5: monitoring_age_hours удалён — дублировал age_capped, train/inference skew
     1. strength        — Python-сила уровня (1-5)
     2. ltype_enc       — тип уровня (из level_type_map.pkl)
     3. vol_ratio       — объём / среднее (обрезается до 20)
@@ -146,7 +146,7 @@ async def reload_models() -> None:
 def ml_score(lvl: dict) -> dict:
     """
     Принимает lvl-словарь (тот же что в calculate_strength).
-    Использует 6 признаков (touches убран, закрыт хард-фильтром).
+    Использует 6 признаков (touches убран, закрыт хард-фильтром).  # FIX BUG-5: monitoring_age_hours удалён
     approach_style читается из lvl["approach_style"] (fallback: "unknown").
 
     Возвращает dict с ключами:
@@ -170,14 +170,10 @@ def ml_score(lvl: dict) -> dict:
         style_enc = STYLE_MAP.get(style, 3)
         age_min   = min(float(lvl.get("monitoring_age_minutes") or 0), 300.0)
 
-        import time as _time
-        monitoring_age_hours = (
-            (_time.time() - lvl["monitoring_start_time"]) / 3600
-            if lvl.get("monitoring_start_time")
-            else 0.0
-        )
-
-        # Вектор признаков: touches убран
+        # Вектор признаков: touches убран, monitoring_age_hours удалён
+        # FIX BUG-5: monitoring_age_hours был дублём age_min/60; при обучении
+        # отсутствовал у 95% записей в history.db (= 0), при инференсе считался
+        # реально → train/inference skew. Признак удалён из модели полностью.
         x = np.array([[
             strength,
             ltype_enc,
@@ -185,7 +181,6 @@ def ml_score(lvl: dict) -> dict:
             min(atr_ratio, 20.0),
             style_enc,
             age_min,
-            monitoring_age_hours,
         ]])
 
         # ── Классификатор bounce/breakout ──────────────────────────────

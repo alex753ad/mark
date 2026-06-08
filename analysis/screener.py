@@ -59,11 +59,12 @@ async def run_screener() -> list[tuple]:
                     continue
 
                 # Fetch last 15M candle for volume filter
-                klines_15m = await client.futures_klines(symbol=sym, interval="15m", limit=2)
+                klines_15m = await client.futures_klines(symbol=sym, interval="15m", limit=3)  # FIX BUG-12: limit=3 чтобы [-2] был доступен
                 if not klines_15m:
                     continue
                 # Use the last closed 15M candle (index -2 if current is open, else -1)
-                last_15m_vol = float(klines_15m[-1][7])  # quoteAssetVolume
+                # FIX BUG-12: [-1] — незакрытая свеча, объём занижен в 1–14 раз; брать [-2]
+                last_15m_vol = float(klines_15m[-2][7])  # последняя закрытая свеча
                 if last_15m_vol < SCREENER_MIN_15M_VOLUME_USD:
                     logger.debug(
                         "Screener: 15M vol too low",

@@ -123,7 +123,10 @@ async def start_monitor(
             "fill_depth_pct": round(fdp, 4),
             "approach_style": approach_style,
             "atr_ratio": atr_ratio,
-            "vol_ratio_at_touch": vol_ratio_captured if vol_ratio_captured != 1.0 else vol_ratio,
+            # FIX BUG-VOL: раньше при vol_ratio_captured==1.0 брался vol_ratio (объём
+            # подхода к уровню), что давало неверный признак для ML. Теперь всегда
+            # используется vol_ratio_captured — после фиксов выше он корректен.
+            "vol_ratio_at_touch": vol_ratio_captured,
             "outcome_saved": _outcome_saved[0],
         }
 
@@ -154,351 +157,258 @@ async def start_monitor(
             **extra,
         }
 
-    while True:
-        if stop_event and stop_event.is_set():
-            _monitor_result = _make_result(None, touched)
-            break
+    # FIX BUG-11: try/finally гарантирует отмену delta_stream_task при любом выходе
+    try:
+        while True:
+            if stop_event and stop_event.is_set():
+                _monitor_result = _make_result(None, touched)
+                break
 
-        iteration += 1
-        if iteration % 60 == 0:
-            atr = calculate_atr(symbol)
+            iteration += 1
+            if iteration % 60 == 0:
+                atr = calculate_atr(symbol)
 
-        c1m = candles_1m.get(symbol, [])
-        if c1m:
-            last = c1m[-1]
-            body_close = last["close"]
-            body_open = last["open"]
-            body_bottom = min(body_close, body_open)
-            body_top = max(body_close, body_open)
+            c1m = candles_1m.get(symbol, [])
+            if c1m:
+                last = c1m[-1]
+                body_close = last["close"]
+                body_open = last["open"]
+                body_bottom = min(body_close, body_open)
+                body_top = max(body_close, body_open)
 
-            # Track extremes for fill_depth_pct
-            if min_price_during is None or last["low"] < min_price_during:
-                min_price_during = last["low"]
-            if max_price_during is None or last["high"] > max_price_during:
-                max_price_during = last["high"]
+                # Track extremes for fill_depth_pct
+                if min_price_during is None or last["low"] < min_price_during:
+                    min_price_during = last["low"]
+                if max_price_during is None or last["high"] > max_price_during:
+                    max_price_during = last["high"]
 
-            if level_side == "support" and body_close < level:
-                avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
-                breakout_vol_ratio = last["volume"] / avg_vol if avg_vol > 0 else 1.0
-                # Confirm breakout: need 2 consecutive closes below level to avoid zakol
-                prev_close_below = len(c1m) >= 2 and c1m[-2]["close"] < level
-                if breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and prev_close_below:
-                    await send_message(
-                        f"💥 {symbol} пробой {level} с объёмом ×{breakout_vol_ratio:.1f} — настоящий, выход"
-                    )
-                    try:
-                        from trading.event_bus import publish as _eb_publish
-                        await _eb_publish(_make_event(
-                            "breakout", body_close,
-                            breakout_vol_ratio=round(breakout_vol_ratio, 2),
-                        ))
-                    except Exception as _eb_e:
-                        logger.debug("event_bus publish error (breakout support): %s", _eb_e)
-                    # ── Pump Phase: count broken level ────────────────
-                    try:
-                        from models import state_manager as _sm
-                        _st = _sm.get_state(symbol)
-                        _st.broken_since_pump += 1
-                        from analysis.pump_phase import pump_health_score, get_pump_phase, calc_correction_pct
-                        if _st.broken_since_pump >= PUMP_MAX_BROKEN_LEVELS:
-                            _st.pump_phase = "dead"
-                            _corr = calc_correction_pct(_st)
+                if level_side == "support" and body_close < level:
+                    avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
+                    breakout_vol_ratio = last["volume"] / avg_vol if avg_vol > 0 else 1.0
+                    # Confirm breakout: need 2 consecutive closes below level to avoid zakol
+                    prev_close_below = len(c1m) >= 2 and c1m[-2]["close"] < level
+                    if breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and prev_close_below:
+                        await send_message(
+                            f"💥 {symbol} пробой {level} с объёмом ×{breakout_vol_ratio:.1f} — настоящий, выход"
+                        )
+                        # Refresh approach_style and p_bounce at moment of breakout.
+                        # If monitor started with approach_style="unknown" (e.g. startup/phase1),
+                        # ML scored p_bounce on unknown style → too low. Re-score now with
+                        # current style so strategy3 gets accurate p_bounce in the event.
+                        try:
+                            from analysis.trigger import detect_approach_style
+                            from analysis.ml_score import ml_score as _ml_score
+                            _current_style = detect_approach_style(symbol) or approach_style or "unknown"
+                            if _current_style != approach_style:
+                                _lvl_tmp = {
+                                    "type": level_type,
+                                    "strength": strength,
+                                    "vol_ratio": vol_ratio_captured,
+                                    "atr_ratio": atr_ratio or 2.0,
+                                    "approach_style": _current_style,
+                                    "monitoring_age_minutes": (time.time() - _monitoring_start_time) / 60,
+                                }
+                                _ml = _ml_score(_lvl_tmp)
+                                approach_style = _current_style
+                                p_bounce = _ml["p_bounce"]
+                                expected_depth = _ml["expected_depth"]
+                                logger.debug(
+                                    "monitor: breakout p_bounce refreshed style=%s p_bounce=%.3f",
+                                    _current_style, p_bounce,
+                                )
+                        except Exception as _ml_e:
+                            logger.debug("monitor: breakout p_bounce refresh failed: %s", _ml_e)
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event(
+                                "breakout", body_close,
+                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                            ))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (breakout support): %s", _eb_e)
+                        # ── Pump Phase: count broken level ────────────────
+                        try:
+                            from models import state_manager as _sm
+                            _st = _sm.get_state(symbol)
+                            _st.broken_since_pump += 1
+                            from analysis.pump_phase import pump_health_score, get_pump_phase, calc_correction_pct
+                            if _st.broken_since_pump >= PUMP_MAX_BROKEN_LEVELS:
+                                _st.pump_phase = "dead"
+                                _corr = calc_correction_pct(_st)
+                                await send_message(
+                                    f"🚫 {symbol} — памп завершён\n"
+                                    f"   Пробито уровней без отскока: {_st.broken_since_pump}\n"
+                                    f"   Коррекция от пика: {_corr:.0%}\n"
+                                    f"   Мониторинг остановлен. Жду новый памп."
+                                )
+                            else:
+                                _st.pump_health = pump_health_score(_st, body_close)
+                                _st.pump_phase = get_pump_phase(_st.pump_health)
+                        except Exception as _pp_e:
+                            logger.debug("pump_phase update error (breakout support): %s", _pp_e)
+                        # ─────────────────────────────────────────────────
+                        # FIX BUG-VOL: при breakout без предварительного касания
+                        # vol_ratio_captured = 1.0 (default). Перезаписываем объёмом
+                        # пробойной свечи, чтобы vol_ratio_at_touch в history.db
+                        # содержал реальный объём, а не заглушку → корректное обучение ML.
+                        if not touched:
+                            vol_ratio_captured = round(breakout_vol_ratio, 2)
+                            # FIX-STYLE: при breakout без touch стиль тоже определяем здесь
+                            from analysis.trigger import detect_approach_style as _das
+                            approach_style = _das(symbol)
+                        _monitor_result = _make_result("breakout", touched)
+                        break
+                    elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_below:
+                        # High volume but only 1 candle below — possible zakol, wait for confirmation
+                        now = time.time()
+                        if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
                             await send_message(
-                                f"🚫 {symbol} — памп завершён\n"
-                                f"   Пробито уровней без отскока: {_st.broken_since_pump}\n"
-                                f"   Коррекция от пика: {_corr:.0%}\n"
-                                f"   Мониторинг остановлен. Жду новый памп."
+                                f"⚠️ {symbol} закол {level} с объёмом ×{breakout_vol_ratio:.1f} — ждём подтверждения"
                             )
-                        else:
-                            _st.pump_health = pump_health_score(_st, body_close)
-                            _st.pump_phase = get_pump_phase(_st.pump_health)
-                    except Exception as _pp_e:
-                        logger.debug("pump_phase update error (breakout support): %s", _pp_e)
-                    # ─────────────────────────────────────────────────
-                    _monitor_result = _make_result("breakout", touched)
-                    break
-                elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_below:
-                    # High volume but only 1 candle below — possible zakol, wait for confirmation
-                    now = time.time()
-                    if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
-                        await send_message(
-                            f"⚠️ {symbol} закол {level} с объёмом ×{breakout_vol_ratio:.1f} — ждём подтверждения"
-                        )
-                        try:
-                            from trading.event_bus import publish as _eb_publish
-                            await _eb_publish(_make_event(
-                                "weak_breakout", body_close,
-                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
-                            ))
-                        except Exception as _eb_e:
-                            logger.debug("event_bus publish error (weak_breakout support): %s", _eb_e)
-                        weak_breakout_sent = True
-                        weak_breakout_time = now
-                else:
-                    now = time.time()
-                    if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
-                        await send_message(
-                            f"⚠️ {symbol} пробой {level} на слабом объёме (×{breakout_vol_ratio:.1f}) — возможен sweep, наблюдаем"
-                        )
-                        try:
-                            from trading.event_bus import publish as _eb_publish
-                            await _eb_publish(_make_event(
-                                "weak_breakout", body_close,
-                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
-                            ))
-                        except Exception as _eb_e:
-                            logger.debug("event_bus publish error (weak_breakout support low vol): %s", _eb_e)
-                        weak_breakout_sent = True
-                        weak_breakout_time = now
-            elif level_side == "support" and body_close >= level:
-                pass  # don't reset — prevents spam on repeated dips
-
-            if level_side == "resistance" and body_close > level:
-                avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
-                breakout_vol_ratio = last["volume"] / avg_vol if avg_vol > 0 else 1.0
-                prev_close_above = len(c1m) >= 2 and c1m[-2]["close"] > level
-                if breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and prev_close_above:
-                    await send_message(
-                        f"💥 {symbol} пробой {level} с объёмом ×{breakout_vol_ratio:.1f} — настоящий, выход"
-                    )
-                    try:
-                        from trading.event_bus import publish as _eb_publish
-                        await _eb_publish(_make_event(
-                            "breakout", body_close,
-                            breakout_vol_ratio=round(breakout_vol_ratio, 2),
-                        ))
-                    except Exception as _eb_e:
-                        logger.debug("event_bus publish error (breakout resistance): %s", _eb_e)
-                    # ── Pump Phase: count broken level ────────────────
-                    try:
-                        from models import state_manager as _sm
-                        _st = _sm.get_state(symbol)
-                        _st.broken_since_pump += 1
-                        from analysis.pump_phase import pump_health_score, get_pump_phase, calc_correction_pct
-                        if _st.broken_since_pump >= PUMP_MAX_BROKEN_LEVELS:
-                            _st.pump_phase = "dead"
-                            _corr = calc_correction_pct(_st)
-                            await send_message(
-                                f"🚫 {symbol} — памп завершён\n"
-                                f"   Пробито уровней без отскока: {_st.broken_since_pump}\n"
-                                f"   Коррекция от пика: {_corr:.0%}\n"
-                                f"   Мониторинг остановлен. Жду новый памп."
-                            )
-                        else:
-                            _st.pump_health = pump_health_score(_st, body_close)
-                            _st.pump_phase = get_pump_phase(_st.pump_health)
-                    except Exception as _pp_e:
-                        logger.debug("pump_phase update error (breakout resistance): %s", _pp_e)
-                    # ─────────────────────────────────────────────────
-                    _monitor_result = _make_result("breakout", touched)
-                    break
-                elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_above:
-                    now = time.time()
-                    if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
-                        await send_message(
-                            f"⚠️ {symbol} закол {level} с объёмом ×{breakout_vol_ratio:.1f} — ждём подтверждения"
-                        )
-                        try:
-                            from trading.event_bus import publish as _eb_publish
-                            await _eb_publish(_make_event(
-                                "weak_breakout", body_close,
-                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
-                            ))
-                        except Exception as _eb_e:
-                            logger.debug("event_bus publish error (weak_breakout resistance): %s", _eb_e)
-                        weak_breakout_sent = True
-                        weak_breakout_time = now
-                else:
-                    now = time.time()
-                    if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
-                        await send_message(
-                            f"⚠️ {symbol} пробой {level} на слабом объёме (×{breakout_vol_ratio:.1f}) — возможен sweep, наблюдаем"
-                        )
-                        try:
-                            from trading.event_bus import publish as _eb_publish
-                            await _eb_publish(_make_event(
-                                "weak_breakout", body_close,
-                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
-                            ))
-                        except Exception as _eb_e:
-                            logger.debug("event_bus publish error (weak_breakout resistance low vol): %s", _eb_e)
-                        weak_breakout_sent = True
-                        weak_breakout_time = now
-            elif level_side == "resistance" and body_close <= level:
-                pass  # don't reset — prevents spam on repeated pops
-
-            if level_side == "support" and last["low"] <= level * 1.002:
-                if not touched:
-                    # Start delta tracking on first touch
-                    start_delta_tracking(symbol)
-                    if delta_stream_task is None or delta_stream_task.done():
-                        delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
-                    touch_c1m_idx = len(c1m) - 1
-                    touch_classify_at = touch_c1m_idx + 5  # classify after 5 x 1M candles
-                    touch_start_time = time.time()
-                    avg_vol = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
-                    vol_ratio_captured = round(last["volume"] / avg_vol, 2) if avg_vol > 0 else 1.0
-                    logger.debug("Delta tracking started on touch", symbol=symbol, level=level)
-                touched = True
-            if level_side == "resistance" and last["high"] >= level * 0.998:
-                if not touched:
-                    start_delta_tracking(symbol)
-                    if delta_stream_task is None or delta_stream_task.done():
-                        delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
-                    touch_c1m_idx = len(c1m) - 1
-                    touch_classify_at = touch_c1m_idx + 5
-                    touch_start_time = time.time()
-                    avg_vol = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
-                    vol_ratio_captured = round(last["volume"] / avg_vol, 2) if avg_vol > 0 else 1.0
-                touched = True
-
-            # Classify touch event after 5 x 1M candles
-            if touched and touch_classify_at > 0 and len(c1m) >= touch_classify_at and not rebound_sent:
-                if not classify_sent:
-                    asyncio.create_task(_classify_and_log_level_event(
-                        symbol, level, c1m, candles_15m.get(symbol, []),
-                        min_price_during or level, touch_c1m_idx,
-                        level_type=level_type, strength=strength,
-                        approach_style=approach_style, atr_ratio=atr_ratio,
-                        touch_start_time=touch_start_time,
-                        vol_ratio_at_touch=vol_ratio_captured,
-                        outcome_saved_flag=_outcome_saved,
-                    ))
-                    classify_sent = True
-                touch_classify_at = 0  # reset so we don't classify again
-
-            # Delta signal: buy pressure absorbing sells at support
-            if touched and not delta_signal_sent:
-                d = get_delta(symbol, window_seconds=30)
-                if d["trades"] >= 10:  # enough data
-                    if level_side == "support" and d["delta"] > 0 and d["buy_vol"] > d["sell_vol"] * 1.5:
-                        await send_message(
-                            f"⚡ {symbol} дельта разворот у {level}\n"
-                            f"   Buy {d['buy_vol']:.1f} vs Sell {d['sell_vol']:.1f} за 30с\n"
-                            f"   Покупатели поглощают продажи — вход"
-                        )
-                        delta_signal_sent = True
-                        logger.info("Delta reversal signal sent", symbol=symbol, level=level,
-                                   buy=d["buy_vol"], sell=d["sell_vol"])
-                    elif level_side == "resistance" and d["delta"] < 0 and d["sell_vol"] > d["buy_vol"] * 1.5:
-                        await send_message(
-                            f"⚡ {symbol} дельта разворот у {level}\n"
-                            f"   Sell {d['sell_vol']:.1f} vs Buy {d['buy_vol']:.1f} за 30с\n"
-                            f"   Продавцы давят — шорт"
-                        )
-                        delta_signal_sent = True
-
-            if level_side == "support" and touched and body_close > body_open and body_close > level:
-                avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
-                if not rebound_sent:
-                    if not classify_sent:
-                        asyncio.create_task(_classify_and_log_level_event(
-                            symbol, level, c1m, candles_15m.get(symbol, []),
-                            min_price_during or level, touch_c1m_idx,
-                            level_type=level_type, strength=strength,
-                            approach_style=approach_style, atr_ratio=atr_ratio,
-                            touch_start_time=touch_start_time,
-                            vol_ratio_at_touch=vol_ratio_captured,
-                            outcome_saved_flag=_outcome_saved,
-                        ))
+                            try:
+                                from trading.event_bus import publish as _eb_publish
+                                await _eb_publish(_make_event(
+                                    "weak_breakout", body_close,
+                                    breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                                ))
+                            except Exception as _eb_e:
+                                logger.debug("event_bus publish error (weak_breakout support): %s", _eb_e)
+                            weak_breakout_sent = True
+                            weak_breakout_time = now
                     else:
-                        # classify already ran (5-candle timer) but bounce happened later — log it now
-                        asyncio.create_task(_log_bounce_outcome(
-                            symbol, level, min_price_during or level,
-                            level_type=level_type, strength=strength,
-                            approach_style=approach_style, atr_ratio=atr_ratio,
-                            touch_start_time=touch_start_time,
-                            vol_ratio_at_touch=vol_ratio_captured,
-                            outcome_saved_flag=_outcome_saved,
-                        ))
-                    classify_sent = True
-                    rebound_sent = True
-                    touched = False
-                    delta_signal_sent = False
-                    stop_delta_tracking(symbol)
-                    if last["volume"] > avg_vol:
-                        _now = time.time()
-                        if _now - _rebound_last_sent.get(symbol, 0) > 60:
-                            _rebound_last_sent[symbol] = _now
+                        now = time.time()
+                        if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
                             await send_message(
-                                f"✅ {symbol} отбой от {level} подтверждён — цена выкупается"
+                                f"⚠️ {symbol} пробой {level} на слабом объёме (×{breakout_vol_ratio:.1f}) — возможен sweep, наблюдаем"
                             )
-                    try:
-                        from trading.event_bus import publish as _eb_publish
-                        await _eb_publish(_make_event("bounce", body_close))
-                    except Exception as _eb_e:
-                        logger.debug("event_bus publish error (bounce support): %s", _eb_e)
-                    # ── Pump Phase: reset broken counter on confirmed bounce ──
-                    try:
-                        from models import state_manager as _sm
-                        _st = _sm.get_state(symbol)
-                        _st.broken_since_pump = 0
-                        _st.last_bounce_time = time.time()
-                        from analysis.pump_phase import pump_health_score, get_pump_phase
-                        _st.pump_health = pump_health_score(_st, body_close)
-                        _st.pump_phase = get_pump_phase(_st.pump_health)
-                    except Exception as _pp_e:
-                        logger.debug("pump_phase reset error (bounce support): %s", _pp_e)
-                    # ────────────────────────────────────────────────────────
+                            try:
+                                from trading.event_bus import publish as _eb_publish
+                                await _eb_publish(_make_event(
+                                    "weak_breakout", body_close,
+                                    breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                                ))
+                            except Exception as _eb_e:
+                                logger.debug("event_bus publish error (weak_breakout support low vol): %s", _eb_e)
+                            weak_breakout_sent = True
+                            weak_breakout_time = now
+                elif level_side == "support" and body_close >= level:
+                    pass  # don't reset — prevents spam on repeated dips
 
-            if level_side == "resistance" and touched and body_close < body_open and body_close < level:
-                avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
-                if not rebound_sent:
-                    if not classify_sent:
-                        asyncio.create_task(_classify_and_log_level_event(
-                            symbol, level, c1m, candles_15m.get(symbol, []),
-                            max_price_during or level, touch_c1m_idx,
-                            level_type=level_type, strength=strength,
-                            approach_style=approach_style, atr_ratio=atr_ratio,
-                            touch_start_time=touch_start_time,
-                            vol_ratio_at_touch=vol_ratio_captured,
-                            outcome_saved_flag=_outcome_saved,
-                        ))
+                if level_side == "resistance" and body_close > level:
+                    avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
+                    breakout_vol_ratio = last["volume"] / avg_vol if avg_vol > 0 else 1.0
+                    prev_close_above = len(c1m) >= 2 and c1m[-2]["close"] > level
+                    if breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and prev_close_above:
+                        await send_message(
+                            f"💥 {symbol} пробой {level} с объёмом ×{breakout_vol_ratio:.1f} — настоящий, выход"
+                        )
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event(
+                                "breakout", body_close,
+                                breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                            ))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (breakout resistance): %s", _eb_e)
+                        # ── Pump Phase: count broken level ────────────────
+                        try:
+                            from models import state_manager as _sm
+                            _st = _sm.get_state(symbol)
+                            _st.broken_since_pump += 1
+                            from analysis.pump_phase import pump_health_score, get_pump_phase, calc_correction_pct
+                            if _st.broken_since_pump >= PUMP_MAX_BROKEN_LEVELS:
+                                _st.pump_phase = "dead"
+                                _corr = calc_correction_pct(_st)
+                                await send_message(
+                                    f"🚫 {symbol} — памп завершён\n"
+                                    f"   Пробито уровней без отскока: {_st.broken_since_pump}\n"
+                                    f"   Коррекция от пика: {_corr:.0%}\n"
+                                    f"   Мониторинг остановлен. Жду новый памп."
+                                )
+                            else:
+                                _st.pump_health = pump_health_score(_st, body_close)
+                                _st.pump_phase = get_pump_phase(_st.pump_health)
+                        except Exception as _pp_e:
+                            logger.debug("pump_phase update error (breakout resistance): %s", _pp_e)
+                        # ─────────────────────────────────────────────────
+                        # FIX BUG-VOL: аналогично support — при breakout без касания
+                        # сохраняем объём пробойной свечи в vol_ratio_captured.
+                        if not touched:
+                            vol_ratio_captured = round(breakout_vol_ratio, 2)
+                            # FIX-STYLE: при breakout без touch стиль тоже определяем здесь
+                            from analysis.trigger import detect_approach_style as _das
+                            approach_style = _das(symbol)
+                        _monitor_result = _make_result("breakout", touched)
+                        break
+                    elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_above:
+                        now = time.time()
+                        if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
+                            await send_message(
+                                f"⚠️ {symbol} закол {level} с объёмом ×{breakout_vol_ratio:.1f} — ждём подтверждения"
+                            )
+                            try:
+                                from trading.event_bus import publish as _eb_publish
+                                await _eb_publish(_make_event(
+                                    "weak_breakout", body_close,
+                                    breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                                ))
+                            except Exception as _eb_e:
+                                logger.debug("event_bus publish error (weak_breakout resistance): %s", _eb_e)
+                            weak_breakout_sent = True
+                            weak_breakout_time = now
                     else:
-                        asyncio.create_task(_log_bounce_outcome(
-                            symbol, level, max_price_during or level,
-                            level_type=level_type, strength=strength,
-                            approach_style=approach_style, atr_ratio=atr_ratio,
-                            touch_start_time=touch_start_time,
-                            vol_ratio_at_touch=vol_ratio_captured,
-                            outcome_saved_flag=_outcome_saved,
-                        ))
-                    classify_sent = True
-                    rebound_sent = True
-                    touched = False
-                    delta_signal_sent = False
-                    stop_delta_tracking(symbol)
-                    if last["volume"] > avg_vol:
-                        _now = time.time()
-                        if _now - _rebound_last_sent.get(symbol, 0) > 60:
-                            _rebound_last_sent[symbol] = _now
+                        now = time.time()
+                        if not weak_breakout_sent or (now - weak_breakout_time) > WEAK_BREAKOUT_COOLDOWN_SECONDS:
                             await send_message(
-                                f"✅ {symbol} отбой от {level} подтверждён — цена отбита вниз"
+                                f"⚠️ {symbol} пробой {level} на слабом объёме (×{breakout_vol_ratio:.1f}) — возможен sweep, наблюдаем"
                             )
-                    try:
-                        from trading.event_bus import publish as _eb_publish
-                        await _eb_publish(_make_event("bounce", body_close))
-                    except Exception as _eb_e:
-                        logger.debug("event_bus publish error (bounce resistance): %s", _eb_e)
-                    # ── Pump Phase: reset broken counter on confirmed bounce ──
-                    try:
-                        from models import state_manager as _sm
-                        _st = _sm.get_state(symbol)
-                        _st.broken_since_pump = 0
-                        _st.last_bounce_time = time.time()
-                        from analysis.pump_phase import pump_health_score, get_pump_phase
-                        _st.pump_health = pump_health_score(_st, body_close)
-                        _st.pump_phase = get_pump_phase(_st.pump_health)
-                    except Exception as _pp_e:
-                        logger.debug("pump_phase reset error (bounce resistance): %s", _pp_e)
-                    # ────────────────────────────────────────────────────────
+                            try:
+                                from trading.event_bus import publish as _eb_publish
+                                await _eb_publish(_make_event(
+                                    "weak_breakout", body_close,
+                                    breakout_vol_ratio=round(breakout_vol_ratio, 2),
+                                ))
+                            except Exception as _eb_e:
+                                logger.debug("event_bus publish error (weak_breakout resistance low vol): %s", _eb_e)
+                            weak_breakout_sent = True
+                            weak_breakout_time = now
+                elif level_side == "resistance" and body_close <= level:
+                    pass  # don't reset — prevents spam on repeated pops
 
-            current_price = last["close"]
-            if atr > 0:
-                distance = abs(current_price - level)
-                if distance > atr * DISTANCE_RESET_ATR_MULTIPLIER:
-                    # If touched but price moved away without confirmed rebound — classify
-                    if touched and not rebound_sent and not classify_sent:
+                if level_side == "support" and last["low"] <= level * 1.002:
+                    if not touched:
+                        # Start delta tracking on first touch
+                        start_delta_tracking(symbol)
+                        if delta_stream_task is None or delta_stream_task.done():
+                            delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
+                        touch_c1m_idx = len(c1m) - 1
+                        touch_classify_at = touch_c1m_idx + 5  # classify after 5 x 1M candles
+                        touch_start_time = time.time()
+                        avg_vol = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
+                        vol_ratio_captured = round(last["volume"] / avg_vol, 2) if avg_vol > 0 else 1.0
+                        # FIX-STYLE: переопределяем стиль в момент касания, а не при старте монитора
+                        from analysis.trigger import detect_approach_style as _das
+                        approach_style = _das(symbol)
+                        logger.debug("Delta tracking started on touch", symbol=symbol, level=level)
+                    touched = True
+                if level_side == "resistance" and last["high"] >= level * 0.998:
+                    if not touched:
+                        start_delta_tracking(symbol)
+                        if delta_stream_task is None or delta_stream_task.done():
+                            delta_stream_task = asyncio.create_task(_stream_agg_trades(symbol))
+                        touch_c1m_idx = len(c1m) - 1
+                        touch_classify_at = touch_c1m_idx + 5
+                        touch_start_time = time.time()
+                        avg_vol = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
+                        vol_ratio_captured = round(last["volume"] / avg_vol, 2) if avg_vol > 0 else 1.0
+                        # FIX-STYLE: переопределяем стиль в момент касания, а не при старте монитора
+                        from analysis.trigger import detect_approach_style as _das
+                        approach_style = _das(symbol)
+                    touched = True
+
+                # Classify touch event after 5 x 1M candles
+                if touched and touch_classify_at > 0 and len(c1m) >= touch_classify_at and not rebound_sent:
+                    if not classify_sent:
                         asyncio.create_task(_classify_and_log_level_event(
                             symbol, level, c1m, candles_15m.get(symbol, []),
                             min_price_during or level, touch_c1m_idx,
@@ -509,13 +419,143 @@ async def start_monitor(
                             outcome_saved_flag=_outcome_saved,
                         ))
                         classify_sent = True
-                    # Check near_miss: came within 0.5% but never touched
-                    elif not touched and min_price_during is not None and not classify_sent:
-                        dist_pct = (level - min_price_during) / level * 100 if level > min_price_during else 0
-                        if 0 < dist_pct <= 0.5:
+                    touch_classify_at = 0  # reset so we don't classify again
+
+                # Delta signal: buy pressure absorbing sells at support
+                if touched and not delta_signal_sent:
+                    d = get_delta(symbol, window_seconds=30)
+                    if d["trades"] >= 10:  # enough data
+                        if level_side == "support" and d["delta"] > 0 and d["buy_vol"] > d["sell_vol"] * 1.5:
+                            await send_message(
+                                f"⚡ {symbol} дельта разворот у {level}\n"
+                                f"   Buy {d['buy_vol']:.1f} vs Sell {d['sell_vol']:.1f} за 30с\n"
+                                f"   Покупатели поглощают продажи — вход"
+                            )
+                            delta_signal_sent = True
+                            logger.info("Delta reversal signal sent", symbol=symbol, level=level,
+                                       buy=d["buy_vol"], sell=d["sell_vol"])
+                        elif level_side == "resistance" and d["delta"] < 0 and d["sell_vol"] > d["buy_vol"] * 1.5:
+                            await send_message(
+                                f"⚡ {symbol} дельта разворот у {level}\n"
+                                f"   Sell {d['sell_vol']:.1f} vs Buy {d['buy_vol']:.1f} за 30с\n"
+                                f"   Продавцы давят — шорт"
+                            )
+                            delta_signal_sent = True
+
+                if level_side == "support" and touched and body_close > body_open and body_close > level:
+                    avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
+                    if not rebound_sent:
+                        if not classify_sent:
                             asyncio.create_task(_classify_and_log_level_event(
                                 symbol, level, c1m, candles_15m.get(symbol, []),
-                                min_price_during, touch_c1m_idx,
+                                min_price_during or level, touch_c1m_idx,
+                                level_type=level_type, strength=strength,
+                                approach_style=approach_style, atr_ratio=atr_ratio,
+                                touch_start_time=touch_start_time,
+                                vol_ratio_at_touch=vol_ratio_captured,
+                                outcome_saved_flag=_outcome_saved,
+                            ))
+                        else:
+                            # classify already ran (5-candle timer) but bounce happened later — log it now
+                            asyncio.create_task(_log_bounce_outcome(
+                                symbol, level, min_price_during or level,
+                                level_type=level_type, strength=strength,
+                                approach_style=approach_style, atr_ratio=atr_ratio,
+                                touch_start_time=touch_start_time,
+                                vol_ratio_at_touch=vol_ratio_captured,
+                                outcome_saved_flag=_outcome_saved,
+                            ))
+                        classify_sent = True
+                        rebound_sent = True
+                        touched = False
+                        delta_signal_sent = False
+                        stop_delta_tracking(symbol)
+                        if last["volume"] > avg_vol:
+                            _now = time.time()
+                            if _now - _rebound_last_sent.get(symbol, 0) > 60:
+                                _rebound_last_sent[symbol] = _now
+                                await send_message(
+                                    f"✅ {symbol} отбой от {level} подтверждён — цена выкупается"
+                                )
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event("bounce", body_close))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (bounce support): %s", _eb_e)
+                        # ── Pump Phase: reset broken counter on confirmed bounce ──
+                        try:
+                            from models import state_manager as _sm
+                            _st = _sm.get_state(symbol)
+                            _st.broken_since_pump = 0
+                            _st.last_bounce_time = time.time()
+                            from analysis.pump_phase import pump_health_score, get_pump_phase
+                            _st.pump_health = pump_health_score(_st, body_close)
+                            _st.pump_phase = get_pump_phase(_st.pump_health)
+                        except Exception as _pp_e:
+                            logger.debug("pump_phase reset error (bounce support): %s", _pp_e)
+                        # ────────────────────────────────────────────────────────
+
+                if level_side == "resistance" and touched and body_close < body_open and body_close < level:
+                    avg_vol = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
+                    if not rebound_sent:
+                        if not classify_sent:
+                            asyncio.create_task(_classify_and_log_level_event(
+                                symbol, level, c1m, candles_15m.get(symbol, []),
+                                max_price_during or level, touch_c1m_idx,
+                                level_type=level_type, strength=strength,
+                                approach_style=approach_style, atr_ratio=atr_ratio,
+                                touch_start_time=touch_start_time,
+                                vol_ratio_at_touch=vol_ratio_captured,
+                                outcome_saved_flag=_outcome_saved,
+                            ))
+                        else:
+                            asyncio.create_task(_log_bounce_outcome(
+                                symbol, level, max_price_during or level,
+                                level_type=level_type, strength=strength,
+                                approach_style=approach_style, atr_ratio=atr_ratio,
+                                touch_start_time=touch_start_time,
+                                vol_ratio_at_touch=vol_ratio_captured,
+                                outcome_saved_flag=_outcome_saved,
+                            ))
+                        classify_sent = True
+                        rebound_sent = True
+                        touched = False
+                        delta_signal_sent = False
+                        stop_delta_tracking(symbol)
+                        if last["volume"] > avg_vol:
+                            _now = time.time()
+                            if _now - _rebound_last_sent.get(symbol, 0) > 60:
+                                _rebound_last_sent[symbol] = _now
+                                await send_message(
+                                    f"✅ {symbol} отбой от {level} подтверждён — цена отбита вниз"
+                                )
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event("bounce", body_close))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (bounce resistance): %s", _eb_e)
+                        # ── Pump Phase: reset broken counter on confirmed bounce ──
+                        try:
+                            from models import state_manager as _sm
+                            _st = _sm.get_state(symbol)
+                            _st.broken_since_pump = 0
+                            _st.last_bounce_time = time.time()
+                            from analysis.pump_phase import pump_health_score, get_pump_phase
+                            _st.pump_health = pump_health_score(_st, body_close)
+                            _st.pump_phase = get_pump_phase(_st.pump_health)
+                        except Exception as _pp_e:
+                            logger.debug("pump_phase reset error (bounce resistance): %s", _pp_e)
+                        # ────────────────────────────────────────────────────────
+
+                current_price = last["close"]
+                if atr > 0:
+                    distance = abs(current_price - level)
+                    if distance > atr * DISTANCE_RESET_ATR_MULTIPLIER:
+                        # If touched but price moved away without confirmed rebound — classify
+                        if touched and not rebound_sent and not classify_sent:
+                            asyncio.create_task(_classify_and_log_level_event(
+                                symbol, level, c1m, candles_15m.get(symbol, []),
+                                min_price_during or level, touch_c1m_idx,
                                 level_type=level_type, strength=strength,
                                 approach_style=approach_style, atr_ratio=atr_ratio,
                                 touch_start_time=touch_start_time,
@@ -523,86 +563,101 @@ async def start_monitor(
                                 outcome_saved_flag=_outcome_saved,
                             ))
                             classify_sent = True
-                    rebound_sent = False
-                    approach_warned = False
-                    touched = False
-                    classify_sent = False  # reset for next touch
-                    _outcome_saved[0] = False  # reset: next touch is a new event
-                    engulf_sent = False
-                    level_broken_sent = False
-                    delta_signal_sent = False
-                    stop_delta_tracking(symbol)
-                elif distance > atr * DISTANCE_PARTIAL_RESET_ATR_MULTIPLIER:
-                    touched = False
-                    rebound_sent = False
-                    classify_sent = False
-                    _outcome_saved[0] = False  # reset: next touch is a new event
-                    touch_start_time = 0.0
-                    vol_ratio_captured = 1.0
-                    min_price_during = None
-                    max_price_during = None
+                        # Check near_miss: came within 0.5% but never touched
+                        elif not touched and min_price_during is not None and not classify_sent:
+                            dist_pct = (level - min_price_during) / level * 100 if level > min_price_during else 0
+                            if 0 < dist_pct <= 0.5:
+                                asyncio.create_task(_classify_and_log_level_event(
+                                    symbol, level, c1m, candles_15m.get(symbol, []),
+                                    min_price_during, touch_c1m_idx,
+                                    level_type=level_type, strength=strength,
+                                    approach_style=approach_style, atr_ratio=atr_ratio,
+                                    touch_start_time=touch_start_time,
+                                    vol_ratio_at_touch=vol_ratio_captured,
+                                    outcome_saved_flag=_outcome_saved,
+                                ))
+                                classify_sent = True
+                        rebound_sent = False
+                        approach_warned = False
+                        touched = False
+                        classify_sent = False  # reset for next touch
+                        _outcome_saved[0] = False  # reset: next touch is a new event
+                        engulf_sent = False
+                        level_broken_sent = False
+                        delta_signal_sent = False
+                        stop_delta_tracking(symbol)
+                    elif distance > atr * DISTANCE_PARTIAL_RESET_ATR_MULTIPLIER:
+                        touched = False
+                        rebound_sent = False
+                        classify_sent = False
+                        _outcome_saved[0] = False  # reset: next touch is a new event
+                        touch_start_time = 0.0
+                        vol_ratio_captured = 1.0
+                        min_price_during = None
+                        max_price_during = None
 
-            avg_vol_20 = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
-            if volume_spike_notified and avg_vol_20 > 0 and last["volume"] / avg_vol_20 < VOLUME_SPIKE_RESET_RATIO:
-                volume_spike_notified = False
+                avg_vol_20 = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
+                if volume_spike_notified and avg_vol_20 > 0 and last["volume"] / avg_vol_20 < VOLUME_SPIKE_RESET_RATIO:
+                    volume_spike_notified = False
 
-            is_sweep = _check_sweep_reclaim(c1m, level, level_side)
-            if is_sweep and not sweep_sent:
-                await _handle_sweep(symbol, level, level_side, c1m)
-                sweep_sent = True
-                # Don't reset sweep_sent - it should only be sent once per monitoring session
-                try:
-                    from trading.event_bus import publish as _eb_publish
-                    _reclaim_vol = c1m[-1]["volume"]
-                    _avg_vol_sw = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
-                    _sweep_vr = round(_reclaim_vol / _avg_vol_sw, 2) if _avg_vol_sw > 0 else 1.0
-                    await _eb_publish(_make_event(
-                        "sweep", c1m[-1]["close"],
-                        sweep_vol_ratio=_sweep_vr,
-                    ))
-                except Exception as _eb_e:
-                    logger.debug("event_bus publish error (sweep): %s", _eb_e)
+                is_sweep = _check_sweep_reclaim(c1m, level, level_side)
+                if is_sweep and not sweep_sent:
+                    await _handle_sweep(symbol, level, level_side, c1m)
+                    sweep_sent = True
+                    # Don't reset sweep_sent - it should only be sent once per monitoring session
+                    try:
+                        from trading.event_bus import publish as _eb_publish
+                        _reclaim_vol = c1m[-1]["volume"]
+                        _avg_vol_sw = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
+                        _sweep_vr = round(_reclaim_vol / _avg_vol_sw, 2) if _avg_vol_sw > 0 else 1.0
+                        await _eb_publish(_make_event(
+                            "sweep", c1m[-1]["close"],
+                            sweep_vol_ratio=_sweep_vr,
+                        ))
+                    except Exception as _eb_e:
+                        logger.debug("event_bus publish error (sweep): %s", _eb_e)
 
-        alert, alert_type = _check_complications(symbol, level, level_side, approach_warned, volume_spike_notified, engulf_sent, level_broken_sent, weak_breakout_sent)
-        if alert:
-            # Set flag BEFORE sending message to prevent race condition
-            if alert_type == "pressure":
-                approach_warned = True
-            elif alert_type == "volume_spike":
-                volume_spike_notified = True
-            elif alert_type == "engulf":
-                engulf_sent = True
-            elif alert_type == "level_broken":
-                level_broken_sent = True
-            
-            # Now send the message
-            await send_message(alert)
+            alert, alert_type = _check_complications(symbol, level, level_side, approach_warned, volume_spike_notified, engulf_sent, level_broken_sent, weak_breakout_sent)
+            if alert:
+                # Set flag BEFORE sending message to prevent race condition
+                if alert_type == "pressure":
+                    approach_warned = True
+                elif alert_type == "volume_spike":
+                    volume_spike_notified = True
+                elif alert_type == "engulf":
+                    engulf_sent = True
+                elif alert_type == "level_broken":
+                    level_broken_sent = True
+                
+                # Now send the message
+                await send_message(alert)
 
-            # Publish to event bus
-            if alert_type == "pressure":
-                try:
-                    from trading.event_bus import publish as _eb_publish
-                    _cp_alert = candles_1m.get(symbol, [{}])[-1].get("close", 0.0)
-                    await _eb_publish(_make_event("pressure", _cp_alert))
-                except Exception as _eb_e:
-                    logger.debug("event_bus publish error (pressure): %s", _eb_e)
-            elif alert_type == "volume_spike":
-                try:
-                    from trading.event_bus import publish as _eb_publish
-                    _cp_vs = candles_1m.get(symbol, [{}])[-1].get("close", 0.0)
-                    _c1m_vs = candles_1m.get(symbol, [])
-                    _avg_vs = sum(c["volume"] for c in _c1m_vs[-60:]) / max(len(_c1m_vs[-60:]), 1) if _c1m_vs else 1
-                    _spike_r = int(_c1m_vs[-1]["volume"] / _avg_vs) if _c1m_vs and _avg_vs > 0 else 1
-                    await _eb_publish(_make_event("volume_spike", _cp_vs, spike_ratio=_spike_r))
-                except Exception as _eb_e:
-                    logger.debug("event_bus publish error (volume_spike): %s", _eb_e)
+                # Publish to event bus
+                if alert_type == "pressure":
+                    try:
+                        from trading.event_bus import publish as _eb_publish
+                        _cp_alert = candles_1m.get(symbol, [{}])[-1].get("close", 0.0)
+                        await _eb_publish(_make_event("pressure", _cp_alert))
+                    except Exception as _eb_e:
+                        logger.debug("event_bus publish error (pressure): %s", _eb_e)
+                elif alert_type == "volume_spike":
+                    try:
+                        from trading.event_bus import publish as _eb_publish
+                        _cp_vs = candles_1m.get(symbol, [{}])[-1].get("close", 0.0)
+                        _c1m_vs = candles_1m.get(symbol, [])
+                        _avg_vs = sum(c["volume"] for c in _c1m_vs[-60:]) / max(len(_c1m_vs[-60:]), 1) if _c1m_vs else 1
+                        _spike_r = int(_c1m_vs[-1]["volume"] / _avg_vs) if _c1m_vs and _avg_vs > 0 else 1
+                        await _eb_publish(_make_event("volume_spike", _cp_vs, spike_ratio=_spike_r))
+                    except Exception as _eb_e:
+                        logger.debug("event_bus publish error (volume_spike): %s", _eb_e)
 
-        await asyncio.sleep(COLLECTOR_UPDATE_INTERVAL_SECONDS)
+            await asyncio.sleep(COLLECTOR_UPDATE_INTERVAL_SECONDS)
 
-    # Cleanup delta tracking when monitor exits
-    stop_delta_tracking(symbol)
-    if delta_stream_task and not delta_stream_task.done():
-        delta_stream_task.cancel()
+    finally:
+        # FIX BUG-11: cleanup выполняется всегда — при break, stop_event и исключении
+        stop_delta_tracking(symbol)
+        if delta_stream_task and not delta_stream_task.done():
+            delta_stream_task.cancel()
 
     return _monitor_result
 
@@ -612,6 +667,38 @@ _classify_last_sent: dict[str, float] = {}  # key: "symbol:level" -> timestamp
 
 # Dedup guard: prevent duplicate rebound messages per symbol
 _rebound_last_sent: dict[str, float] = {}  # key: "symbol" -> timestamp
+
+
+def _get_market_context(symbol: str, monitoring_start_time: float) -> dict:
+    """
+    Вычислить btc_change_1m и monitoring_age_minutes в момент сохранения.
+    funding_rate — async, получается отдельно через _get_market_context_async.
+    Вызывается из _log_bounce_outcome и _classify_and_log_level_event.
+    """
+    from analysis.trigger import get_btc_change_1m as _get_btc
+    btc_change_1m = None
+    try:
+        btc_change_1m = _get_btc()
+    except Exception:
+        pass
+
+    monitoring_age_minutes = None
+    if monitoring_start_time > 0:
+        monitoring_age_minutes = round((time.time() - monitoring_start_time) / 60, 2)
+
+    return {
+        "btc_change_1m": btc_change_1m,
+        "monitoring_age_minutes": monitoring_age_minutes,
+    }
+
+
+async def _get_funding_rate(symbol: str) -> float | None:
+    """Получить funding_rate через тот же путь что main.py."""
+    from analysis.trigger import get_funding_rate as _get_fr
+    try:
+        return await _get_fr(symbol)
+    except Exception:
+        return None
 
 
 async def _log_bounce_outcome(
@@ -634,6 +721,8 @@ async def _log_bounce_outcome(
     now = _time.time()
     duration_minutes = int((now - touch_start_time) / 60) if touch_start_time > 0 else 0
 
+    ctx = _get_market_context(symbol, touch_start_time)
+    funding = await _get_funding_rate(symbol)
     event_type = "zakol" if fill_depth_pct >= 0.1 else "bounce"
     await log_event(symbol, event_type,
                     f"level={level} depth={fill_depth_pct:.2f}% (late confirm)")
@@ -652,6 +741,9 @@ async def _log_bounce_outcome(
         vol_ratio_at_touch=vol_ratio_at_touch,
         atr_ratio=atr_ratio,
         fill_depth_pct=round(fill_depth_pct, 4),
+        btc_change_1m=ctx["btc_change_1m"],
+        funding_rate=funding,
+        monitoring_age_minutes=ctx["monitoring_age_minutes"],
     )
     if outcome_saved_flag is not None:
         outcome_saved_flag[0] = True
@@ -738,10 +830,21 @@ async def _classify_and_log_level_event(
             details = f"level={level} depth={fill_depth_pct:.2f}%"
     else:
         # Price went below level and didn't return in 5 candles — not a bounce
+        # Детализируем partial по глубине, как в _make_result, чтобы outcome
+        # был консистентен независимо от пути сохранения.
         event_type = "no_return"
-        outcome = "partial"
+        if fill_depth_pct >= 2.0:
+            outcome = "partial_deep"
+        elif fill_depth_pct >= 1.0:
+            outcome = "partial_mid"
+        elif fill_depth_pct >= 0.1:
+            outcome = "partial_shallow"
+        else:
+            outcome = "partial_shallow"
         details = f"level={level} fill_depth={fill_depth_pct:.2f}%"
 
+    ctx = _get_market_context(symbol, touch_start_time)
+    funding = await _get_funding_rate(symbol)
     await log_event(symbol, event_type, details)
 
     # Also write to level_outcomes so ML has the data
@@ -760,6 +863,9 @@ async def _classify_and_log_level_event(
         vol_ratio_at_touch=vol_ratio_at_touch,
         atr_ratio=atr_ratio,
         fill_depth_pct=round(fill_depth_pct, 4),
+        btc_change_1m=ctx["btc_change_1m"],
+        funding_rate=funding,
+        monitoring_age_minutes=ctx["monitoring_age_minutes"],
     )
     if outcome_saved_flag is not None:
         outcome_saved_flag[0] = True

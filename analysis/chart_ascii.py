@@ -47,18 +47,16 @@ def generate_ascii_chart(c15m: list[dict], levels: list[dict], poc_price: float 
         # Price label
         line = f"{price_at_row:7.5f} |"
         
-        # Draw candles
+        # FIX BUG-3: строим массив width ячеек и маппим свечи по col-позиции
+        # FIX: используем round+деление на (candles_to_show-1) чтобы последняя свеча
+        # попадала в col=width-1, а не в width-2 (при старой формуле крайний столбец всегда пустой)
+        row_chars = [" "] * width
+        denom = max(candles_to_show - 1, 1)
         for i, candle in enumerate(recent_candles):
-            col = int((i / candles_to_show) * width)
-            
-            # Check if candle intersects this price level
+            col = int(round(i / denom * (width - 1)))
             if candle["low"] <= price_at_row <= candle["high"]:
-                if candle["close"] >= candle["open"]:
-                    line += "█"  # Bullish
-                else:
-                    line += "▓"  # Bearish
-            else:
-                line += " "
+                row_chars[col] = "█" if candle["close"] >= candle["open"] else "▓"
+        line += "".join(row_chars)
         
         # Mark levels on the right
         level_marker = ""
