@@ -1,8 +1,114 @@
 # Архитектура проекта mark
 
-Торговый бот для Binance Futures. Проект мониторит фьючерсные пары, строит уровни поддержки/сопротивления после импульсов, оценивает силу уровней через Python-эвристики, ML и Claude, отправляет сигналы в Telegram, ведет историю и paper trading по стратегиям.
+Торговый бот для Binance Futures. Проект мониторит фьючерсные пары, строит уровни поддержки/сопротивления и тестирует стратегии paper trading.
 
-Актуализировано: 2026-06-09.
+Актуализировано: 2026-06-11.
+
+**Последние изменения (после 07.06.2026):**
+
+## Обновления от 11 июня
+
+### Новая стратегия: Strategy4 Breakout Long (`trading/strategy4_breakout_long.py`)
+
+Полностью автономная стратегия для лонг-пробоев resistance-уровней. Особенности:
+- **Сканирование уровней**: собственный фоновый сканер ищет resistance-уровни выше цены в диапазоне ATR
+- **Фильтры входа**: 
+  - Объём пробойной свечи ≥ `S4_MIN_BREAKOUT_VOL_RATIO` (2.4×)
+  - Подтверждение: текущая И предыдущая свеча закрыты выше уровня
+  - Касания снизу ≥ `S4_MIN_APPROACH_COUNT` (1 касание, ибо resistance слабее support)
+  - ML p_bounce ≤ `S4_MAX_P_BOUNCE` (0.65) — уровень скорее пробьётся, чем отобьёт
+  - Нет BTC-дропа > 0.2%, нет sweep за последние 120 сек
+- **Параметры выхода**:
+  - SL = entry − ATR × 1.5
+  - TP1 (50%) = entry + ATR × 1.5 → стоп в breakeven
+  - TP2 (50%) = entry + ATR × 3.0
+  - Трейлинг после TP1 = current − ATR × 1.5
+  - Bounce-выход: цена под уровень × 0.998 → `breakout_failed_bounce`
+- **Entry context** логирует: дельта, свеча пробоя, объём тренд, BTC, approach_style, наклон 15M
+
+Запускается через `strategy_runner.py`: `strategies[-1].start_scanner()`.
+
+### Улучшения в Strategy1 (Bounce)
+
+- **Trailing stop** до TP1:
+  - Активируется при profitable move ≥ 0.5% от входа
+  - Пик = max of последних 2×1M свечей
+  - Стоп = peak × (1 − 0.3%) — отступ 30 бп
+  - При TP1: trailing отключается, стоп → breakeven
+  - Логирование на каждое обновление пика
+
+- **Исключение pump_base** из входа (BUG-FIX): носят слишком волатильную мул, даже в лонге не входят чисто
+
+- **Сигнал на очистку chart**: интегрирована функция `_send_close_with_chart()` для отправки графика при закрытии
+
+### Улучшения в Strategy2 (Limit Grid)
+
+**Радикальная переработка логики TP/SL и трейлинга:**
+
+- **Grid width** теперь = ATR × 2.5 (более гибкое распределение ордеров)
+- **Full-grid mode**: если все S2_GRID_ORDERS (10) ордеров заполнены:
+  - Уровень пробит насквозь → ждём возврата к уровню
+  - `full_grid_tp` = level × (1 − 0.15%) — возврат с профитом
+  - Эта ветка работает только до TP1
+- **TP2** теперь явный: `entry + ATR × 5.0` (вместо удвоения от grid_bottom)
+- **Trailing после TP1**:
+  - Активируется немедленно при достижении TP1
+  - Пик = max of последних 2×1M свечей
+  - Стоп = peak × (1 − 0.5%)
+  - Срабатывает по low последних 2 свечей (ловит sweep)
+- **Таймауты**:
+  - Без заполнения: 20 мин (вместо 60)
+  - С заполнением: стандартный timeout checker
+  - Guard: если fill_count обнулился за сессию → закрыть с pnl=0
+- **Параметры при fill_count > S2_GRID_ORDERS**: ужесточение SL = entry − ATR × 0.2
+- **Recent close cooldown**: 300 сек после закрытия по одному уровню, чтобы не открывать повторно сразу
+- **Логирование fill events**: удалены излишние message per fill, консолидировано в params_updated
+- **Position size** становится константой: `S2_POSITION_SIZE_USDT` (отдельно от базовой)
+
+### Улучшения в Strategy3 (Breakout Short)
+
+**Фильтры входа:**
+
+- **Strength filter**: `S3_MIN_STRENGTH` (4) — пропускает слабые уровни
+- **NATR 5M filter**: `S3_MAX_NATR_5M` (0.03 = 3%) — избегает высокой волатильности (шума)
+  - `_calc_natr_5m()` вычисляет ATR(14)/close × 100
+  - Логируется на всех сделках в entry_context независимо от фильтра
+- **Исключение pump_base и consolidation_base** полностью
+
+**Trailing stop до TP1** (адаптирован для short):
+  - Для short: пик = минимум цены (low), стоп = low_peak × (1 + offset)
+  - Активируется при favorable move ≥ 0.5% вниз
+  - Offset = 0.3%
+  - Срабатывает по current_price ≥ trailing_stop (цена вернулась вверх)
+
+**TP1 логика переработана**:
+  - Удалены трейлинг-по-ATR логики после TP1
+  - Теперь: TP1 → trailing активируется, затем trailing stop только на second половине
+
+**Entry context расширен**: добавлены trades_per_min, natr_5m_at_entry
+
+### Улучшения в price_tracker.py
+
+**Восстановление трекеров при рестарте**:
+
+- `resume_post_exit_trackers()` вызывается из `run_strategies()` перед стартом
+- Находит закрытые сделки без post_exit данных, которые находятся в 30-минутном окне отслеживания
+- Перезапускает трекер для каждой, восстанавливая их из памяти event loop
+- Guard: `_resume_task_ids`, `_resume_tasks` — защита от GC и дедупликации
+
+### Обновление в base_strategy.py
+
+- **Интегрирована функция** `_send_close_with_chart()` для отправки чартов при закрытии (fallback на текст при ошибке)
+- **Флаг `_send_open_message`**: теперь не абстрактный, каждая стратегия может переопределить со своими параметрами
+- **Импорт**: добавлен `send_close_with_chart` из `bot.telegram`
+
+### Обновление в strategy_runner.py
+
+- Импортирован `Strategy4BreakoutLong`
+- Инициализирована как четвёртая стратегия в `run_strategies()`
+- Сканер запускается явно: `strategies[-1].start_scanner()`
+
+---
 
 ## Общая схема
 
@@ -26,7 +132,8 @@ data.collector
   |              +--> trading.event_bus
   |                       |
   |                       +--> trading.strategy_runner
-  |                               +--> S1/S2/S3/S4 paper strategies
+  |                               +--> S1/S2/S3 monitor-driven strategies
+  |                               +--> S4 autonomous scanner (self-monitoring)
   |                               +--> trading.trade_log / trades.db
   |
   +--> web_server.py + dashboard.html
@@ -81,14 +188,14 @@ mark/
 
   trading/
     event_bus.py            # async очередь событий monitor -> strategies
-    base_strategy.py        # общий каркас paper strategies
-    strategy1_bounce.py     # S1 Bounce
-    strategy2_limit_grid.py # S2 Limit Grid
-    strategy3_breakout.py   # S3 Breakout short/continuation
-    strategy4_breakout_long.py # S4 Breakout Long
-    strategy_runner.py      # запуск стратегий, price loop, timeout checker
+    base_strategy.py        # общий каркас paper strategies (обновлено 11.06)
+    strategy1_bounce.py     # S1 Bounce (с trailing stop до TP1)
+    strategy2_limit_grid.py # S2 Limit Grid (полная переработка TP/SL/trailing)
+    strategy3_breakout.py   # S3 Breakout short/continuation (с NATR и strength фильтром)
+    strategy4_breakout_long.py # S4 Breakout Long (новая, 11.06)
+    strategy_runner.py      # запуск стратегий, price loop, timeout checker (обновлено 11.06)
     trade_log.py            # SQLite CRUD сделок и статистики
-    price_tracker.py        # post-exit отслеживание цены
+    price_tracker.py        # post-exit отслеживание цены (с resume после рестарта)
 ```
 
 ## Технологии
@@ -138,7 +245,7 @@ TELEGRAM_CHAT_ID=...
 - состояние слабых касаний;
 - метрики pump phase: high/base/time, broken levels, last bounce, health, phase.
 
-`models.LevelData` описывает уровень: цена, тип, сторона `support/resistance`, сила, verdict, причины, ATR/volume/approach признаки, кластерность, sweep/broken/history flags.
+`models.LevelData` описывает уровень: цена, тип, сторона `support/resistance`, сила, verdict, причины, ATR/volume/approach признаки, кластеры.
 
 `StateManager` держит все `SymbolState` и умеет отменять задачи по символу или глобально.
 
@@ -202,7 +309,7 @@ TELEGRAM_CHAT_ID=...
 - weak/confirmed breakout;
 - complications: engulfing, level broken, volume trend.
 
-При bounce или breakout монитор может инициировать поиск следующего уровня через `main.py`: сопротивление после отскока или следующий уровень после пробоя.
+При bounce или breakout монитор может инициировать поиск следующего уровня через `main.py`: сопротивление после отскока, новая база для памп-фазы.
 
 ## Trading subsystem
 
@@ -214,14 +321,14 @@ Paper trading работает отдельно от сигналов, чере�
 - `trade_log.py` хранит сделки, события, экстремумы и статистику в `trades.db`.
 - `price_tracker.py` отслеживает движение цены после выхода, чтобы оценивать качество закрытий.
 
-Стратегии:
+### Стратегии
 
-| Стратегия | Идея |
-| --- | --- |
-| S1 Bounce | вход от сильного уровня при тихом касании и высокой `p_bounce` |
-| S2 Limit Grid | сетка лимитных ордеров у уровня при подходящем pressure/volume контексте |
-| S3 Breakout | вход на подтвержденном пробое с объемом |
-| S4 Breakout Long | long-сценарий пробоя/продолжения по отдельным правилам |
+| Стратегия | Идея | Статус (11.06) |
+| --- | --- | --- |
+| S1 Bounce | вход от сильного уровня при тихом касании и высокой `p_bounce` | ✅ С trailing stop до TP1 |
+| S2 Limit Grid | сетка лимитных ордеров у уровня при подходящем pressure/volume контексте | ✅ Полная переработка TP/SL/trailing |
+| S3 Breakout | вход на подтвержденном пробое с объемом | ✅ С strength/NATR фильтром и trailing |
+| S4 Breakout Long | лонг-пробой resistance вверх, самостоятельный сканер | ✨ Новая (11.06) |
 
 ## Telegram
 
@@ -282,7 +389,7 @@ JSON-файлы:
 - label encoder и map типов уровней;
 - thresholds и размер последнего train dataset.
 
-`analysis.ml_score` лениво загружает модели, защищает reload через lock и применяет score к каждому уровню. `main.py` содержит `_ml_retrain_loop`, который переобучает модели при накоплении новых данных.
+`analysis.ml_score` лениво загружает модели, защищает reload через lock и применяет score к каждому уровню. `main.py` содержит `_refresh_ml_loop()` для периодического переобучения.
 
 ## Важные интервалы и пороги
 
@@ -302,6 +409,14 @@ JSON-файлы:
 | `STRATEGY_POSITION_SIZE_USDT` | 100 USDT |
 | `STRATEGY_MAX_OPEN_TRADES` | 3 на стратегию |
 | `STRATEGY_TRADE_TIMEOUT_MINUTES` | 60 минут |
+
+**S1 (Bounce)**: `S1_TRAILING_ACTIVATE_PCT=0.5%`, `S1_TRAILING_OFFSET_PCT=0.3%`
+
+**S2 (Limit Grid)**: `S2_TRAILING_PCT=0.5%`, `S2_TP2_ATR_MULT=5.0`, `S2_FULL_GRID_TP_PCT=0.15%`
+
+**S3 (Breakout Short)**: `S3_MIN_STRENGTH=4`, `S3_MAX_NATR_5M=0.03`, `S3_TRAILING_ACTIVATE_PCT=0.5%`, `S3_TRAILING_OFFSET_PCT=0.3%`
+
+**S4 (Breakout Long)**: `S4_MIN_BREAKOUT_VOL_RATIO=2.4`, `S4_MAX_P_BOUNCE=0.65`, `S4_SL_ATR_MULT=1.5`, `S4_TP1_ATR_MULT=1.5`, `S4_TP2_ATR_MULT=3.0`, `S4_TRAILING_ATR_MULT=1.5`
 
 ## Запуск
 
@@ -330,6 +445,7 @@ python export_to_csv.py
 
 ## Точки внимания
 
-- В рабочем дереве есть сгенерированные файлы (`*.db`, `*.csv`, `__pycache__`, модели `*.pkl`), их не стоит смешивать с документационными изменениями в одном коммите.
-- Название архитектурного файла сейчас `ARCHITECTURE (2).md`; README ссылается на `ARCHITECTURE.md`, поэтому ссылку стоит поправить или переименовать файл отдельным шагом.
-- В части исходников комментарии уже содержат mojibake, но новый архитектурный документ сохранен как нормальный UTF-8.
+- В рабочем дереве есть сгенерированные файлы (`*.db`, `*.csv`, `__pycache__`, модели `*.pkl`), их не стоит смешивать с документацией.
+- Название архитектурного файла `ARCHITECTURE.md`; README ссылается на файл, убедитесь в консистентности ссылок.
+- При развертывании Railway используется `Procfile` с `worker: python main.py`.
+- Strategy4 запускает собственный сканер — убедитесь, что `strategy_runner.py` вызывает `.start_scanner()`.
