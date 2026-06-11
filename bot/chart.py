@@ -36,6 +36,11 @@ def generate_close_chart(
 
     data = candles[-n_candles:] if len(candles) > n_candles else candles
 
+    # Normalize "time" field: collector uses "open_time", chart expects "time"
+    for c in data:
+        if "time" not in c and "open_time" in c:
+            c["time"] = c["open_time"]
+
     # --- DataFrame ---
     df = pd.DataFrame(data)
     # time может быть timestamp в мс или с
@@ -155,9 +160,10 @@ def generate_close_chart(
 
     # --- X-axis ticks ---
     tick_step = max(1, n // 8)
-    ax_v.set_xticks(x[::tick_step])
+    tick_indices = list(range(0, n, tick_step))
+    ax_v.set_xticks(x[tick_indices])
     ax_v.set_xticklabels(
-        [df.index[i].strftime("%H:%M") for i in range(0, n, tick_step)],
+        [df.index[i].strftime("%H:%M") for i in tick_indices],
         color="#888888", fontsize=7,
     )
     plt.setp(ax_c.get_xticklabels(), visible=False)

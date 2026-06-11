@@ -744,7 +744,7 @@ async def _do_analyze(message: Message, symbol: str):
         broken_levels = [lvl for lvl in all_levels if lvl["level"] > current_price]
         for lvl in broken_levels:
             lvl["symbol"] = symbol
-            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr) if atr > 0 else 0
+            lvl["approach"] = _count_approaches(symbol, lvl["level"], atr)[0] if atr > 0 else 0
             # считаем strength без штрафа за пробой — уровень УЖЕ пробит, это ожидаемо
             lvl_copy = dict(lvl)
             lvl_copy["was_broken"] = False
@@ -810,7 +810,7 @@ async def _do_analyze(message: Message, symbol: str):
 
     for lvl in filtered:
         lvl["symbol"] = symbol
-        lvl["approach"] = _count_approaches(symbol, lvl["level"], atr) if atr > 0 else 1
+        lvl["approach"] = _count_approaches(symbol, lvl["level"], atr)[0] if atr > 0 else 1
 
     # Python pre-calculates strength and history — Claude uses this as context
     from analysis.trigger import get_level_history
@@ -1062,7 +1062,7 @@ async def _do_check(message: Message, symbol: str, level: float):
         level = real_level
 
     atr = calculate_atr(symbol)
-    approach = _count_approaches(symbol, level, atr) if atr > 0 else 1
+    approach = _count_approaches(symbol, level, atr)[0] if atr > 0 else 1
     vol_ratio = _calc_vol_ratio(symbol)
     history = get_level_history(symbol, level, atr) if atr > 0 else {}
 
@@ -1097,7 +1097,7 @@ async def _do_check(message: Message, symbol: str, level: float):
         if abs(other["level"] - level) <= zone_radius and other["level"] != level
     ]
     zone_approaches = sum(
-        _count_approaches(symbol, other["level"], atr)
+        _count_approaches(symbol, other["level"], atr)[0]
         for other in nearby
     ) if atr > 0 else 0
 
@@ -1353,6 +1353,7 @@ async def cmd_stats(message: Message):
         (1, "S1 Bounce"),
         (2, "S2 Grid"),
         (3, "S3 Breakout"),
+        (4, "S4 Breakout Long"),
     ]
 
     for strategy_id, label in strategy_labels:
@@ -1402,11 +1403,16 @@ async def send_photo_with_caption(image_bytes: bytes, caption: str):
 async def send_close_with_chart(text: str, symbol: str, entry_price=None, exit_price=None, level=None):
     try:
         from data.collector import candles_1m
-        from bot.chart import generate_close_chart
+        from analysis.chart import generate_close_chart
         c1m = candles_1m.get(symbol, [])
         if c1m:
+            # Normalize candle field: collector stores "open_time", chart expects "time"
+            normalized = [
+                {**c, "time": c.get("time", c.get("open_time", 0))}
+                for c in c1m
+            ]
             img = generate_close_chart(
-                symbol=symbol, candles=c1m,
+                symbol=symbol, candles=normalized,
                 entry_price=entry_price, exit_price=exit_price, level=level,
             )
             if img:
