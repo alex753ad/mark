@@ -9,6 +9,7 @@ import time
 invalid_symbols: set[str] = set()
 
 candles_15m: dict[str, list[dict]] = {}
+candles_5m: dict[str, list[dict]] = {}
 candles_1m: dict[str, list[dict]] = {}
 
 # aggTrades delta buffer: {symbol: deque of (timestamp, qty, is_buy_taker)}
@@ -29,16 +30,19 @@ def _parse_kline(kline) -> dict:
         "close": float(kline[4]),
         "volume": float(kline[5]),
         "close_time": int(kline[6]),
+        "trades": int(kline[8]),  # number of trades in candle (Binance field n)
     }
 
 
 async def _fetch_history(client: AsyncClient, symbol: str) -> bool:
     try:
         raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=MAX_CANDLES)
+        raw_5m = await client.futures_klines(symbol=symbol, interval="5m", limit=MAX_CANDLES)
         raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=MAX_CANDLES)
     except BinanceAPIException:
         invalid_symbols.add(symbol)
         candles_15m.pop(symbol, None)
+        candles_5m.pop(symbol, None)
         candles_1m.pop(symbol, None)
         logger.warning("Symbol delisted or invalid: %s", symbol)
         try:
@@ -53,6 +57,7 @@ async def _fetch_history(client: AsyncClient, symbol: str) -> bool:
         logger.exception("Failed to fetch history for %s", symbol)
         return False
     candles_15m[symbol] = [_parse_kline(k) for k in raw_15m]
+    candles_5m[symbol] = [_parse_kline(k) for k in raw_5m]
     candles_1m[symbol] = [_parse_kline(k) for k in raw_1m]
     return True
 
@@ -60,6 +65,7 @@ async def _fetch_history(client: AsyncClient, symbol: str) -> bool:
 async def _update(client: AsyncClient, symbol: str):
     try:
         raw_15m = await client.futures_klines(symbol=symbol, interval="15m", limit=2)
+        raw_5m = await client.futures_klines(symbol=symbol, interval="5m", limit=2)
         raw_1m = await client.futures_klines(symbol=symbol, interval="1m", limit=2)
     except Exception:
         logger.warning("Failed to update candles for %s", symbol)
@@ -73,6 +79,15 @@ async def _update(client: AsyncClient, symbol: str):
             candles_15m[symbol].append(parsed)
             if len(candles_15m[symbol]) > MAX_CANDLES:
                 candles_15m[symbol] = candles_15m[symbol][-MAX_CANDLES:]
+
+    for kline in raw_5m:
+        parsed = _parse_kline(kline)
+        if candles_5m[symbol] and candles_5m[symbol][-1]["open_time"] == parsed["open_time"]:
+            candles_5m[symbol][-1] = parsed
+        else:
+            candles_5m[symbol].append(parsed)
+            if len(candles_5m[symbol]) > MAX_CANDLES:
+                candles_5m[symbol] = candles_5m[symbol][-MAX_CANDLES:]
 
     for kline in raw_1m:
         parsed = _parse_kline(kline)

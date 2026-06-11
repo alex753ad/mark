@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS level_outcomes (
     vol_ratio_on_approach REAL,
     touches_count INTEGER,
     result TEXT,
-    duration_minutes INTEGER,
+    duration_minutes REAL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -50,6 +50,12 @@ _NEW_COLUMNS = [
     ("btc_change_1m", "REAL"),
     ("funding_rate", "REAL"),
     ("monitoring_age_minutes", "REAL"),
+    ("trades_per_min_1m", "REAL"),   # avg trades/min за последнюю 1М свечу при касании
+    ("trades_per_min_5m", "REAL"),   # avg trades/min за последние 5 свечей при касании
+    ("trades_per_min_15m", "REAL"),  # avg trades/min за последние 15 свечей при касании
+    ("trades_increasing", "INTEGER"),  # 1 если trades_per_min_1m > trades_per_min_5m > trades_per_min_15m
+    # BUG-4: duration_minutes declared REAL in schema; SQLite stores it correctly regardless
+    # of legacy INTEGER declaration — no ALTER needed, new writes will be REAL seconds.
 ]
 
 
@@ -128,6 +134,10 @@ async def save_level_outcome(
     btc_change_1m: float = None,
     funding_rate: float = None,
     monitoring_age_minutes: float = None,
+    trades_per_min_1m: float = None,
+    trades_per_min_5m: float = None,
+    trades_per_min_15m: float = None,
+    trades_increasing: int = None,
 ) -> None:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -136,12 +146,14 @@ async def save_level_outcome(
                 (symbol, level, level_type, strength_claude, approach_type,
                  vol_ratio_on_approach, touches_count, result, duration_minutes,
                  outcome, approach_style, vol_ratio_at_touch, atr_ratio,
-                 fill_depth_pct, btc_change_1m, funding_rate, monitoring_age_minutes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 fill_depth_pct, btc_change_1m, funding_rate, monitoring_age_minutes,
+                 trades_per_min_1m, trades_per_min_5m, trades_per_min_15m, trades_increasing)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (symbol, level, level_type, strength, approach_type,
                  vol_ratio, touches, result, duration,
                  outcome, approach_style, vol_ratio_at_touch, atr_ratio,
-                 fill_depth_pct, btc_change_1m, funding_rate, monitoring_age_minutes),
+                 fill_depth_pct, btc_change_1m, funding_rate, monitoring_age_minutes,
+                 trades_per_min_1m, trades_per_min_5m, trades_per_min_15m, trades_increasing),
             )
             await db.commit()
     except Exception:
