@@ -131,11 +131,17 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     )
     df["vol_capped"] = df["vol_ratio_at_touch"].clip(upper=20).fillna(1.0)
     df["atr_capped"] = df["atr_ratio"].clip(upper=20).fillna(1.0)
-    # monitoring_age_minutes — bounce ~5 мин, breakout ~131 мин; cap=300
-    df["age_capped"] = df["monitoring_age_minutes"].fillna(0).clip(upper=300).astype(float)
-    # FIX BUG-5: monitoring_age_hours удалён из признаков — дублировал age_capped (age_min/60),
-    # при этом в history.db отсутствовал у ~95% записей → всегда 0 при обучении,
-    # но считался реально при инференсе → train/inference skew.
+    # BUG-4 fix: monitoring_age_minutes now stores SECONDS (was int minutes).
+    # Convert to minutes here so the model feature is still in minutes.
+    # Old records had int minutes (0 for <60s); new records have seconds.
+    # Heuristic: values >= 300 are almost certainly seconds (>5 min as minutes is unrealistic
+    # since cap is 300 min = 5h, but seconds up to ~18000 are valid). We divide by 60
+    # only for new-format records. Old records are unaffected (they were already 0 mostly).
+    age_raw = df["monitoring_age_minutes"].fillna(0).astype(float)
+    # Values > 300 are in seconds (new format); ≤ 300 are in minutes (old format, keep as-is).
+    # This handles mixed old/new data in the DB gracefully.
+    age_in_minutes = age_raw.where(age_raw <= 300, age_raw / 60)
+    df["age_capped"] = age_in_minutes.clip(upper=300)
 
     age_nonzero_pct = (df["age_capped"] > 0).mean() * 100
     if age_nonzero_pct < 30:
@@ -187,6 +193,7 @@ def train(db_path: str, out_dir: str) -> None:
         min_samples_leaf=5,
         random_state=42,
         class_weight="balanced",
+        oob_score=True,
         n_jobs=-1,
     )
     clf.fit(X, y_clf)
@@ -208,14 +215,18 @@ def train(db_path: str, out_dir: str) -> None:
     print()
 
     # ── Калибровка порогов ────────────────────────────────────────────
-    # Пороги выставляем по P25/P75 чтобы ~25% записей получали +1 и ~25% получали -1.
-    all_proba = clf.predict_proba(X)[:, bounce_idx]
+    # Пороги считаем по OOB-предсказаниям (out-of-bag), а не по трейну.
+    # RandomForest на трейне даёт p_bounce близко к 1.0 для знакомых записей,
+    # поэтому P75 на трейне улетает к 0.999 и ml_delta=+1 становится недостижимым.
+    # OOB: каждое дерево предсказывает только те записи, на которых не обучалось —
+    # честная оценка без переобучения, без потери обучающих данных.
+    all_proba = clf.oob_decision_function_[:, bounce_idx]
     p25 = np.percentile(all_proba, 25)
     p75 = np.percentile(all_proba, 75)
-    print(f"p_bounce percentiles: P25={p25:.3f}  P75={p75:.3f}")
+    print(f"p_bounce OOB percentiles: P25={p25:.3f}  P75={p75:.3f}")
     print(f"  → пороги для ml_score.py: верхний={p75:.2f}  нижний={p25:.2f}")
-    if not (0.50 <= p75 <= 0.99):
-        print(f"  ⚠️  P75={p75:.3f} за пределами ожидаемого диапазона 0.50–0.99")
+    if not (0.50 <= p75 <= 0.95):
+        print(f"  ⚠️  P75={p75:.3f} за пределами ожидаемого диапазона 0.50–0.95")
     print()
 
     # ── Классификатор скорости breakout (clf2) ────────────────────────

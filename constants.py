@@ -52,6 +52,11 @@ SCREENER_AUTO_INTERVAL_SECONDS = 600  # Интервал автоскринер�
 LOW_VOLUME_FADE_CANDLES = 4        # Сколько подряд 15М свечей проверять
 LOW_VOLUME_FADE_THRESHOLD = 400_000  # Порог объёма ($) каждой из N свечей
 
+# Monitor health — удаление монеты из мониторинга при потере активности
+MONITOR_HEALTH_INTERVAL_SECONDS = 60   # Интервал проверки здоровья мониторов
+MONITOR_MIN_NATR_5M = 0.8              # Минимальный NATR(5m, 14 баров) для удержания в мониторинге
+MONITOR_MIN_1M_TRADES = 200            # Минимум сделок в последней закрытой 1m свече
+
 # API limits
 CLAUDE_MAX_CONCURRENT_REQUESTS = 2  # Максимум параллельных запросов к Claude API
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"  # Исправленный ID модели Haiku
@@ -89,8 +94,8 @@ STRATEGY_TRADE_TIMEOUT_MINUTES: float = 60.0  # таймаут позиции в
 
 # Strategy 1 (Bounce)
 S1_MIN_STRENGTH: int = 4
-S1_MIN_P_BOUNCE: float = 0.70
-S1_MIN_VOL_RATIO: float = 1.5   # минимальный vol_ratio при любом approach_style для входа (не используется, оставлен для совместимости)
+S1_MIN_P_BOUNCE: float = 0.86
+S1_MIN_VOL_RATIO: float = 1.5   # DEPRECATED: не используется; используй S1_MAX_VOL_RATIO
 S1_MAX_VOL_RATIO: float = 1.2   # S1 входит только при тихом касании уровня
 S1_TP1_RR: float = 1.5    # risk:reward для TP1
 S1_TP2_RR: float = 3.0    # risk:reward для TP2
@@ -99,7 +104,8 @@ S1_TP2_RR: float = 3.0    # risk:reward для TP2
 S2_MIN_STRENGTH: int = 3
 S2_MIN_P_BOUNCE: float = 0.60
 S2_PRESSURE_COOLDOWN_SECONDS: int = 300   # не входить N сек после pressure события
-S2_GRID_ORDERS: int = 5
+S2_GRID_ORDERS: int = 10
+S2_POSITION_SIZE_USDT: float = 200.0   # 10 ордеров × 20 USDT
 
 # Strategy 3 (Breakout)
 S3_MIN_BREAKOUT_VOL_RATIO: float = 2.4
@@ -109,6 +115,8 @@ S3_TP1_ATR_MULT: float = 2.0
 S3_TP2_ATR_MULT: float = 4.0
 S3_SL_ATR_MULT: float = 0.5
 S3_MIN_TRADE_DURATION_MINUTES: float = 5.0   # не закрывать по SL/TP раньше этого времени (было 45.0)
+S3_MIN_STRENGTH  = 4      # фильтр входа по strength (задача 1)
+S3_MAX_NATR_5M   = 0.0    # выключен пока нет статы; поставить ~0.03 после накопления данных
 
 # ── Pump Phase Detection ──────────────────────────────────────────
 PUMP_HEALTH_MIN_SCORE: int = 50           # min score to allow monitoring

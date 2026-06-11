@@ -148,6 +148,83 @@ async def handle_events(request: web.Request) -> web.Response:
         )
 
 
+async def handle_signals(request: web.Request) -> web.Response:
+    """Last 100 events across all symbols (global signal feed)."""
+    try:
+        import aiosqlite
+        from data.history import DB_PATH as HISTORY_DB_FILE
+        async with aiosqlite.connect(HISTORY_DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT symbol, event_type, details, created_at
+                   FROM symbol_events ORDER BY created_at DESC LIMIT 100"""
+            ) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+        return web.Response(
+            text=json.dumps(rows, ensure_ascii=False, default=str),
+            content_type="application/json",
+        )
+    except Exception as e:
+        logger.exception("Error fetching signals")
+        return web.Response(
+            text=json.dumps({"error": str(e)}),
+            content_type="application/json", status=500,
+        )
+
+
+async def handle_open_trades(request: web.Request) -> web.Response:
+    """All currently open trades."""
+    try:
+        from trading.trade_log import get_open_trades
+        trades = await get_open_trades()
+        return web.Response(
+            text=json.dumps(trades, ensure_ascii=False, default=str),
+            content_type="application/json",
+        )
+    except Exception as e:
+        logger.exception("Error fetching open trades")
+        return web.Response(
+            text=json.dumps({"error": str(e)}),
+            content_type="application/json", status=500,
+        )
+
+
+async def handle_trades_history(request: web.Request) -> web.Response:
+    """Closed trades + per-strategy stats."""
+    try:
+        import aiosqlite
+        from trading.trade_log import DB_PATH, get_trade_stats
+        strategy_id = request.rel_url.query.get("strategy_id")
+        limit = min(int(request.rel_url.query.get("limit", 100)), 1000)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            if strategy_id:
+                q = ("SELECT * FROM trades WHERE status='closed' AND strategy_id=?"
+                     " ORDER BY exit_time DESC LIMIT ?")
+                async with db.execute(q, (int(strategy_id), limit)) as cur:
+                    trades = [dict(r) for r in await cur.fetchall()]
+            else:
+                q = "SELECT * FROM trades WHERE status='closed' ORDER BY exit_time DESC LIMIT ?"
+                async with db.execute(q, (limit,)) as cur:
+                    trades = [dict(r) for r in await cur.fetchall()]
+
+        stats = {}
+        for sid in [1, 2, 3, 4]:
+            stats[sid] = await get_trade_stats(sid)
+
+        return web.Response(
+            text=json.dumps({"trades": trades, "stats": stats}, ensure_ascii=False, default=str),
+            content_type="application/json",
+        )
+    except Exception as e:
+        logger.exception("Error fetching trade history")
+        return web.Response(
+            text=json.dumps({"error": str(e)}),
+            content_type="application/json", status=500,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
@@ -155,9 +232,12 @@ async def handle_events(request: web.Request) -> web.Response:
 async def start_web_server(host: str = "127.0.0.1", port: int = 8080) -> None:
     """Start aiohttp server. Designed to run inside asyncio.gather()."""
     app = web.Application()
-    app.router.add_get("/",                    handle_index)
-    app.router.add_get("/api/state",           handle_state)
-    app.router.add_get("/api/events/{symbol}", handle_events)
+    app.router.add_get("/",                        handle_index)
+    app.router.add_get("/api/state",               handle_state)
+    app.router.add_get("/api/events/{symbol}",     handle_events)
+    app.router.add_get("/api/signals",             handle_signals)
+    app.router.add_get("/api/open_trades",         handle_open_trades)
+    app.router.add_get("/api/trades_history",      handle_trades_history)
 
     runner = web.AppRunner(app)
     await runner.setup()

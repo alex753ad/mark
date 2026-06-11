@@ -20,14 +20,18 @@ from constants import (
     PROXIMITY_ALERT_COOLDOWN_SECONDS,
     PUMP_HEALTH_MIN_SCORE,
     PUMP_HEALTH_CAUTION_SCORE,
+    MONITOR_HEALTH_INTERVAL_SECONDS,
+    MONITOR_MIN_NATR_5M,
+    MONITOR_MIN_1M_TRADES,
 )
 from models import state_manager
 from data.collector import start_collector, candles_1m
 from analysis.trigger import (
-    check_trigger, get_approaching_levels, calculate_strength,
+    check_trigger, get_approaching_levels,
     detect_approach_style, calculate_atr_ratio, get_vol_ratio_current,
     get_btc_change_1m, get_funding_rate,
 )
+from utils import calculate_strength, calc_atr as _calc_atr_util
 from analysis.monitor import start_monitor
 from bot.telegram import send_message, start_bot
 from config import token_registry, blacklist, validate_config, TRIGGER_TIMES_FILE, ACTIVE_MONITORS_FILE
@@ -45,9 +49,15 @@ def save_active_monitors():
         for task_key in state.tasks:
             parsed = state.parse_task_key(task_key)
             if parsed is not None:
+                sym, lvl = parsed
+                # Определяем level_side по позиции цены: уровень выше цены = resistance
+                c1m_data = candles_1m.get(sym, [])
+                cur = c1m_data[-1]["close"] if c1m_data else 0
+                side = "resistance" if cur > 0 and lvl > cur else "support"
                 monitors.append({
-                    "symbol": parsed[0],
-                    "level": parsed[1],
+                    "symbol": sym,
+                    "level": lvl,
+                    "level_side": side,
                 })
     try:
         with open(ACTIVE_MONITORS_FILE, "w") as f:
@@ -148,7 +158,7 @@ async def _auto_screener_loop():
                 from binance import AsyncClient
                 from data.collector import _parse_kline, candles_1m, candles_15m
                 from analysis.level_builder import build_levels
-                from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
+                from analysis.trigger import calculate_atr, get_level_history, _count_approaches
                 from analysis.claude_strength import calculate_strength_with_claude
                 import json as _json
 
@@ -208,6 +218,7 @@ async def _auto_screener_loop():
                                 _style_screener = detect_approach_style(sym)
                                 for lvl in supports:
                                     lvl["approach_style"] = _style_screener
+                                    lvl["monitoring_age_minutes"] = 0.0  # FIX BUG-M8: новый символ, age = 0
                                     apply_ml_to_level(lvl)
                             except Exception as _e:
                                 logger.warning("ml_score failed in screener: %s", _e)
@@ -227,7 +238,8 @@ async def _auto_screener_loop():
                                               level_type=nearest["type"],
                                               strength=nearest["strength"],
                                               p_bounce=nearest.get("p_bounce", 0.0),
-                                              expected_depth=nearest.get("expected_depth", 0.0))
+                                              expected_depth=nearest.get("expected_depth", 0.0),
+                                              approach=nearest.get("approach", 0))
                                 )
                                 sym_state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
                                 sym_state.phase = "phase2"
@@ -264,6 +276,12 @@ async def _auto_screener_loop():
 
 # Global set of symbols currently being processed in phase1
 _building_levels: set[str] = set()
+
+# Cooldown for "proximity" events published to the strategy event_bus (S1/S2/S3).
+# Independent from PROXIMITY_ALERT_COOLDOWN_SECONDS (Telegram alert, ~once per session) —
+# strategies need repeated proximity events as price keeps approaching the level.
+PROXIMITY_EVENT_COOLDOWN_SECONDS = 15
+_proximity_event_sent: dict[str, float] = {}  # key: task_key -> timestamp of last event_bus publish
 
 # Stores the level that was replaced by a closer one during _run_phase1.
 # After breakout of the new level, this level becomes the next monitoring target.
@@ -325,8 +343,13 @@ async def _run_phase1(symbol: str):
 
     _building_levels.add(symbol)
     try:
+        # FIX BUG-M6: сброс кэша в начале phase1 — чтобы при исключении
+        # _proximity_loop не итерировал по устаревшим уровням
+        from bot.telegram import _last_analysis_cache
+        _last_analysis_cache.pop(symbol, None)
+
         from analysis.level_builder import build_levels
-        from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
+        from analysis.trigger import calculate_atr, get_level_history, _count_approaches
         from analysis.pump_phase import detect_pump_peak, pump_health_score, get_pump_phase, calc_correction_pct
 
         c1m = candles_1m.get(symbol, [])
@@ -558,6 +581,7 @@ async def _run_phase1(symbol: str):
             nearest["atr_ratio"] = real_atr_ratio
             nearest["vol_ratio"] = real_vol_ratio
             nearest["approach_style"] = detect_approach_style(symbol)
+            nearest["monitoring_age_minutes"] = 0.0  # FIX BUG-M8: уровень только что найден
             from analysis.ml_score import apply_ml_to_level
             apply_ml_to_level(nearest)
         except Exception as _e:
@@ -597,7 +621,8 @@ async def _run_phase1(symbol: str):
                        level_type=nearest["type"],
                        strength=nearest["strength"],
                        p_bounce=nearest.get("p_bounce", 0.0),
-                       expected_depth=nearest.get("expected_depth", 0.0))
+                       expected_depth=nearest.get("expected_depth", 0.0),
+                       approach=nearest.get("approach", 0))
         )
         state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
         state.phase = "phase2"
@@ -635,7 +660,8 @@ async def _monitored(symbol: str, level: float, level_side: str,
                      approach_style: str = None, atr_ratio: float = None,
                      vol_ratio: float = None,
                      p_bounce: float = 0.0,
-                     expected_depth: float = 0.0):
+                     expected_depth: float = 0.0,
+                     approach: int = 0):
     """Monitor a level until breakout or manual stop."""
     state = state_manager.get_state(symbol)
     task_key = state.make_task_key(level)
@@ -658,6 +684,10 @@ async def _monitored(symbol: str, level: float, level_side: str,
     save_active_monitors()
 
     try:
+        # on_bounce: при отбое от support немедленно стартуем resistance-монитор,
+        # не дожидаясь завершения текущего монитора.
+        _on_bounce = _start_resistance_after_bounce if level_side == "support" else None
+
         monitor_result = await start_monitor(
             symbol, level, level_side, stop_event,
             approach_style=approach_style,
@@ -667,8 +697,10 @@ async def _monitored(symbol: str, level: float, level_side: str,
             strength=strength,
             p_bounce=p_bounce,
             expected_depth=expected_depth,
+            approach=approach,
+            on_bounce=_on_bounce,
         )
-        duration = int((time.time() - start_time) / 60)
+        duration = round(time.time() - start_time, 1)  # BUG-4 fix: seconds as REAL, not int minutes
 
         if isinstance(monitor_result, dict):
             reason = monitor_result.get("reason")
@@ -713,7 +745,7 @@ async def _monitored(symbol: str, level: float, level_side: str,
                     fill_depth_pct=fill_depth_pct,
                     btc_change_1m=btc_change,
                     funding_rate=funding,
-                    monitoring_age_minutes=float(duration),
+                    monitoring_age_minutes=duration,  # BUG-4: now seconds REAL
                 )
             await update_symbol_profile(symbol)
             logger.info("Level outcome saved",
@@ -770,7 +802,7 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
     If nothing found — check screener and possibly remove symbol.
     """
     from data.collector import candles_1m as _c1m, candles_15m as _c15m
-    from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
+    from analysis.trigger import calculate_atr, get_level_history, _count_approaches
     from bot.telegram import _last_analysis_cache
 
     state = state_manager.get_state(symbol)
@@ -795,8 +827,15 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
     if prev_level and _in_range(prev_level):
         task_key = state.make_task_key(prev_level)
         if task_key not in state.tasks:
+            # FIX BUG-C5: берём параметры из кэша, иначе strength=0, p_bounce=0.0
+            cached_all = _last_analysis_cache.get(symbol, [])
+            _prev_cached = next((l for l in cached_all if l["level"] == prev_level), {})
             task = asyncio.create_task(
-                _monitored(symbol, prev_level, "support")
+                _monitored(symbol, prev_level, "support",
+                           level_type=_prev_cached.get("type", "body_level"),
+                           strength=_prev_cached.get("strength", 0),
+                           p_bounce=_prev_cached.get("p_bounce", 0.0),
+                           expected_depth=_prev_cached.get("expected_depth", 0.0))
             )
             state.add_task(prev_level, task)
             state.phase = "phase2"
@@ -827,6 +866,7 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
             try:
                 from analysis.ml_score import apply_ml_to_level
                 nearest["approach_style"] = detect_approach_style(symbol)
+                nearest["monitoring_age_minutes"] = 0.0  # FIX BUG-M8: новый монитор, age = 0
                 apply_ml_to_level(nearest)
             except Exception as _e:
                 logger.warning("ml_score failed in cache recalc: %s", _e)
@@ -875,6 +915,7 @@ async def _start_next_level_after_breakout(symbol: str, broken_level: float):
             _style_rebuild = detect_approach_style(symbol)
             for lvl in rebuild_candidates:
                 lvl["approach_style"] = _style_rebuild
+                lvl["monitoring_age_minutes"] = 0.0  # FIX BUG-M8: свежий rebuild, age = 0
                 apply_ml_to_level(lvl)
         except Exception as _e:
             logger.warning("ml_score failed in rebuild: %s", _e)
@@ -1011,10 +1052,14 @@ async def _start_resistance_after_bounce(symbol: str, support_level: float) -> N
     if task_key in state.tasks:
         return
 
+    from analysis.trigger import _count_approaches
+    res_approach = _count_approaches(symbol, resistance["level"], atr)[0] if atr > 0 else 0
+
     task = asyncio.create_task(
         _monitored(symbol, resistance["level"], "resistance",
                    level_type=resistance["type"],
-                   strength=resistance.get("strength", 3))
+                   strength=resistance.get("strength", 3),
+                   approach=res_approach)
     )
     state.add_task(resistance["level"], task)
     state.phase = "phase2"
@@ -1102,6 +1147,7 @@ async def _stale_monitor_loop() -> None:
             # Trigger level rebuild for each affected symbol
             for symbol in stale_symbols:
                 if symbol not in _building_levels and token_registry.contains(symbol):
+                    _building_levels.add(symbol)  # FIX BUG-C2: до create_task, иначе _trigger_loop успевает войти
                     await asyncio.sleep(0.3)
                     asyncio.create_task(_run_phase1(symbol))
 
@@ -1159,9 +1205,10 @@ async def _proximity_loop():
                 # Only send alert if:
                 # 1. In proximity zone
                 # 2. Approaching from above
-                # 3. Cooldown passed OR never sent before
-                # 4. Pump is not dead (pump_phase guard)
+                # 3. Pump is not dead (pump_phase guard)
                 _pump_phase_ok = state.pump_phase not in ("dead",)
+
+                # ── Telegram alert: ~раз за сессию мониторинга (24ч cooldown) ──
                 if in_proximity_zone and approaching and cooldown_ok and _pump_phase_ok:
                     await send_message(
                         f"🎯 {symbol} цена в {distance_pct:.2f}% от уровня {level} — готовь ордер"
@@ -1171,6 +1218,15 @@ async def _proximity_loop():
                                symbol=symbol, 
                                level=level, 
                                distance_pct=distance_pct)
+
+                # ── Event bus: отдельный короткий cooldown — стратегиям (S1/S2/S3)
+                # нужно несколько шансов поймать цену в своей зоне входа, а не один
+                # на всю сессию (FIX: S2 не успевал выставить сетку, т.к. единственное
+                # proximity-событие приходило ещё до входа цены в узкую зону грида).
+                last_event_sent = _proximity_event_sent.get(task_key, 0)
+                event_cooldown_ok = (now - last_event_sent) > PROXIMITY_EVENT_COOLDOWN_SECONDS
+                if in_proximity_zone and approaching and event_cooldown_ok and _pump_phase_ok:
+                    _proximity_event_sent[task_key] = now
                     # Publish proximity event to strategy event bus
                     try:
                         from trading.event_bus import publish as _eb_publish
@@ -1205,7 +1261,7 @@ async def _proximity_loop():
                         })
                     except Exception as _eb_e:
                         logger.debug("event_bus publish error (proximity): %s", _eb_e)
-                
+
                 # Reset cooldown if price moved far away (> 5% from level)
                 # This allows re-alerting if price comes back after leaving
                 if distance_pct > 5.0 and task_key in state.proximity_notified:
@@ -1216,6 +1272,11 @@ async def _proximity_loop():
                                    symbol=symbol,
                                    level=level,
                                    distance_pct=distance_pct)
+
+                # Drop event_bus cooldown entry once price is far from the level —
+                # next approach should be free to publish proximity again immediately.
+                if distance_pct > 5.0:
+                    _proximity_event_sent.pop(task_key, None)
 
             # Track touches on weak (unmonitored) levels from cache
             from bot.telegram import _last_analysis_cache
@@ -1337,7 +1398,7 @@ async def _startup_monitoring():
     from binance import AsyncClient
     from data.collector import _parse_kline, candles_1m, candles_15m
     from analysis.level_builder import build_levels
-    from analysis.trigger import calculate_atr, calculate_strength, get_level_history, _count_approaches
+    from analysis.trigger import calculate_atr, get_level_history, _count_approaches
     import json as _json
 
     client = await AsyncClient.create()
@@ -1350,15 +1411,16 @@ async def _startup_monitoring():
             logger.info("Restoring saved monitors", count=len(saved_monitors))
 
             # Group by symbol — only restore the nearest level to current price
+            # Храним (level, level_side) чтобы не терять level_side при группировке
             from collections import defaultdict
-            by_symbol: dict[str, list[float]] = defaultdict(list)
+            by_symbol: dict[str, list[tuple]] = defaultdict(list)
             for entry in saved_monitors:
                 sym   = entry.get("symbol")
                 level = entry.get("level")
                 if sym and level and sym in tokens:
-                    by_symbol[sym].append(float(level))
+                    by_symbol[sym].append((float(level), entry.get("level_side", "support")))
 
-            for sym, levels in by_symbol.items():
+            for sym, level_entries in by_symbol.items():
                 try:
                     if sym not in candles_1m or not candles_1m[sym]:
                         raw_15m = await client.futures_klines(symbol=sym, interval="15m", limit=500)
@@ -1368,7 +1430,9 @@ async def _startup_monitoring():
 
                     c1m = candles_1m.get(sym, [])
                     current_price = c1m[-1]["close"] if c1m else 0
+                    levels = [l for l, _ in level_entries]
                     nearest_level = min(levels, key=lambda l: abs(current_price - l)) if current_price > 0 else levels[0]
+                    saved_side = next((s for l, s in level_entries if l == nearest_level), "support")
 
                     sym_state = state_manager.get_state(sym)
                     task_key  = sym_state.make_task_key(nearest_level)
@@ -1379,18 +1443,48 @@ async def _startup_monitoring():
                             None
                         )
                         strength = 0
+                        p_bounce_restore = 0.0
+                        expected_depth_restore = 0.0
                         if matched:
                             calculate_strength(matched)
                             strength = matched.get("strength", 0)
-                        task = asyncio.create_task(_monitored(sym, nearest_level, "support", strength=strength))
+                            try:
+                                from analysis.ml_score import apply_ml_to_level
+                                matched["approach_style"] = detect_approach_style(sym)
+                                matched["monitoring_age_minutes"] = 0.0
+                                apply_ml_to_level(matched)
+                                p_bounce_restore = matched.get("p_bounce", 0.0)
+                                expected_depth_restore = matched.get("expected_depth", 0.0)
+                            except Exception as _mle:
+                                logger.warning("ml_score failed in restore: %s", _mle)
+                        task = asyncio.create_task(_monitored(sym, nearest_level, saved_side,
+                            strength=strength,
+                            p_bounce=p_bounce_restore,
+                            expected_depth=expected_depth_restore))
                         sym_state.add_task(nearest_level, task, strength=strength)
                         sym_state.phase = "phase2"
+
+                        # Заполняем кэш чтобы _proximity_loop брал корректные p_bounce
+                        if matched:
+                            from bot.telegram import _last_analysis_cache as _lac_restore
+                            existing = _lac_restore.get(sym, [])
+                            if not any(abs(e["level"] - nearest_level) < 0.001 for e in existing):
+                                _lac_restore[sym] = existing + [{
+                                    "level": matched["level"],
+                                    "strength": strength,
+                                    "type": matched.get("type", "body_level"),
+                                    "p_bounce": p_bounce_restore,
+                                    "expected_depth": expected_depth_restore,
+                                }]
+
                         restored_symbols.add(sym)
                         if len(levels) > 1:
                             logger.info("Restored nearest of multiple saved monitors",
                                         symbol=sym, chosen=nearest_level, discarded=[l for l in levels if l != nearest_level])
                         else:
                             logger.info("Monitor restored", symbol=sym, level=nearest_level)
+                        await log_event(sym, "monitoring_start",
+                            f"level={nearest_level} strength={strength} (restored after restart)")
                 except Exception as e:
                     logger.exception("Failed to restore monitor", symbol=sym, error=str(e))
 
@@ -1425,6 +1519,24 @@ async def _startup_monitoring():
                 atr = calculate_atr(symbol)
                 range_limit = current_price * 0.20
 
+                # Initialise pump phase so _run_phase1 / _proximity_loop have correct state
+                try:
+                    from analysis.pump_phase import detect_pump_peak, pump_health_score, get_pump_phase
+                    _ph, _pb, _pht = detect_pump_peak(symbol)
+                    if _ph > 0:
+                        sym_state.pump_high = _ph
+                        sym_state.pump_base_price = _pb
+                        sym_state.pump_high_time = _pht
+                    _health = pump_health_score(sym_state, current_price)
+                    sym_state.pump_health = _health
+                    sym_state.pump_phase = get_pump_phase(_health)
+                    if _health < PUMP_HEALTH_MIN_SCORE:
+                        logger.info("Pump degraded on startup, skipping",
+                                    symbol=symbol, health=_health)
+                        continue
+                except Exception as _pe:
+                    logger.warning("pump_health init failed on startup: %s", _pe)
+
                 supports = [
                     lvl for lvl in all_levels
                     if lvl["level"] < current_price
@@ -1448,6 +1560,7 @@ async def _startup_monitoring():
                     _style_startup = detect_approach_style(symbol)
                     for lvl in supports:
                         lvl["approach_style"] = _style_startup
+                        lvl["monitoring_age_minutes"] = 0.0  # FIX BUG-M8: старт, age = 0
                         apply_ml_to_level(lvl)
                 except Exception as _e:
                     logger.warning("ml_score failed in startup: %s", _e)
@@ -1468,6 +1581,20 @@ async def _startup_monitoring():
                 sym_state = state_manager.get_state(symbol)
                 task_key = sym_state.make_task_key(nearest["level"])
                 if task_key not in sym_state.tasks:
+                    stars = "⭐️" * nearest["strength"]
+                    dist_pct = (current_price - nearest["level"]) / current_price * 100
+                    p_b = nearest.get("p_bounce")
+                    startup_text = (
+                        f"📋 {symbol} мониторинг при старте\n"
+                        f"   {stars} {nearest['level']} — {nearest.get('type', '')} ({dist_pct:.1f}%)\n"
+                    )
+                    if p_b is not None:
+                        e_d = nearest.get("expected_depth")
+                        depth_str = f" | прокол ~{e_d:.1f}%" if e_d is not None else ""
+                        startup_text += f"   🤖 P(отбой): {p_b:.0%}{depth_str}\n"
+                    startup_text += f"   Жду цену на {nearest['level']}..."
+                    await send_message(startup_text)
+
                     task = asyncio.create_task(
                         _monitored(symbol, nearest["level"], "support",
                                   level_type=nearest["type"],
@@ -1477,6 +1604,20 @@ async def _startup_monitoring():
                     )
                     sym_state.add_task(nearest["level"], task, strength=nearest.get("strength", 0))
                     sym_state.phase = "phase2"
+
+                    # Заполняем кэш чтобы _proximity_loop брал корректные strength/p_bounce
+                    from bot.telegram import _last_analysis_cache as _lac_startup
+                    _lac_startup[symbol] = [
+                        {
+                            "level": l["level"],
+                            "strength": l["strength"],
+                            "type": l["type"],
+                            "p_bounce": l.get("p_bounce", 0.0),
+                            "expected_depth": l.get("expected_depth", 0.0),
+                        }
+                        for l in sorted(supports, key=lambda x: x["level"])
+                    ]
+
                     await log_event(symbol, "monitoring_start",
                                    f"level={nearest['level']} strength={nearest['strength']} type={nearest['type']} (startup)")
                     logger.info("Startup monitoring started", symbol=symbol, level=nearest["level"])
@@ -1486,6 +1627,86 @@ async def _startup_monitoring():
                                symbol=symbol, error=str(e))
     finally:
         await client.close_connection()
+
+
+async def _monitor_health_loop():
+    """Every minute: remove symbols that lost activity (low NATR or low trade count).
+
+    Checks for each monitored symbol:
+    - NATR(5m, 14 bars) >= MONITOR_MIN_NATR_5M (1.0%)
+    - Last closed 1m candle trades >= MONITOR_MIN_1M_TRADES (500)
+
+    On failure: stops all monitors, removes from token_registry.
+    Re-entry only via screener (all original criteria apply).
+    """
+    from data.collector import candles_5m, candles_1m as _c1m
+
+    await asyncio.sleep(120)  # дать старту устояться
+    while True:
+        try:
+            for symbol in list(token_registry.get_all()):
+                if blacklist.contains(symbol):
+                    continue
+
+                # ── 1. NATR(5m, 14 bars) ──────────────────────────────
+                c5m = candles_5m.get(symbol, [])
+                if len(c5m) < 2:
+                    continue  # данных нет — не трогаем
+                bars = c5m[-14:] if len(c5m) >= 14 else c5m
+                current_price = float(c5m[-1]["close"])
+                if current_price == 0:
+                    continue
+                atr_5m = sum(float(k["high"]) - float(k["low"]) for k in bars) / len(bars)
+                natr_5m = atr_5m / current_price * 100
+
+                # ── 2. Trades в последней закрытой 1m свече ───────────
+                c1m = _c1m.get(symbol, [])
+                # [-2] — последняя закрытая; [-1] может быть открытой
+                if len(c1m) < 2:
+                    continue
+                last_closed_trades = c1m[-2]["trades"]
+
+                # ── 3. Проверка порогов ───────────────────────────────
+                natr_ok = natr_5m >= MONITOR_MIN_NATR_5M
+                trades_ok = last_closed_trades >= MONITOR_MIN_1M_TRADES
+
+                if natr_ok and trades_ok:
+                    continue
+
+                # ── 4. Удаление ───────────────────────────────────────
+                reasons = []
+                if not natr_ok:
+                    reasons.append(f"NATR(5m)={natr_5m:.2f}% < {MONITOR_MIN_NATR_5M}%")
+                if not trades_ok:
+                    reasons.append(f"сделок(1m)={last_closed_trades} < {MONITOR_MIN_1M_TRADES}")
+
+                # Останавливаем все мониторы символа
+                state = state_manager.get_state(symbol)
+                for task_key in list(state.tasks.keys()):
+                    stop_ev = state.stop_flags.get(task_key)
+                    if stop_ev:
+                        stop_ev.set()
+                    task = state.tasks.get(task_key)
+                    if task and not task.done():
+                        task.cancel()
+                    state.remove_task(task_key)
+                state.phase = "idle"
+
+                token_registry.remove(symbol)
+                await log_event(symbol, "removed", "monitor_health: " + "; ".join(reasons))
+                await send_message(
+                    f"🔕 {symbol} удалён из мониторинга\n"
+                    f"   {chr(10).join(reasons)}\n"
+                    f"   Вернётся при повторном прохождении скринера"
+                )
+                logger.info("Symbol removed by monitor health check",
+                            symbol=symbol, natr_5m=round(natr_5m, 2),
+                            trades_1m=last_closed_trades)
+
+        except Exception:
+            logger.exception("Error in monitor health loop")
+
+        await asyncio.sleep(MONITOR_HEALTH_INTERVAL_SECONDS)
 
 
 async def _ml_retrain_loop():
@@ -1540,6 +1761,7 @@ async def main():
     logger.info("Starting trading bot...")
 
     from trading.strategy_runner import run_strategies
+    from web_server import start_web_server
 
     # Start all components
     await asyncio.gather(
@@ -1550,8 +1772,10 @@ async def main():
         _auto_screener_loop(),
         _startup_monitoring(),
         _stale_monitor_loop(),
+        _monitor_health_loop(),
         _ml_retrain_loop(),
         run_strategies(),
+        start_web_server(),
     )
 
 

@@ -1,10 +1,13 @@
 """Logging configuration with structured logging support."""
 
+import os
 import sys
 from loguru import logger
 
 # Remove default handler
 logger.remove()
+
+os.makedirs("logs", exist_ok=True)
 
 # Console handler - simple format for readability
 logger.add(
