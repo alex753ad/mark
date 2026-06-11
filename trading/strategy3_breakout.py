@@ -17,9 +17,17 @@ from constants import (
     S3_TP2_ATR_MULT,
     S3_SL_ATR_MULT,
     S3_MIN_TRADE_DURATION_MINUTES,
+    S3_MIN_STRENGTH,       # новый: минимальный strength для входа (рекомендация: 4)
+    S3_MAX_NATR_5M,        # новый: максимальный NATR 5м для входа (рекомендация: 0.03)
 )
-from data.collector import candles_1m, get_delta
+from data.collector import candles_1m, candles_5m, get_delta
 from logger import logger
+
+# Trailing stop до TP1 (аналогично S1, адаптировано для short).
+# Активируется когда цена прошла вниз >= S3_TRAILING_ACTIVATE_PCT от входа.
+# Стоп = текущий минимум + S3_TRAILING_OFFSET_PCT (для short: стоп выше минимума).
+S3_TRAILING_ACTIVATE_PCT = 0.005   # 0.5% favorable move для активации
+S3_TRAILING_OFFSET_PCT   = 0.003   # стоп = low_peak * (1 + offset)
 
 
 class Strategy3Breakout(BaseStrategy):
@@ -54,12 +62,25 @@ class Strategy3Breakout(BaseStrategy):
         symbol = event["symbol"]
         breakout_vol_ratio = event.get("breakout_vol_ratio", 0.0)
         level_side = event.get("level_side", "")
+        level_type = event.get("level_type", "")
 
-        if breakout_vol_ratio < S3_MIN_BREAKOUT_VOL_RATIO:
+        if breakout_vol_ratio < S3_MIN_BREAKOUT_VOL_RATIO_STRONG:
             return
         if level_side != "support":
             return
-        if event.get("level_type") == "pump_base":
+
+        # Задача 1: фильтр по strength — входить только при strength >= S3_MIN_STRENGTH (рекомендация: 4)
+        strength = event.get("strength", 0)
+        if strength < S3_MIN_STRENGTH:
+            logger.debug("S3 skip: strength below threshold", symbol=symbol, strength=strength, threshold=S3_MIN_STRENGTH)
+            return
+
+        # Задача 2+5: исключить pump_base и consolidation_base полностью
+        if level_type == "pump_base":
+            logger.debug("S3 skip: pump_base level excluded since 09.06", symbol=symbol)
+            return
+        if level_type == "consolidation_base":
+            logger.debug("S3 skip: consolidation_base level excluded", symbol=symbol)
             return
 
         # Не входить в short если BTC растёт в эту минуту (контртренд).
@@ -74,6 +95,17 @@ class Strategy3Breakout(BaseStrategy):
         # Не торговать если был sweep незадолго до пробоя (ложный пробой)
         last_sweep = self._recent_sweep.get(symbol, 0.0)
         if time.time() - last_sweep < S3_SWEEP_COOLDOWN_SECONDS:
+            return
+
+        # Задача 4: вычислить NATR 5м (Normalized ATR = ATR/close * 100)
+        # Логируется всегда; используется как фильтр входа при S3_MAX_NATR_5M > 0.
+        natr_5m = self._calc_natr_5m(symbol)
+
+        if S3_MAX_NATR_5M > 0 and natr_5m is not None and natr_5m > S3_MAX_NATR_5M:
+            logger.debug(
+                "S3 skip: NATR_5m above threshold",
+                symbol=symbol, natr_5m=round(natr_5m, 5), threshold=S3_MAX_NATR_5M,
+            )
             return
 
         if not await self._can_open_trade(symbol):
@@ -99,10 +131,10 @@ class Strategy3Breakout(BaseStrategy):
             "strategy_name": self.strategy_name,
             "symbol": symbol,
             "level": level,
-            "level_type": event.get("level_type", ""),
+            "level_type": level_type,
             "level_side": level_side,
             "entry_signal": "breakout",
-            "strength_at_entry": event.get("strength", 0),
+            "strength_at_entry": strength,
             "p_bounce_at_entry": event.get("p_bounce", 0.0),
             "expected_depth_at_entry": event.get("expected_depth", 0.0),
             "approach_style": event.get("approach_style", "unknown"),
@@ -124,6 +156,10 @@ class Strategy3Breakout(BaseStrategy):
             "take_profit_2": round(take_profit_2, 8),
             "tp1_hit": False,
             "stop_moved_to_breakeven": False,
+            # Задача 3: trailing-поля (аналог S1, адаптирован для short)
+            "trailing_active": False,
+            "trailing_low": None,     # минимум цены с момента активации (для short: тянем вниз)
+            "trailing_stop": None,
             "breakout_vol_ratio": breakout_vol_ratio,
             "is_strong_breakout": is_strong_breakout,
         })
@@ -132,6 +168,7 @@ class Strategy3Breakout(BaseStrategy):
         # Записываем контекст входа для последующего анализа ложных пробоев.
         # delta_at_entry: агрессия продавца в момент пробоя (отрицательная = продавцы доминировали).
         # candle_body_ratio: отношение тела к диапазону последней 1М свечи (0 = закол, 1 = чистое тело).
+        # natr_5m_at_entry: нормализованный ATR на 5М (задача 4) — логируется на всех сделках.
         try:
             delta_data = get_delta(symbol)
             delta_at_entry = round(delta_data.get("delta", 0.0), 4)
@@ -147,17 +184,22 @@ class Strategy3Breakout(BaseStrategy):
             else:
                 candle_body_ratio = 0.0
 
+            trades_count = delta_data.get("trades", 0)
+            trades_per_min = trades_count * 2  # буфер 30 сек → пересчёт в минуту
+
             await add_trade_event(
                 trade_id, "entry_context", entry_price,
                 json.dumps({
                     "delta_at_entry": delta_at_entry,
                     "candle_body_ratio": candle_body_ratio,
+                    "trades_per_min": trades_per_min,
+                    "natr_5m_at_entry": round(natr_5m, 6) if natr_5m is not None else None,
                 })
             )
         except Exception as e:
             logger.warning("S3 entry_context logging failed", trade_id=trade_id, error=str(e))
 
-        await self._send_open_message(trade, stop_loss, take_profit_1, take_profit_2)
+        await self._send_open_message(trade, stop_loss, take_profit_1, take_profit_2, natr_5m=natr_5m)
 
         logger.info(
             "S3 trade opened",
@@ -168,6 +210,7 @@ class Strategy3Breakout(BaseStrategy):
             tp1=round(take_profit_1, 8),
             tp2=round(take_profit_2, 8),
             vol_ratio=breakout_vol_ratio,
+            natr_5m=round(natr_5m, 6) if natr_5m is not None else None,
         )
 
     # ── Сопровождение ─────────────────────────────────────────────────
@@ -181,8 +224,6 @@ class Strategy3Breakout(BaseStrategy):
             trade["events_json"] = "[]"
 
         age_minutes = (time.time() - trade["entry_time"]) / 60
-        params_check = self._extract_params(trade)
-        is_strong = params_check.get("is_strong_breakout", False) if params_check else False
         if age_minutes < S3_MIN_TRADE_DURATION_MINUTES:
             return
 
@@ -200,6 +241,9 @@ class Strategy3Breakout(BaseStrategy):
         take_profit_2 = params["take_profit_2"]
         tp1_hit = params.get("tp1_hit", False)
         stop_moved = params.get("stop_moved_to_breakeven", False)
+        trailing_active = params.get("trailing_active", False)
+        trailing_low = params.get("trailing_low")
+        trailing_stop = params.get("trailing_stop")
 
         # Short: стоп выше цены входа; после TP1 — на уровне безубытка
         effective_stop = entry_price if stop_moved else stop_loss
@@ -211,10 +255,13 @@ class Strategy3Breakout(BaseStrategy):
             await self._send_close_message(trade, avg_exit, "take_profit_2")
             return
 
-        # TP1
+        # TP1 — частичная фиксация, стоп → безубыток, trailing снимается
         if not tp1_hit and current_price <= take_profit_1:
             params["tp1_hit"] = True
             params["stop_moved_to_breakeven"] = True
+            params["trailing_active"] = False  # trailing снимается, стоп уходит в breakeven
+            params["trailing_low"] = None
+            params["trailing_stop"] = None
             await add_trade_event(
                 trade_id, "tp1_hit", current_price,
                 json.dumps({"partial_exit_price": current_price, "partial_exit_pct": 50})
@@ -223,23 +270,49 @@ class Strategy3Breakout(BaseStrategy):
             logger.info("S3 TP1 hit, stop moved to breakeven", trade_id=trade_id)
             return
 
-        # Трейлинг-стоп: после TP1 подтягиваем стоп вслед за ценой.
-        # Для short: чем ниже цена, тем ниже опускаем стоп.
-        if tp1_hit:
-            atr = trade.get("atr_at_entry") or 0.0
-            if atr > 0:
-                # Новый трейлинг-стоп = текущая цена + 1.5 × ATR (для short стоп выше цены)
-                new_trailing_stop = current_price + atr * 1.5
-                # Обновляем только если новый стоп ниже текущего effective_stop
-                # (для short: тянем стоп вниз, не вверх)
-                if new_trailing_stop < effective_stop:
-                    params["stop_loss"] = round(new_trailing_stop, 8)
-                    params["stop_moved_to_breakeven"] = True  # флаг уже стоит
+        # ── Trailing stop до TP1 (аналог S1, адаптирован для short) ──────────
+        # Для short: пик движения = минимум цены (low); стоп = low_peak * (1 + offset)
+        if not tp1_hit:
+            _c5m = candles_5m.get(trade["symbol"], [])
+            _last_low = min((c["low"] for c in _c5m[-2:]), default=current_price)
+            fav_pct = (entry_price - _last_low) / entry_price  # >0 если цена упала
+
+            if trailing_active and trailing_low is not None:
+                # Обновить пик если low ушёл ниже
+                if _last_low < trailing_low:
+                    trailing_low = _last_low
+                    trailing_stop = round(trailing_low * (1.0 + S3_TRAILING_OFFSET_PCT), 8)
+                    params["trailing_low"] = trailing_low
+                    params["trailing_stop"] = trailing_stop
                     await add_trade_event(
-                        trade_id, "trailing_stop_updated", current_price,
-                        json.dumps({"new_stop": round(new_trailing_stop, 8), "atr": atr})
+                        trade_id, "params_updated", current_price, json.dumps(params)
                     )
-                    await add_trade_event(trade_id, "params_updated", current_price, json.dumps(params))
+                    logger.debug(
+                        "S3 trailing low updated",
+                        trade_id=trade_id, low=trailing_low, trailing_stop=trailing_stop,
+                    )
+
+                # Срабатывание trailing stop: цена вернулась выше стопа
+                if trailing_stop is not None and current_price >= trailing_stop:
+                    await self._close_and_track(trade_id, trade["symbol"], current_price, "trailing_stop")
+                    await self._send_close_message(trade, current_price, "trailing_stop")
+                    return
+
+            elif fav_pct >= S3_TRAILING_ACTIVATE_PCT:
+                # Активировать trailing
+                trailing_low = _last_low
+                trailing_stop = round(trailing_low * (1.0 + S3_TRAILING_OFFSET_PCT), 8)
+                params["trailing_active"] = True
+                params["trailing_low"] = trailing_low
+                params["trailing_stop"] = trailing_stop
+                await add_trade_event(
+                    trade_id, "params_updated", current_price, json.dumps(params)
+                )
+                logger.info(
+                    "S3 trailing activated",
+                    trade_id=trade_id, low=trailing_low, trailing_stop=trailing_stop,
+                )
+                return
 
         # Stop loss (для short: цена ушла вверх выше стопа)
         if current_price >= effective_stop:
@@ -294,10 +367,35 @@ class Strategy3Breakout(BaseStrategy):
                     return None
         return None
 
+    def _calc_natr_5m(self, symbol: str) -> float | None:
+        """NATR 5М = ATR(14) / close * 100. Использует candles_5m из data.collector.
+        Возвращает None если данных недостаточно (< 15 свечей).
+        Логировать на всех сделках независимо от фильтра.
+        """
+        candles = candles_5m.get(symbol, [])
+        if len(candles) < 15:
+            return None
+        # ATR(14): среднее true range по последним 14 периодам
+        trs = []
+        for i in range(-14, 0):
+            c = candles[i]
+            prev_close = candles[i - 1]["close"]
+            tr = max(
+                c["high"] - c["low"],
+                abs(c["high"] - prev_close),
+                abs(c["low"] - prev_close),
+            )
+            trs.append(tr)
+        atr14 = sum(trs) / len(trs)
+        close = candles[-1]["close"]
+        if close <= 0:
+            return None
+        return atr14 / close * 100
+
     # ── Telegram ──────────────────────────────────────────────────────
 
     async def _send_open_message(
-        self, trade: dict, stop_loss: float, tp1: float, tp2: float
+        self, trade: dict, stop_loss: float, tp1: float, tp2: float, natr_5m: float | None = None
     ) -> None:
         ep = trade["entry_price"]
         # Short: SL выше входа (+), TP ниже входа (-)
@@ -306,11 +404,12 @@ class Strategy3Breakout(BaseStrategy):
         tp2_pct = self._format_pct((tp2 - ep) / ep * 100)
         params = self._extract_params(trade) or {}
         vol_ratio = params.get("breakout_vol_ratio", trade.get("vol_ratio_at_entry", 0.0))
+        natr_str = f" | NATR5m={natr_5m:.4f}%" if natr_5m is not None else ""
         text = (
             f"🔴 [S3 Breakout] {trade['symbol']} SHORT\n"
             f"   Пробой уровня: {trade['level']} ({trade['level_type']})"
             f" | Объём: ×{vol_ratio:.1f}\n"
-            f"   Вход: {ep} | strength={trade['strength_at_entry']}\n"
+            f"   Вход: {ep} | strength={trade['strength_at_entry']}{natr_str}\n"
             f"   SL: {round(stop_loss, 8)} ({sl_pct})"
             f" | TP1: {round(tp1, 8)} ({tp1_pct})"
             f" | TP2: {round(tp2, 8)} ({tp2_pct})\n"

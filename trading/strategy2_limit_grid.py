@@ -16,9 +16,19 @@ from constants import (
     S2_MIN_P_BOUNCE,
     S2_PRESSURE_COOLDOWN_SECONDS,
     S2_GRID_ORDERS,
+    S2_POSITION_SIZE_USDT,
 )
 from data.collector import candles_1m
 from logger import logger
+
+# Trailing stop: отступ от пика после TP1
+S2_TRAILING_PCT = 0.005   # 0.5%
+
+# TP2 как множитель ATR от entry (явный, не через grid_bottom)
+S2_TP2_ATR_MULT = 5.0
+
+# Full-grid TP: при fill=10 ставим TP на этом % ниже уровня (возврат к уровню снизу)
+S2_FULL_GRID_TP_PCT = 0.0015   # 0.15%
 
 
 class Strategy2LimitGrid(BaseStrategy):
@@ -29,6 +39,8 @@ class Strategy2LimitGrid(BaseStrategy):
         super().__init__()  # FIX BUG-1: создаёт _tracker_tasks, иначе AttributeError при _close_and_track
         # symbol → timestamp последнего события "pressure"
         self._recent_pressure: dict[str, float] = {}
+        # "symbol:level" 2192 timestamp 043f043e0441043b04350434043d04350433043e 04370430043a0440044b04420438044f 044104340435043b043a0438 043f043e 044d0442043e043c0443 04430440043e0432043d044e
+        self._recent_close: dict[str, float] = {}
 
     # ── Вход ──────────────────────────────────────────────────────────
 
@@ -54,32 +66,96 @@ class Strategy2LimitGrid(BaseStrategy):
         approach_style = event.get("approach_style", "unknown")
 
         if strength < S2_MIN_STRENGTH:
+            logger.info(
+                "S2 skip: strength too low",
+                symbol=symbol,
+                strength=strength,
+                min_required=S2_MIN_STRENGTH,
+            )
             return
         if p_bounce < S2_MIN_P_BOUNCE:
+            logger.info(
+                "S2 skip: p_bounce too low",
+                symbol=symbol,
+                p_bounce=round(p_bounce, 3),
+                min_required=S2_MIN_P_BOUNCE,
+            )
             return
         if approach_style == "bleed":
+            logger.info(
+                "S2 skip: approach_style=bleed",
+                symbol=symbol,
+            )
             return
 
         # Нет давления за последние N секунд
         last_pressure = self._recent_pressure.get(symbol, 0.0)
-        if time.time() - last_pressure < S2_PRESSURE_COOLDOWN_SECONDS:
+        seconds_since_pressure = time.time() - last_pressure
+        if seconds_since_pressure < S2_PRESSURE_COOLDOWN_SECONDS:
+            logger.info(
+                "S2 skip: pressure cooldown active",
+                symbol=symbol,
+                seconds_since_pressure=round(seconds_since_pressure, 1),
+                cooldown=S2_PRESSURE_COOLDOWN_SECONDS,
+            )
             return
 
         if not await self._can_open_trade(symbol):
+            open_count = await self._open_trades_count()
+            has_symbol = await self._has_open_trade_for_symbol(symbol)
+            logger.info(
+                "S2 skip: cannot open trade",
+                symbol=symbol,
+                has_open_for_symbol=has_symbol,
+                open_count=open_count,
+                max_open=self.MAX_OPEN_TRADES,
+            )
             return
 
         level = event["level"]
+        # Кулдаун после закрытия сделки по этому уровню — не открывать повторно сразу
+        _close_key = f"{symbol}:{level}"
+        seconds_since_close = time.time() - self._recent_close.get(_close_key, 0.0)
+        if seconds_since_close < 300:
+            logger.info(
+                "S2 skip: recent close cooldown",
+                symbol=symbol,
+                level=level,
+                seconds_since_close=round(seconds_since_close, 1),
+            )
+            return
         atr = event.get("atr", 0.0)
         expected_depth = event.get("expected_depth", 0.0)
 
-        expected_depth_abs = level * (expected_depth / 100)
-        if expected_depth < 0.1:
-            expected_depth_abs = atr if atr > 0 else level * 0.005
-
-        step = expected_depth_abs * 1.2 / (S2_GRID_ORDERS - 1)
+        grid_width = atr * 2.5
+        step = grid_width / (S2_GRID_ORDERS - 1)
         grid_anchor = level * 1.0015  # первый ордер на 0.15% выше уровня (front-run)
+
+        _c1m_now = candles_1m.get(symbol, [])
+        _current_price_now = _c1m_now[-1]["close"] if _c1m_now else grid_anchor
         grid_prices = [grid_anchor - step * i for i in range(S2_GRID_ORDERS)]
-        order_size = round(self.POSITION_SIZE_USDT / S2_GRID_ORDERS, 4)
+        grid_bottom = grid_prices[-1]
+
+        # Не открывать если цена выше grid_anchor более чем на 0.5% (уровень уже выше рынка)
+        if _current_price_now > grid_anchor * 1.005:
+            logger.info(
+                "S2 skip: price too far above grid",
+                symbol=symbol,
+                current=round(_current_price_now, 8),
+                anchor=round(grid_anchor, 8),
+                diff_pct=round((_current_price_now - grid_anchor) / grid_anchor * 100, 3),
+            )
+            return
+        # Не открывать если цена уже ниже нижнего ордера — вся сетка мгновенно заполнится
+        if _current_price_now < grid_bottom:
+            logger.info(
+                "S2 skip: price already below grid bottom",
+                symbol=symbol,
+                current=round(_current_price_now, 8),
+                grid_bottom=round(grid_bottom, 8),
+            )
+            return
+        order_size = round(S2_POSITION_SIZE_USDT / S2_GRID_ORDERS, 4)
 
         grid_orders = [
             {
@@ -96,9 +172,12 @@ class Strategy2LimitGrid(BaseStrategy):
         bottom_price = grid_prices[-1]
         stop_loss = bottom_price - atr * 0.5
 
-        # TP рассчитывается от entry_price (пока = level, уточнится при fill)
-        # Сохраняем как функцию от grid bottom и entry_price — пересчитаем при каждом fill
         entry_price_initial = level  # до первого fill = верхний ордер
+
+        # TP1: entry + (entry - grid_bottom) × 1
+        # TP2: entry + ATR × S2_TP2_ATR_MULT (явный множитель, независим от числа fills)
+        tp1 = entry_price_initial + (entry_price_initial - bottom_price) * 1.0
+        tp2 = entry_price_initial + atr * S2_TP2_ATR_MULT
 
         trade_id = str(uuid.uuid4())
         trade = {
@@ -118,7 +197,7 @@ class Strategy2LimitGrid(BaseStrategy):
             "atr_at_entry": atr,
             "entry_price": entry_price_initial,
             "entry_time": time.time(),
-            "position_size": self.POSITION_SIZE_USDT,
+            "position_size": S2_POSITION_SIZE_USDT,
             "direction": "long",
             "grid_orders_json": json.dumps(grid_orders),
             "grid_fill_count": 0,
@@ -126,9 +205,6 @@ class Strategy2LimitGrid(BaseStrategy):
 
         await open_trade(trade)
 
-        # Параметры сетки — первое событие
-        tp1 = entry_price_initial + (entry_price_initial - bottom_price) * 1.0
-        tp2 = entry_price_initial + (entry_price_initial - bottom_price) * 2.0
         params_note = json.dumps({
             "stop_loss": round(stop_loss, 8),
             "take_profit_1": round(tp1, 8),
@@ -137,6 +213,12 @@ class Strategy2LimitGrid(BaseStrategy):
             "atr": atr,
             "tp1_hit": False,
             "stop_moved_to_breakeven": False,
+            # trailing — инициализируем пустыми, заполнятся при tp1_hit
+            "trailing_active": False,
+            "trailing_peak": None,
+            "trailing_stop": None,
+            # full-grid TP — заполнится при fill=10
+            "full_grid_tp": None,
         })
         await add_trade_event(trade_id, "params_set", entry_price_initial, params_note)
 
@@ -149,6 +231,8 @@ class Strategy2LimitGrid(BaseStrategy):
             level=level,
             grid_count=S2_GRID_ORDERS,
             sl=round(stop_loss, 8),
+            tp1=round(tp1, 8),
+            tp2=round(tp2, 8),
         )
 
     # ── Сопровождение ─────────────────────────────────────────────────
@@ -157,14 +241,11 @@ class Strategy2LimitGrid(BaseStrategy):
         trade_id = trade["trade_id"]
 
         # Проверить заполнение ордеров в любом случае — включая первый fill при fill_count==0.
-        # Раньше этот вызов был защищён условием fill_count > 0, из-за чего первый ордер
-        # никогда не исполнялся: _process_grid_fills не вызывался пока fill_count == 0,
-        # а fill_count оставался 0 потому что _process_grid_fills не вызывался.
         await self._process_grid_fills(trade, current_price)
 
         # Таймаут без единого fill — проверяем после попытки заполнить
         if trade["grid_fill_count"] == 0:
-            if time.time() - trade["entry_time"] > 3600:
+            if time.time() - trade["entry_time"] > 1200:  # 20 минут без fill
                 await self._close_and_track(trade_id, trade["symbol"], trade["entry_price"], "timeout_no_fill")
                 await self._send_close_message(trade, trade["entry_price"], "timeout_no_fill")
             return
@@ -174,49 +255,120 @@ class Strategy2LimitGrid(BaseStrategy):
         if updated is None or updated["status"] != "open":
             return
 
-        params = self._extract_params(updated)
-        if params is None:
+        params = self._extract_params_full(updated)
+        if not params:
             return
 
         stop_loss = params["stop_loss"]
         take_profit_1 = params["take_profit_1"]
         take_profit_2 = params["take_profit_2"]
         tp1_hit = params.get("tp1_hit", False)
-        stop_moved = params.get("stop_moved_to_breakeven", False)
+        trailing_active = params.get("trailing_active", False)
+        trailing_peak = params.get("trailing_peak")
+        trailing_stop = params.get("trailing_stop")
+        full_grid_tp = params.get("full_grid_tp")
         entry_price = updated["entry_price"]
-
-        effective_stop = entry_price if stop_moved else stop_loss
 
         fill_count = updated.get("grid_fill_count") or 0
         filled_usdt = self._filled_usdt(fill_count)
 
-        # TP2
-        if current_price >= take_profit_2:
+        # High/Low последних 2 свечей 1М для захвата быстрых движений между тиками.
+        _c1m = candles_1m.get(updated["symbol"], [])
+        _last_high = max((c["high"] for c in _c1m[-2:]), default=current_price)
+        _last_low = min((c["low"] for c in _c1m[-2:]), default=current_price)
+
+        # ── Предложение 2: full-grid TP (fill == S2_GRID_ORDERS) ──────────
+        # При заполнении всех ордеров сетки уровень пробит насквозь.
+        # Ждём возврата к уровню снизу: TP = level × (1 − S2_FULL_GRID_TP_PCT).
+        # Эта ветка работает только до tp1_hit — после TP1 переходим на trailing логику.
+        if full_grid_tp is not None and not tp1_hit:
+            if _last_high >= full_grid_tp:
+                await self._close_and_track(
+                    trade_id, updated["symbol"], full_grid_tp, "full_grid_tp", filled_usdt
+                )
+                await self._send_close_message(updated, full_grid_tp, "full_grid_tp")
+                return
+            # Стоп по-прежнему актуален — проверим ниже
+            if current_price <= stop_loss:
+                await self._close_and_track(
+                    trade_id, updated["symbol"], current_price, "stop_loss", filled_usdt
+                )
+                await self._send_close_message(updated, current_price, "stop_loss")
+            return
+
+        # ── TP2 — только если trailing ещё не активирован ───────────────────
+        if not tp1_hit and _last_high >= take_profit_2:
             avg_exit = (take_profit_1 + take_profit_2) / 2 if tp1_hit else take_profit_2
             await self._close_and_track(trade_id, updated["symbol"], avg_exit, "take_profit_2", filled_usdt)
             await self._send_close_message(updated, avg_exit, "take_profit_2")
             return
 
-        # TP1
-        if not tp1_hit and current_price >= take_profit_1:
+        # ── Предложение 1: TP1 → активировать trailing немедленно ─────────
+        if not tp1_hit and _last_high >= take_profit_1:
+            # Инициализируем trailing от текущего high (пика в момент TP1)
+            peak = _last_high
+            t_stop = round(peak * (1.0 - S2_TRAILING_PCT), 8)
+
             params["tp1_hit"] = True
             params["stop_moved_to_breakeven"] = True
+            params["trailing_active"] = True
+            params["trailing_peak"] = peak
+            params["trailing_stop"] = t_stop
+
             await add_trade_event(
                 trade_id, "tp1_hit", current_price,
-                json.dumps({"partial_exit_price": current_price, "partial_exit_pct": 50})
+                json.dumps({
+                    "partial_exit_price": _last_high,
+                    "partial_exit_pct": 50,
+                    "trailing_peak": peak,
+                    "trailing_stop": t_stop,
+                })
             )
             await add_trade_event(trade_id, "params_updated", current_price, json.dumps(params))
-            logger.info("S2 TP1 hit", trade_id=trade_id)
+            logger.info(
+                "S2 TP1 hit — trailing activated",
+                trade_id=trade_id,
+                peak=peak,
+                trailing_stop=t_stop,
+            )
             return
 
-        # Stop
-        if current_price <= effective_stop:
-            if tp1_hit:
-                avg_exit = (take_profit_1 + entry_price) / 2
-                await self._close_and_track(trade_id, updated["symbol"], avg_exit, "stop_loss", filled_usdt)
-                await self._send_close_message(updated, avg_exit, "stop_loss")
-            else:
-                await self._close_and_track(trade_id, updated["symbol"], current_price, "stop_loss", filled_usdt)
+        # ── Trailing stop: обновлять пик и стоп каждый тик после tp1_hit ──
+        if trailing_active and trailing_peak is not None:
+            new_peak = trailing_peak
+            if _last_high > trailing_peak:
+                new_peak = _last_high
+                new_t_stop = round(new_peak * (1.0 - S2_TRAILING_PCT), 8)
+                params["trailing_peak"] = new_peak
+                params["trailing_stop"] = new_t_stop
+                await add_trade_event(
+                    trade_id, "params_updated", current_price,
+                    json.dumps(params)
+                )
+                logger.debug(
+                    "S2 trailing peak updated",
+                    trade_id=trade_id,
+                    new_peak=new_peak,
+                    new_trailing_stop=new_t_stop,
+                )
+                trailing_stop = new_t_stop
+
+            # Проверка trailing stop по _last_low — захватывает sweep между тиками
+            if trailing_stop is not None and _last_low <= trailing_stop:
+                # Выходим по trailing: среднее между TP1 и trailing_stop (половина позиции уже "зафиксирована")
+                avg_exit = (take_profit_1 + trailing_stop) / 2
+                await self._close_and_track(
+                    trade_id, updated["symbol"], avg_exit, "trailing_stop", filled_usdt
+                )
+                await self._send_close_message(updated, avg_exit, "trailing_stop")
+                return
+
+        # ── Обычный стоп (до TP1) ─────────────────────────────────────────
+        if not tp1_hit:
+            if current_price <= stop_loss:
+                await self._close_and_track(
+                    trade_id, updated["symbol"], current_price, "stop_loss", filled_usdt
+                )
                 await self._send_close_message(updated, current_price, "stop_loss")
 
     async def _process_grid_fills(self, trade: dict, current_price: float) -> None:
@@ -235,7 +387,6 @@ class Strategy2LimitGrid(BaseStrategy):
             return
 
         # Low последних 2 закрытых свечей 1М как прокси реального минимума цены.
-        # default=current_price — фолбэк на старое поведение если свечей нет.
         _c1m = candles_1m.get(symbol, [])
         _last_low = min((c["low"] for c in _c1m[-2:]), default=current_price)
 
@@ -263,20 +414,15 @@ class Strategy2LimitGrid(BaseStrategy):
                     trade_id, grid_orders, fill_count, weighted_entry, trade
                 )
 
-                await send_message(
-                    f"🔵 [S2 Grid] {trade['symbol']} — ордер #{order['index']} исполнен на {order['price']}\n"
-                    f"   Заполнено {fill_count}/{S2_GRID_ORDERS} | Ср. цена входа: {round(weighted_entry, 8)}"
-                )
-
         if changed:
-            # Пересчитать TP/SL от нового entry_price
             fill_count = sum(1 for o in grid_orders if o["filled"])
             weighted_entry = sum(o["price"] for o in grid_orders if o["filled"]) / fill_count
+
             # FIX BUG-10: перечитываем trade из БД — исходный dict не содержит params_updated
-            # событий, добавленных в этой же сессии, _extract_params вернул бы устаревшие TP/SL
+            # событий, добавленных в этой же сессии.
             fresh_trade = await self._reload_trade(trade_id)
             if fresh_trade:
-                await self._recalculate_params(trade_id, weighted_entry, fresh_trade)
+                await self._recalculate_params(trade_id, weighted_entry, fill_count, fresh_trade)
 
     async def _update_grid_in_db(
         self,
@@ -302,21 +448,69 @@ class Strategy2LimitGrid(BaseStrategy):
             await db.commit()
 
     async def _recalculate_params(
-        self, trade_id: str, weighted_entry: float, trade: dict
+        self,
+        trade_id: str,
+        weighted_entry: float,
+        fill_count: int,
+        trade: dict,
     ) -> None:
-        """Пересчитать TP/SL после изменения средневзвешенного entry_price."""
+        """Пересчитать TP/SL после изменения средневзвешенного entry_price.
+
+        При fill_count == S2_GRID_ORDERS (полный grid) устанавливаем full_grid_tp:
+        TP = level × (1 - S2_FULL_GRID_TP_PCT), только если он выше weighted_entry.
+        Это даёт шанс закрыться при возврате цены к уровню снизу.
+        TP2 теперь задаётся как entry + ATR × S2_TP2_ATR_MULT (явный, не через grid_bottom).
+        """
         params = self._extract_params(trade)
         if params is None:
             return
+
+        # Preserve trailing/state fields from full event history in case
+        # _extract_params picked up a stale params_updated without them.
+        existing_params = self._extract_params_full(trade)
+        for key in ("trailing_active", "trailing_peak", "trailing_stop", "tp1_hit", "stop_moved_to_breakeven"):
+            if not params.get(key):
+                val = existing_params.get(key)
+                if val is not None:
+                    params[key] = val
+
         grid_bottom = params.get("grid_bottom", weighted_entry)
         atr = params.get("atr", trade.get("atr_at_entry", 0.0))
+        level = trade.get("level", weighted_entry)
+
         stop_loss = grid_bottom - atr * 0.5
+        # При полном заполнении сетки уровень пробит насквозь — ужесточаем стоп
+        if fill_count >= S2_GRID_ORDERS:
+            stop_loss = weighted_entry - atr * 0.2
         tp1 = weighted_entry + (weighted_entry - grid_bottom) * 1.0
-        tp2 = weighted_entry + (weighted_entry - grid_bottom) * 2.0
+        # TP2 = entry + ATR × 5 (явный, стабильный при любом числе fills)
+        tp2 = weighted_entry + atr * S2_TP2_ATR_MULT
+
+        # Предложение 2: при заполнении всего grid — полный-grid TP
+        full_grid_tp = None
+        if fill_count >= S2_GRID_ORDERS:
+            candidate = round(level * (1.0 - S2_FULL_GRID_TP_PCT), 8)
+            # Выставляем только если выше breakeven (иначе фиксировали бы убыток)
+            full_grid_tp = candidate if candidate > weighted_entry else round(weighted_entry * 1.001, 8)
+            logger.info(
+                "S2 full grid reached — full_grid_tp set",
+                trade_id=trade_id,
+                fill_count=fill_count,
+                level=level,
+                weighted_entry=round(weighted_entry, 8),
+                full_grid_tp=full_grid_tp,
+            )
+            await send_message(
+                f"⚠️ [S2 Grid] {trade.get('symbol', '')} — сетка заполнена полностью ({fill_count}/{S2_GRID_ORDERS})\n"
+                f"   Ср. вход: {round(weighted_entry, 8)} | Full-grid TP: {full_grid_tp}\n"
+                f"   Уровень пробит насквозь. Ждём возврат к уровню."
+            )
+
         params.update({
             "stop_loss": round(stop_loss, 8),
             "take_profit_1": round(tp1, 8),
             "take_profit_2": round(tp2, 8),
+            "full_grid_tp": full_grid_tp,
         })
         await add_trade_event(trade_id, "params_updated", weighted_entry, json.dumps(params))
 
@@ -348,10 +542,7 @@ class Strategy2LimitGrid(BaseStrategy):
                 logger.error("S2 cancel grid orders failed", error=str(e))
 
             if fill_count == 0:
-                # Позиции не было — ни один ордер сетки не исполнен.
-                # Не вызываем close_trade: она считает pnl от entry_price=level,
-                # хотя реальной позиции не существовало — это ложный убыток.
-                # Закрываем запись напрямую с нулевым PnL.
+                # Позиции не было — закрываем с нулевым PnL без вызова close_trade.
                 async with aiosqlite.connect(DB_PATH) as _db:
                     await _db.execute(
                         """UPDATE trades
@@ -372,15 +563,31 @@ class Strategy2LimitGrid(BaseStrategy):
                 await self._send_close_message(trade, trade["entry_price"], "cancelled_no_fill")
                 logger.info("S2 grid cancelled (no fills), pnl=0", trade_id=trade_id)
             else:
-                await self._close_and_track(trade_id, trade["symbol"], current_price, "breakout_confirmed", self._filled_usdt(fill_count))
+                # Есть реальная позиция — проверяем, активен ли trailing
+                params = self._extract_params(trade)
+                tp1_hit = params.get("tp1_hit", False) if params else False
+                trailing_stop = params.get("trailing_stop") if params else None
+                take_profit_1 = params.get("take_profit_1", trade["entry_price"]) if params else trade["entry_price"]
+
+                if tp1_hit and trailing_stop is not None:
+                    # После TP1: среднее между TP1 и текущим trailing_stop
+                    avg_exit = (take_profit_1 + max(current_price, trailing_stop)) / 2
+                    exit_reason = "breakout_after_tp1"
+                else:
+                    avg_exit = current_price
+                    exit_reason = "breakout_confirmed"
+
+                await self._close_and_track(
+                    trade_id, trade["symbol"], avg_exit, exit_reason, self._filled_usdt(fill_count)
+                )
                 updated_trade = await self._reload_trade_closed(trade_id) or trade
-                await self._send_close_message(updated_trade, current_price, "breakout_confirmed")
+                await self._send_close_message(updated_trade, avg_exit, exit_reason)
 
             logger.info("S2 grid closed on breakout", trade_id=trade_id, fill_count=fill_count)
 
     def _filled_usdt(self, fill_count: int) -> float:
         """Реальный размер позиции в USDT по числу исполненных ордеров."""
-        return self.POSITION_SIZE_USDT * fill_count / S2_GRID_ORDERS
+        return S2_POSITION_SIZE_USDT * fill_count / S2_GRID_ORDERS
 
     # ── Таймаут ───────────────────────────────────────────────────────
 
@@ -406,7 +613,7 @@ class Strategy2LimitGrid(BaseStrategy):
             symbol = trade["symbol"]
 
             if fill_count == 0:
-                # Позиции не было — закрываем с нулевым PnL без вызова close_trade
+                # Позиции не было — закрываем с нулевым PnL
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
                         """UPDATE trades
@@ -427,7 +634,25 @@ class Strategy2LimitGrid(BaseStrategy):
                 await self._send_close_message(trade, trade["entry_price"], "timeout_no_fill")
                 logger.info("S2 timeout_no_fill (zero PnL)", trade_id=trade_id, symbol=symbol)
             else:
-                # Есть реальная позиция — стандартная логика базового класса
+                # Страховка: перечитать fill_count из БД перед закрытием
+                fresh = await self._reload_trade(trade_id)
+                if fresh and (fresh.get("grid_fill_count") or 0) == 0:
+                    # fill_count обнулился — закрыть с pnl=0
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute(
+                            """UPDATE trades
+                               SET exit_price = ?, exit_time = ?, exit_reason = ?,
+                                   pnl_pct = 0.0, pnl_usdt = 0.0, duration_minutes = ?,
+                                   status = 'closed', updated_at = ?
+                               WHERE trade_id = ?""",
+                            (trade["entry_price"], now, "timeout_no_fill",
+                             round(age_minutes, 2), now, trade_id),
+                        )
+                        await db.commit()
+                    await self._send_close_message(trade, trade["entry_price"], "timeout_no_fill")
+                    logger.info("S2 timeout_no_fill guard (zero PnL)", trade_id=trade_id, symbol=symbol)
+                    continue
+                # Есть реальная позиция — стандартная логика
                 c1m = candles_1m.get(symbol, [])
                 current_price = c1m[-1]["close"] if c1m else trade["entry_price"]
                 try:
@@ -452,6 +677,18 @@ class Strategy2LimitGrid(BaseStrategy):
 
     # ── Вспомогательные ───────────────────────────────────────────────
 
+    async def _close_and_track(self, trade_id, symbol, exit_price, exit_reason, filled_size=None):
+        # Фиксируем кулдаун по уровню перед закрытием (trade ещё open, level доступен)
+        try:
+            from trading.trade_log import get_open_trades as _got
+            _trades = await _got(self.strategy_id)
+            _level = next((t['level'] for t in _trades if t['trade_id'] == trade_id), None)
+            if _level is not None:
+                self._recent_close[f'{symbol}:{_level}'] = time.time()
+        except Exception:
+            pass
+        await super()._close_and_track(trade_id, symbol, exit_price, exit_reason, filled_size)
+
     def _extract_params(self, trade: dict) -> dict | None:
         try:
             events = json.loads(trade.get("events_json") or "[]")
@@ -464,6 +701,25 @@ class Strategy2LimitGrid(BaseStrategy):
                 except Exception:
                     return None
         return None
+
+    def _extract_params_full(self, trade: dict) -> dict:
+        """Scan ALL params events to collect the most recent value of each field.
+
+        Used in _recalculate_params to preserve trailing/state fields that may
+        be absent from the very last params_updated (written before tp1_hit).
+        """
+        try:
+            events = json.loads(trade.get("events_json") or "[]")
+        except Exception:
+            return {}
+        merged: dict = {}
+        for ev in events:
+            if ev["type"] in ("params_updated", "params_set"):
+                try:
+                    merged.update(json.loads(ev["note"]))
+                except Exception:
+                    pass
+        return merged
 
     async def _reload_trade(self, trade_id: str) -> dict | None:
         trades = await get_open_trades(self.strategy_id)
@@ -496,7 +752,7 @@ class Strategy2LimitGrid(BaseStrategy):
         tp1: float,
         tp2: float,
     ) -> None:
-        order_size = round(self.POSITION_SIZE_USDT / S2_GRID_ORDERS, 2)
+        order_size = round(S2_POSITION_SIZE_USDT / S2_GRID_ORDERS, 2)
         prices_str = "  ".join(f"#{o['index']}: {o['price']}" for o in grid_orders)
         text = (
             f"🔵 [S2 Grid] {trade['symbol']} LONG — сетка выставлена\n"
@@ -504,7 +760,7 @@ class Strategy2LimitGrid(BaseStrategy):
             f" | p_bounce={trade['p_bounce_at_entry']:.2f}\n"
             f"   Ордера ({S2_GRID_ORDERS}×{order_size} USDT):\n"
             f"     {prices_str}\n"
-            f"   SL: {round(stop_loss, 8)} | TP1: {round(tp1, 8)} | TP2: {round(tp2, 8)}"
+            f"   SL: {round(stop_loss, 8)} | TP1: {round(tp1, 8)} | TP2: {round(tp2, 8)} (entry+{S2_TP2_ATR_MULT}×ATR)"
         )
         try:
             await send_message(text)
@@ -515,7 +771,7 @@ class Strategy2LimitGrid(BaseStrategy):
         ep = trade["entry_price"]
         fill_count = trade.get("grid_fill_count") or 0
         pnl_pct = (exit_price - ep) / ep * 100 if ep > 0 else 0.0
-        filled_size = self.POSITION_SIZE_USDT * fill_count / S2_GRID_ORDERS
+        filled_size = S2_POSITION_SIZE_USDT * fill_count / S2_GRID_ORDERS
         pnl_usdt = filled_size * pnl_pct / 100
         icon = "✅" if pnl_pct >= 0 else "🔴"
         max_fav  = trade.get("max_favorable_pct") or 0.0
@@ -533,11 +789,18 @@ class Strategy2LimitGrid(BaseStrategy):
         except Exception:
             pass
 
+        # Добавляем пометку для trailing/full_grid выходов
+        reason_label = {
+            "trailing_stop": "trailing stop 🎯",
+            "full_grid_tp": "full-grid TP (возврат к уровню) 🎯",
+            "breakout_after_tp1": "breakout после TP1",
+        }.get(reason, reason)
+
         text = (
             f"{icon} [S2 Grid] {trade['symbol']} закрыт\n"
             f"   Заполнено ордеров: {fill_count}/{S2_GRID_ORDERS}"
             f" | Ср. вход: {ep} → Выход: {exit_price}\n"
-            f"   Причина: {reason}\n"
+            f"   Причина: {reason_label}\n"
             f"   PnL: {self._format_pct(pnl_pct)} ({self._format_pct(pnl_usdt, sign=True)} USDT)"
             f" | Время: {self._format_duration(trade['entry_time'])}{first_fill_duration}\n"
             f"   📈 Max profit: +{max_fav:.2f}% (+{max_profit_usdt:.2f} USDT)\n"

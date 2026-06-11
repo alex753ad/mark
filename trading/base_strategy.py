@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 
 from data.collector import candles_1m
-from bot.telegram import send_message
+from bot.telegram import send_message, send_close_with_chart
 from trading.trade_log import (
     get_open_trades,
     close_trade,
@@ -39,9 +39,11 @@ class BaseStrategy(ABC):
     async def on_event(self, event: dict) -> None:
         """Точка входа — вызывается из strategy_runner для каждого события."""
 
-    @abstractmethod
-    async def _send_open_message(self, trade: dict) -> None:
-        """Telegram-сообщение об открытии сделки."""
+    async def _send_open_message(self, trade: dict, *args, **kwargs) -> None:
+        """Telegram-сообщение об открытии сделки.
+        Каждая стратегия переопределяет со своими параметрами (stop_loss, tp1, tp2 и т.д.)
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} must implement _send_open_message")
 
     @abstractmethod
     async def _send_close_message(self, trade: dict, exit_price: float, reason: str) -> None:
@@ -201,6 +203,25 @@ class BaseStrategy(ABC):
         task.add_done_callback(self._tracker_tasks.discard)
 
     # ── Вспомогательные методы ────────────────────────────────────────
+
+    async def _send_close_with_chart(
+        self,
+        text: str,
+        trade: dict,
+        exit_price: float,
+    ) -> None:
+        """
+        Отправить уведомление о закрытии сделки с графиком 1М.
+        Вызывать из _send_close_message вместо send_message.
+        Если генерация графика падает — автоматически fallback на текст.
+        """
+        await send_close_with_chart(
+            text=text,
+            symbol=trade["symbol"],
+            entry_price=trade.get("entry_price"),
+            exit_price=exit_price,
+            level=trade.get("level"),
+        )
 
     async def _has_open_trade_for_symbol(self, symbol: str) -> bool:
         """True если по symbol уже есть открытая сделка этой стратегии."""

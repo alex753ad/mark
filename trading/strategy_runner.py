@@ -8,6 +8,7 @@ from trading.event_bus import subscribe
 from trading.strategy1_bounce import Strategy1Bounce
 from trading.strategy2_limit_grid import Strategy2LimitGrid
 from trading.strategy3_breakout import Strategy3Breakout
+from trading.strategy4_breakout_long import Strategy4BreakoutLong
 from trading.trade_log import init_trades_db, get_open_trades
 from trading.price_tracker import resume_post_exit_trackers
 from data.collector import candles_1m
@@ -28,7 +29,8 @@ async def run_strategies() -> None:
     logger.info("trades.db initialized")
     await resume_post_exit_trackers()
 
-    strategies = [Strategy1Bounce(), Strategy2LimitGrid(), Strategy3Breakout()]
+    strategies = [Strategy1Bounce(), Strategy2LimitGrid(), Strategy3Breakout(), Strategy4BreakoutLong()]
+    strategies[-1].start_scanner()
     asyncio.create_task(_timeout_checker(strategies))
     asyncio.create_task(_price_loop(strategies))
 

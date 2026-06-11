@@ -96,6 +96,63 @@ async def track_post_exit_price(trade_id: str, symbol: str, exit_time: float) ->
             )
 
 
+async def resume_post_exit_trackers() -> None:
+    """
+    Вызывать при старте бота (например из run_strategies() в strategy_runner.py):
+
+        from trading.price_tracker import resume_post_exit_trackers
+        await resume_post_exit_trackers()
+
+    Находит закрытые сделки без post_exit данных у которых 30-минутное окно
+    ещё не истекло, и перезапускает трекер для каждой.
+    При рестарте бота _tracker_tasks теряются из памяти — эта функция их восстанавливает.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT trade_id, symbol, exit_time
+                   FROM trades
+                   WHERE status = 'closed'
+                     AND post_exit_high_30m IS NULL
+                     AND exit_time IS NOT NULL
+                     AND exit_time >= ?""",
+                (time.time() - TRACKING_DURATION_SECONDS,),
+            ) as cur:
+                rows = await cur.fetchall()
+    except Exception as e:
+        logger.error("resume_post_exit_trackers: db query failed: %s", e)
+        return
+
+    if not rows:
+        return
+
+    logger.info("resume_post_exit_trackers: resuming %d trackers after restart", len(rows))
+
+    for row in rows:
+        if row["trade_id"] in _resume_task_ids:
+            continue
+        _resume_task_ids.add(row["trade_id"])
+        task = asyncio.create_task(
+            track_post_exit_price(row["trade_id"], row["symbol"], row["exit_time"]),
+            name=f"post_exit_tracker::{row['trade_id']}",
+        )
+        # asyncio держит ссылку на задачи в event loop пока они живы —
+        # здесь этого достаточно, задачи короткоживущие (макс 30 мин).
+        # Для надёжности добавляем в модульный set:
+        _resume_tasks.add(task)
+        task.add_done_callback(_resume_tasks.discard)
+        logger.debug(
+            "resume_post_exit_trackers: resumed trade_id=%s symbol=%s",
+            row["trade_id"], row["symbol"],
+        )
+
+
+# Хранилище задач восстановления — защита от GC и дедупликация по trade_id
+_resume_task_ids: set[str] = set()
+_resume_tasks: set[asyncio.Task] = set()
+
+
 async def _save_post_exit_range(
     trade_id: str,
     price_high: float,

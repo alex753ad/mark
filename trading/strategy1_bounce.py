@@ -9,8 +9,13 @@ import uuid
 from trading.base_strategy import BaseStrategy
 from trading.trade_log import open_trade, add_trade_event, get_open_trades
 from bot.telegram import send_message, send_close_with_chart
+from data.collector import candles_1m
 from constants import S1_MIN_STRENGTH, S1_MIN_P_BOUNCE, S1_MAX_VOL_RATIO, S1_TP1_RR, S1_TP2_RR
 from logger import logger
+
+# Trailing stop до TP1: активируется при max_favorable >= порога
+S1_TRAILING_ACTIVATE_PCT = 0.005   # 0.5% от пика для активации
+S1_TRAILING_OFFSET_PCT   = 0.003   # стоп = пик − 0.3%
 
 
 class Strategy1Bounce(BaseStrategy):
@@ -42,6 +47,11 @@ class Strategy1Bounce(BaseStrategy):
         if p_bounce < S1_MIN_P_BOUNCE:
             return
         if approach_style == "bleed":
+            return
+        # pump_base уровни в bearish режиме пробиваются насквозь — исключить полностью
+        level_type = event.get("level_type", "")
+        if level_type == "pump_base":
+            logger.debug("S1 skip: pump_base level", symbol=symbol, level_type=level_type)
             return
         # Не входить если объём на касании выше порога — S1 ловит тихие отбои.
         # Данные history.db: vol 0.8–3.0× даёт одинаковый bounce rate ~41%.
@@ -111,6 +121,9 @@ class Strategy1Bounce(BaseStrategy):
             "take_profit_2": round(take_profit_2, 8),
             "tp1_hit": False,
             "stop_moved_to_breakeven": False,
+            "trailing_active": False,
+            "trailing_peak": None,
+            "trailing_stop": None,
         })
         await add_trade_event(trade_id, "params_set", entry_price, params_note)
 
@@ -143,8 +156,11 @@ class Strategy1Bounce(BaseStrategy):
         take_profit_2 = params["take_profit_2"]
         tp1_hit = params.get("tp1_hit", False)
         stop_moved = params.get("stop_moved_to_breakeven", False)
+        trailing_active = params.get("trailing_active", False)
+        trailing_peak = params.get("trailing_peak")
+        trailing_stop = params.get("trailing_stop")
 
-        # После TP1 стоп сдвинут на безубыток
+        # После TP1 стоп сдвинут на безубыток (trailing уже не нужен — логика TP2/SL)
         effective_stop = entry_price if stop_moved else stop_loss
 
         # TP2
@@ -162,16 +178,61 @@ class Strategy1Bounce(BaseStrategy):
         if not tp1_hit and current_price >= take_profit_1:
             params["tp1_hit"] = True
             params["stop_moved_to_breakeven"] = True
+            params["trailing_active"] = False  # trailing снимается, стоп уходит в breakeven
             await add_trade_event(
                 trade_id, "tp1_hit", current_price,
                 json.dumps({"partial_exit_price": current_price, "partial_exit_pct": 50})
             )
-            # Обновить params_set с новыми флагами
             await add_trade_event(trade_id, "params_updated", current_price, json.dumps(params))
             logger.info("S1 TP1 hit, stop moved to breakeven", trade_id=trade_id)
             return
 
-        # Stop loss
+        # ── Trailing stop до TP1 ──────────────────────────────────────────
+        if not tp1_hit:
+            # High последних 2 свечей 1М — захватывает быстрые пики между тиками поллинга
+            _c1m = candles_1m.get(trade["symbol"], [])
+            _last_high = max((c["high"] for c in _c1m[-2:]), default=current_price)
+            fav_pct = (_last_high - entry_price) / entry_price
+
+            if trailing_active and trailing_peak is not None:
+                # Обновить пик если high пошёл выше
+                if _last_high > trailing_peak:
+                    trailing_peak = _last_high
+                    trailing_stop = round(trailing_peak * (1.0 - S1_TRAILING_OFFSET_PCT), 8)
+                    params["trailing_peak"] = trailing_peak
+                    params["trailing_stop"] = trailing_stop
+                    await add_trade_event(
+                        trade_id, "params_updated", current_price, json.dumps(params)
+                    )
+                    logger.debug(
+                        "S1 trailing peak updated",
+                        trade_id=trade_id, peak=trailing_peak, trailing_stop=trailing_stop,
+                    )
+
+                # Проверить срабатывание trailing stop по current_price (консервативно)
+                if trailing_stop is not None and current_price <= trailing_stop:
+                    await self._close_and_track(trade_id, trade["symbol"], current_price, "trailing_stop")
+                    await self._send_close_message(trade, current_price, "trailing_stop")
+                    return
+
+            elif fav_pct >= S1_TRAILING_ACTIVATE_PCT:
+                # Активировать trailing: пик = last_high
+                trailing_peak = _last_high
+                trailing_stop = round(trailing_peak * (1.0 - S1_TRAILING_OFFSET_PCT), 8)
+                params["trailing_active"] = True
+                params["trailing_peak"] = trailing_peak
+                params["trailing_stop"] = trailing_stop
+                await add_trade_event(
+                    trade_id, "params_updated", current_price,
+                    json.dumps(params)
+                )
+                logger.info(
+                    "S1 trailing activated",
+                    trade_id=trade_id, peak=trailing_peak, trailing_stop=trailing_stop,
+                )
+                return
+
+        # Stop loss (статичный — до активации trailing или после TP1 в breakeven)
         if current_price <= effective_stop:
             if tp1_hit:
                 # Половина уже зафиксирована по TP1, вторая половина по стопу (= безубыток)
