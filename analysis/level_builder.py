@@ -20,13 +20,13 @@ def _round_level(price: float) -> float:
         return round(price, 8)
 
 
-def _calc_atr_1m(c1m: list[dict]) -> float:
-    """Calculate ATR from 1M candles (Wilder, includes gaps).
-    Note: duplicates trigger.calculate_atr to avoid circular import.
+def _calc_atr(candles: list[dict], period: int) -> float:
+    """Calculate ATR (Wilder, includes gaps). Works for any timeframe.
+    Note: avoids circular import with trigger.calculate_atr.
     """
-    if len(c1m) < ATR_PERIOD + 1:
+    if len(candles) < period + 1:
         return 0.0
-    recent = c1m[-(ATR_PERIOD + 1):]
+    recent = candles[-(period + 1):]
     trs = []
     for i in range(1, len(recent)):
         hl = recent[i]["high"] - recent[i]["low"]
@@ -34,21 +34,14 @@ def _calc_atr_1m(c1m: list[dict]) -> float:
         lc = abs(recent[i]["low"]  - recent[i - 1]["close"])
         trs.append(max(hl, hc, lc))
     return sum(trs) / len(trs)
+
+
+def _calc_atr_1m(c1m: list[dict]) -> float:
+    return _calc_atr(c1m, ATR_PERIOD)
 
 
 def _calc_atr_15m(c15m: list[dict]) -> float:
-    """Calculate ATR from 15M candles (Wilder, includes gaps)."""
-    period = 20
-    if len(c15m) < period + 1:
-        return 0.0
-    recent = c15m[-(period + 1):]
-    trs = []
-    for i in range(1, len(recent)):
-        hl = recent[i]["high"] - recent[i]["low"]
-        hc = abs(recent[i]["high"] - recent[i - 1]["close"])
-        lc = abs(recent[i]["low"]  - recent[i - 1]["close"])
-        trs.append(max(hl, hc, lc))
-    return sum(trs) / len(trs)
+    return _calc_atr(c15m, 20)
 
 
 def _timeframe_bonus(open_time_ms: int) -> int:

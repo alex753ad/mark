@@ -60,16 +60,17 @@ def generate_ascii_chart(c15m: list[dict], levels: list[dict], poc_price: float 
         
         # Mark levels on the right
         level_marker = ""
-        for lvl in levels:
-            if abs(lvl["level"] - price_at_row) / price_range < 0.02:  # Within 2% of row
-                poc_mark = "🎯" if lvl.get("poc_aligned") else ""
-                level_marker = f" ← {lvl['level']:.5f} ({lvl['type']}) {poc_mark}"
-                break
-        
-        # Mark POC
-        if poc_price and abs(poc_price - price_at_row) / price_range < 0.02:
-            if not level_marker:
-                level_marker = f" ← POC: {poc_price:.5f} (MAX VOLUME)"
+        if price_range > 0:
+            for lvl in levels:
+                if abs(lvl["level"] - price_at_row) / price_range < 0.02:  # Within 2% of row
+                    poc_mark = "🎯" if lvl.get("poc_aligned") else ""
+                    level_marker = f" ← {lvl['level']:.5f} ({lvl['type']}) {poc_mark}"
+                    break
+
+            # Mark POC
+            if poc_price and abs(poc_price - price_at_row) / price_range < 0.02:
+                if not level_marker:
+                    level_marker = f" ← POC: {poc_price:.5f} (MAX VOLUME)"
         
         line += level_marker
         lines.append(line)

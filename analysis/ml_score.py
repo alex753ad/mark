@@ -168,7 +168,10 @@ def ml_score(lvl: dict) -> dict:
 
         ltype_enc = _type_map.get(ltype, 1)
         style_enc = STYLE_MAP.get(style, 3)
-        age_min   = min(float(lvl.get("monitoring_age_minutes") or 0), 300.0)
+        # BUG-4 fix: monitoring_age_minutes now stores seconds (REAL).
+        # Convert to minutes; cap at 300 min.
+        age_sec = float(lvl.get("monitoring_age_minutes") or 0)
+        age_min = min(age_sec / 60, 300.0)
 
         # Вектор признаков: touches убран, monitoring_age_hours удалён
         # FIX BUG-5: monitoring_age_hours был дублём age_min/60; при обучении

@@ -18,13 +18,26 @@ from constants import (
     PRESSURE_VOLUME_MIN_RATIO,
     LEVEL_BROKEN_MIN_CANDLES,
     PUMP_MAX_BROKEN_LEVELS,
+    PROXIMITY_ALERT_DISTANCE_PCT,
 )
 from logger import logger
+from utils import calc_atr, detect_approach_style_from_candles
 
 # Global cooldown tracking for pressure alerts
 _pressure_alert_sent: dict[str, float] = {}  # key: "SYMBOL_LEVEL" -> timestamp
 PRESSURE_ALERT_COOLDOWN = 3600  # 1 hour cooldown for pressure alerts
 _PRESSURE_ALERT_TTL = PRESSURE_ALERT_COOLDOWN * 2  # evict entries older than 2× cooldown
+
+# Global dedup for rebound messages — referenced inside start_monitor
+_rebound_last_sent: dict[str, float] = {}  # key: "symbol" -> timestamp
+
+# Global dedup for level_broken alerts — prevents spam when multiple monitor instances run for same symbol
+_level_broken_sent: dict[str, float] = {}  # key: "SYMBOL_LEVEL" -> timestamp
+LEVEL_BROKEN_ALERT_COOLDOWN = 300  # 5 min cooldown
+
+# Global cooldown for volume_spike alerts — prevents spam on sustained high-volume candles
+_volume_spike_sent: dict[str, float] = {}  # key: "SYMBOL_LEVEL" -> timestamp
+VOLUME_SPIKE_ALERT_COOLDOWN = 300  # 5 min cooldown per symbol+level
 
 
 def _evict_stale_pressure_alerts() -> None:
@@ -49,6 +62,31 @@ async def _handle_sweep(symbol: str, level: float, level_side: str, c1m: list[di
         await send_message(f"🟡 {symbol} sweep на {level}\n   Объём слабый ×{ratio} — уровень ослаб")
 
 
+def _calc_trade_activity(symbol: str) -> dict:
+    """
+    Считает trades/min за 1м, 5м, 15м на основе поля trades в свечах.
+    Вызывается в момент касания уровня.
+    Returns: trades_per_min_1m, trades_per_min_5m, trades_per_min_15m, trades_increasing
+    """
+    c1m = candles_1m.get(symbol, [])
+    if not c1m or "trades" not in c1m[-1]:
+        return {"trades_per_min_1m": None, "trades_per_min_5m": None,
+                "trades_per_min_15m": None, "trades_increasing": None}
+
+    t1m = float(c1m[-1]["trades"])
+    t5m = round(sum(c["trades"] for c in c1m[-5:]) / min(len(c1m), 5), 1) if len(c1m) >= 1 else None
+    t15m = round(sum(c["trades"] for c in c1m[-15:]) / min(len(c1m), 15), 1) if len(c1m) >= 1 else None
+
+    increasing = int(t1m > t5m > t15m) if (t5m is not None and t15m is not None) else None
+
+    return {
+        "trades_per_min_1m": t1m,
+        "trades_per_min_5m": t5m,
+        "trades_per_min_15m": t15m,
+        "trades_increasing": increasing,
+    }
+
+
 async def start_monitor(
     symbol: str,
     level: float,
@@ -62,16 +100,18 @@ async def start_monitor(
     strength: int = 0,
     p_bounce: float = 0.0,
     expected_depth: float = 0.0,
+    approach: int = 0,
+    on_bounce=None,  # async callable(symbol, level) — вызывается немедленно при bounce
 ) -> str | None:
     """Monitor a level until body of 1M candle breaks it.
     level_side: 'support' or 'resistance'
     Returns 'breakout' if level was broken with volume, None otherwise.
     """
-    from analysis.trigger import calculate_atr
-    atr = calculate_atr(symbol)
+    atr = calc_atr(candles_1m.get(symbol, []))
 
     touched = False
     approach_warned = False
+    proximity_sent = False
     weak_breakout_sent = False
     weak_breakout_time = 0.0
     rebound_sent = False
@@ -93,6 +133,7 @@ async def start_monitor(
     touch_start_time: float = 0.0
     vol_ratio_captured: float = vol_ratio if vol_ratio is not None else 1.0  # vol_ratio captured at moment of first touch
     _monitoring_start_time = time.time()
+    _trade_activity: dict = {}  # trade activity snapshot at moment of touch
 
     def _make_result(reason, _touched=False):
         """Build result dict with outcome info."""
@@ -139,6 +180,11 @@ async def start_monitor(
         ) / max(len(candles_1m.get(symbol, [])[-20:]), 1)
         last_vol = candles_1m.get(symbol, [{}])[-1].get("volume", 0)
         vr = round(last_vol / avg_vol_ctx, 2) if avg_vol_ctx > 0 else 1.0
+        try:
+            from analysis.trigger import get_btc_change_1m as _btc_chg
+            _btc_change_1m = _btc_chg()
+        except Exception:
+            _btc_change_1m = None
         return {
             "event_type": event_type,
             "symbol": symbol,
@@ -154,6 +200,8 @@ async def start_monitor(
             "current_price": current_price,
             "timestamp": time.time(),
             "monitoring_start_time": _monitoring_start_time,
+            "approach": approach,
+            "btc_change_1m": _btc_change_1m,
             **extra,
         }
 
@@ -166,7 +214,7 @@ async def start_monitor(
 
             iteration += 1
             if iteration % 60 == 0:
-                atr = calculate_atr(symbol)
+                atr = calc_atr(c1m)
 
             c1m = candles_1m.get(symbol, [])
             if c1m:
@@ -256,6 +304,7 @@ async def start_monitor(
                             # FIX-STYLE: при breakout без touch стиль тоже определяем здесь
                             from analysis.trigger import detect_approach_style as _das
                             approach_style = _das(symbol)
+                            _outcome_saved[0] = True  # FIX BUG-C1: предотвращает дубль в _monitored
                         _monitor_result = _make_result("breakout", touched)
                         break
                     elif breakout_vol_ratio >= VOLUME_BREAKOUT_RATIO and not prev_close_below:
@@ -386,6 +435,7 @@ async def start_monitor(
                         touch_start_time = time.time()
                         avg_vol = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
                         vol_ratio_captured = round(last["volume"] / avg_vol, 2) if avg_vol > 0 else 1.0
+                        _trade_activity = _calc_trade_activity(symbol)
                         # FIX-STYLE: переопределяем стиль в момент касания, а не при старте монитора
                         from analysis.trigger import detect_approach_style as _das
                         approach_style = _das(symbol)
@@ -401,6 +451,7 @@ async def start_monitor(
                         touch_start_time = time.time()
                         avg_vol = sum(c["volume"] for c in c1m[-20:]) / max(len(c1m[-20:]), 1)
                         vol_ratio_captured = round(last["volume"] / avg_vol, 2) if avg_vol > 0 else 1.0
+                        _trade_activity = _calc_trade_activity(symbol)
                         # FIX-STYLE: переопределяем стиль в момент касания, а не при старте монитора
                         from analysis.trigger import detect_approach_style as _das
                         approach_style = _das(symbol)
@@ -415,8 +466,11 @@ async def start_monitor(
                             level_type=level_type, strength=strength,
                             approach_style=approach_style, atr_ratio=atr_ratio,
                             touch_start_time=touch_start_time,
+                            monitoring_start_time=_monitoring_start_time,
                             vol_ratio_at_touch=vol_ratio_captured,
                             outcome_saved_flag=_outcome_saved,
+                            trade_activity=_trade_activity,
+                            level_side=level_side,
                         ))
                         classify_sent = True
                     touch_classify_at = 0  # reset so we don't classify again
@@ -452,8 +506,11 @@ async def start_monitor(
                                 level_type=level_type, strength=strength,
                                 approach_style=approach_style, atr_ratio=atr_ratio,
                                 touch_start_time=touch_start_time,
+                            monitoring_start_time=_monitoring_start_time,
                                 vol_ratio_at_touch=vol_ratio_captured,
                                 outcome_saved_flag=_outcome_saved,
+                                trade_activity=_trade_activity,
+                                level_side=level_side,
                             ))
                         else:
                             # classify already ran (5-candle timer) but bounce happened later — log it now
@@ -462,8 +519,11 @@ async def start_monitor(
                                 level_type=level_type, strength=strength,
                                 approach_style=approach_style, atr_ratio=atr_ratio,
                                 touch_start_time=touch_start_time,
+                            monitoring_start_time=_monitoring_start_time,
                                 vol_ratio_at_touch=vol_ratio_captured,
                                 outcome_saved_flag=_outcome_saved,
+                                trade_activity=_trade_activity,
+                                level_side=level_side,
                             ))
                         classify_sent = True
                         rebound_sent = True
@@ -482,6 +542,13 @@ async def start_monitor(
                             await _eb_publish(_make_event("bounce", body_close))
                         except Exception as _eb_e:
                             logger.debug("event_bus publish error (bounce support): %s", _eb_e)
+                        # ── Немедленно запустить resistance-монитор выше ──────
+                        if on_bounce is not None:
+                            try:
+                                asyncio.create_task(on_bounce(symbol, level))
+                            except Exception as _ob_e:
+                                logger.debug("on_bounce callback error: %s", _ob_e)
+                        # ─────────────────────────────────────────────────────
                         # ── Pump Phase: reset broken counter on confirmed bounce ──
                         try:
                             from models import state_manager as _sm
@@ -505,8 +572,11 @@ async def start_monitor(
                                 level_type=level_type, strength=strength,
                                 approach_style=approach_style, atr_ratio=atr_ratio,
                                 touch_start_time=touch_start_time,
+                            monitoring_start_time=_monitoring_start_time,
                                 vol_ratio_at_touch=vol_ratio_captured,
                                 outcome_saved_flag=_outcome_saved,
+                                trade_activity=_trade_activity,
+                                level_side=level_side,
                             ))
                         else:
                             asyncio.create_task(_log_bounce_outcome(
@@ -514,8 +584,11 @@ async def start_monitor(
                                 level_type=level_type, strength=strength,
                                 approach_style=approach_style, atr_ratio=atr_ratio,
                                 touch_start_time=touch_start_time,
+                            monitoring_start_time=_monitoring_start_time,
                                 vol_ratio_at_touch=vol_ratio_captured,
                                 outcome_saved_flag=_outcome_saved,
+                                trade_activity=_trade_activity,
+                                level_side=level_side,
                             ))
                         classify_sent = True
                         rebound_sent = True
@@ -559,8 +632,11 @@ async def start_monitor(
                                 level_type=level_type, strength=strength,
                                 approach_style=approach_style, atr_ratio=atr_ratio,
                                 touch_start_time=touch_start_time,
+                            monitoring_start_time=_monitoring_start_time,
                                 vol_ratio_at_touch=vol_ratio_captured,
                                 outcome_saved_flag=_outcome_saved,
+                                trade_activity=_trade_activity,
+                                level_side=level_side,
                             ))
                             classify_sent = True
                         # Check near_miss: came within 0.5% but never touched
@@ -573,12 +649,16 @@ async def start_monitor(
                                     level_type=level_type, strength=strength,
                                     approach_style=approach_style, atr_ratio=atr_ratio,
                                     touch_start_time=touch_start_time,
+                            monitoring_start_time=_monitoring_start_time,
                                     vol_ratio_at_touch=vol_ratio_captured,
                                     outcome_saved_flag=_outcome_saved,
+                                    trade_activity=_trade_activity,
+                                    level_side=level_side,
                                 ))
                                 classify_sent = True
                         rebound_sent = False
                         approach_warned = False
+                        proximity_sent = False
                         touched = False
                         classify_sent = False  # reset for next touch
                         _outcome_saved[0] = False  # reset: next touch is a new event
@@ -589,7 +669,9 @@ async def start_monitor(
                     elif distance > atr * DISTANCE_PARTIAL_RESET_ATR_MULTIPLIER:
                         touched = False
                         rebound_sent = False
+                        sweep_sent = False  # FIX BUG-C4: иначе повторный sweep игнорируется
                         classify_sent = False
+                        proximity_sent = False  # сброс: при следующем подходе proximity выйдет снова
                         _outcome_saved[0] = False  # reset: next touch is a new event
                         touch_start_time = 0.0
                         vol_ratio_captured = 1.0
@@ -599,6 +681,18 @@ async def start_monitor(
                 avg_vol_20 = sum(c["volume"] for c in c1m[-20:]) / min(len(c1m), 20)
                 if volume_spike_notified and avg_vol_20 > 0 and last["volume"] / avg_vol_20 < VOLUME_SPIKE_RESET_RATIO:
                     volume_spike_notified = False
+
+                # Proximity: публикуем событие когда цена приближается к уровню на PROXIMITY_ALERT_DISTANCE_PCT,
+                # ещё до касания — чтобы S2 успел выставить сетку заблаговременно.
+                if not touched and not proximity_sent and atr > 0:
+                    _dist_pct = abs(current_price - level) / level
+                    if _dist_pct <= PROXIMITY_ALERT_DISTANCE_PCT:
+                        proximity_sent = True
+                        try:
+                            from trading.event_bus import publish as _eb_publish
+                            await _eb_publish(_make_event("proximity", current_price))
+                        except Exception as _eb_e:
+                            logger.debug("event_bus publish error (proximity): %s", _eb_e)
 
                 is_sweep = _check_sweep_reclaim(c1m, level, level_side)
                 if is_sweep and not sweep_sent:
@@ -665,15 +759,15 @@ async def start_monitor(
 # Dedup guard: prevent multiple classify calls for the same touch event
 _classify_last_sent: dict[str, float] = {}  # key: "symbol:level" -> timestamp
 
-# Dedup guard: prevent duplicate rebound messages per symbol
-_rebound_last_sent: dict[str, float] = {}  # key: "symbol" -> timestamp
 
-
-def _get_market_context(symbol: str, monitoring_start_time: float) -> dict:
+def _get_market_context(symbol: str, touch_start_time: float, monitoring_start_time: float = 0.0) -> dict:
     """
     Вычислить btc_change_1m и monitoring_age_minutes в момент сохранения.
     funding_rate — async, получается отдельно через _get_market_context_async.
     Вызывается из _log_bounce_outcome и _classify_and_log_level_event.
+
+    monitoring_age_minutes = время от старта монитора до касания уровня.
+    touch_start_time — момент касания, monitoring_start_time — старт монитора.
     """
     from analysis.trigger import get_btc_change_1m as _get_btc
     btc_change_1m = None
@@ -683,8 +777,9 @@ def _get_market_context(symbol: str, monitoring_start_time: float) -> dict:
         pass
 
     monitoring_age_minutes = None
-    if monitoring_start_time > 0:
-        monitoring_age_minutes = round((time.time() - monitoring_start_time) / 60, 2)
+    if monitoring_start_time > 0 and touch_start_time > 0:
+        monitoring_age_minutes = round((touch_start_time - monitoring_start_time) / 60, 2)
+        monitoring_age_minutes = max(0.0, monitoring_age_minutes)
 
     return {
         "btc_change_1m": btc_change_1m,
@@ -710,33 +805,53 @@ async def _log_bounce_outcome(
     approach_style: str = None,
     atr_ratio: float = None,
     touch_start_time: float = 0.0,
+    monitoring_start_time: float = 0.0,
     vol_ratio_at_touch: float = 1.0,
     outcome_saved_flag: list = None,
+    trade_activity: dict = None,
+    level_side: str = "support",
 ):
     """Log a confirmed bounce directly to level_outcomes (used when classify already ran)."""
+    if outcome_saved_flag is not None and outcome_saved_flag[0]:
+        logger.debug("outcome already saved for this touch, skipping duplicate write")
+        return
     import time as _time
     from data.history import log_event, save_level_outcome
 
     fill_depth_pct = (level - min_price) / level * 100 if min_price < level else 0.0
     now = _time.time()
-    duration_minutes = int((now - touch_start_time) / 60) if touch_start_time > 0 else 0
+    duration_minutes = round((now - touch_start_time), 1) if touch_start_time > 0 else 0.0  # BUG-4 fix: store seconds as REAL, not int minutes
 
-    ctx = _get_market_context(symbol, touch_start_time)
+    ctx = _get_market_context(symbol, touch_start_time, monitoring_start_time)
     funding = await _get_funding_rate(symbol)
-    event_type = "zakol" if fill_depth_pct >= 0.1 else "bounce"
+    if fill_depth_pct >= 1.0:
+        event_type = "zakol_deep"
+    elif fill_depth_pct >= 0.1:
+        event_type = "zakol"
+    else:
+        event_type = "bounce"
     await log_event(symbol, event_type,
                     f"level={level} depth={fill_depth_pct:.2f}% (late confirm)")
+    if fill_depth_pct >= 2.0:
+        outcome = "partial_deep"
+    elif fill_depth_pct >= 1.0:
+        outcome = "partial_mid"
+    elif fill_depth_pct >= 0.1:
+        outcome = "partial_shallow"
+    else:
+        outcome = "bounce"
+    ta = trade_activity or {}
     await save_level_outcome(
         symbol=symbol,
         level=level,
         level_type=level_type,
         strength=strength,
-        approach_type="support",
+        approach_type=level_side,
         vol_ratio=vol_ratio_at_touch,
         touches=1,
         result="отбой",
         duration=duration_minutes,
-        outcome="bounce",
+        outcome=outcome,
         approach_style=approach_style,
         vol_ratio_at_touch=vol_ratio_at_touch,
         atr_ratio=atr_ratio,
@@ -744,6 +859,10 @@ async def _log_bounce_outcome(
         btc_change_1m=ctx["btc_change_1m"],
         funding_rate=funding,
         monitoring_age_minutes=ctx["monitoring_age_minutes"],
+        trades_per_min_1m=ta.get("trades_per_min_1m"),
+        trades_per_min_5m=ta.get("trades_per_min_5m"),
+        trades_per_min_15m=ta.get("trades_per_min_15m"),
+        trades_increasing=ta.get("trades_increasing"),
     )
     if outcome_saved_flag is not None:
         outcome_saved_flag[0] = True
@@ -761,8 +880,11 @@ async def _classify_and_log_level_event(
     approach_style: str = None,
     atr_ratio: float = None,
     touch_start_time: float = 0.0,
+    monitoring_start_time: float = 0.0,
     vol_ratio_at_touch: float = 1.0,
     outcome_saved_flag: list = None,
+    trade_activity: dict = None,
+    level_side: str = "support",
 ):
     """
     Classify what happened at the level and log to history + send message.
@@ -777,9 +899,12 @@ async def _classify_and_log_level_event(
     import time as _time
     dedup_key = f"{symbol}:{level}"
     now = _time.time()
-    if now - _classify_last_sent.get(dedup_key, 0) < 60:  # 60s cooldown per level
+    if now - _classify_last_sent.get(dedup_key, 0) < 300:  # 300s cooldown per level (BUG-1 fix: was 60s, caused ~47 writes/session)
         return
     _classify_last_sent[dedup_key] = now
+    if outcome_saved_flag is not None and outcome_saved_flag[0]:
+        logger.debug("outcome already saved for this touch, skipping duplicate write")
+        return
     from data.history import log_event, save_level_outcome
 
     if not c1m or level == 0:
@@ -788,7 +913,7 @@ async def _classify_and_log_level_event(
     current_price = c1m[-1]["close"]
     fill_depth_pct = (level - min_price) / level * 100 if min_price < level else 0.0
 
-    duration_minutes = int((now - touch_start_time) / 60) if touch_start_time > 0 else 0
+    duration_minutes = round((now - touch_start_time), 1) if touch_start_time > 0 else 0.0  # BUG-4 fix: seconds as REAL
 
     # Get candles after touch
     post_touch = c1m[touch_time_idx:touch_time_idx + 20] if touch_time_idx < len(c1m) else []
@@ -818,16 +943,22 @@ async def _classify_and_log_level_event(
             )
             if retest:
                 event_type = "zakol_deep_retest"
-                outcome = "bounce"
                 details = f"level={level} depth={fill_depth_pct:.2f}% retest=yes"
             else:
                 event_type = "zakol_deep"
-                outcome = "bounce"
                 details = f"level={level} depth={fill_depth_pct:.2f}% retest=no"
         else:
             event_type = "zakol"
-            outcome = "bounce"
             details = f"level={level} depth={fill_depth_pct:.2f}%"
+        # outcome по глубине — одинаковая логика с _make_result
+        if fill_depth_pct >= 2.0:
+            outcome = "partial_deep"
+        elif fill_depth_pct >= 1.0:
+            outcome = "partial_mid"
+        elif fill_depth_pct >= 0.1:
+            outcome = "partial_shallow"
+        else:
+            outcome = "bounce"
     else:
         # Price went below level and didn't return in 5 candles — not a bounce
         # Детализируем partial по глубине, как в _make_result, чтобы outcome
@@ -843,17 +974,18 @@ async def _classify_and_log_level_event(
             outcome = "partial_shallow"
         details = f"level={level} fill_depth={fill_depth_pct:.2f}%"
 
-    ctx = _get_market_context(symbol, touch_start_time)
+    ctx = _get_market_context(symbol, touch_start_time, monitoring_start_time)
     funding = await _get_funding_rate(symbol)
     await log_event(symbol, event_type, details)
 
     # Also write to level_outcomes so ML has the data
+    ta = trade_activity or {}
     await save_level_outcome(
         symbol=symbol,
         level=level,
         level_type=level_type,
         strength=strength,
-        approach_type="support",
+        approach_type=level_side,
         vol_ratio=vol_ratio_at_touch,
         touches=1,
         result="отбой",
@@ -866,6 +998,10 @@ async def _classify_and_log_level_event(
         btc_change_1m=ctx["btc_change_1m"],
         funding_rate=funding,
         monitoring_age_minutes=ctx["monitoring_age_minutes"],
+        trades_per_min_1m=ta.get("trades_per_min_1m"),
+        trades_per_min_5m=ta.get("trades_per_min_5m"),
+        trades_per_min_15m=ta.get("trades_per_min_15m"),
+        trades_increasing=ta.get("trades_increasing"),
     )
     if outcome_saved_flag is not None:
         outcome_saved_flag[0] = True
@@ -895,11 +1031,28 @@ def _check_complications(symbol: str, level: float, level_side: str, approach_wa
     if not level_broken_sent and not weak_breakout_active:
         broken = _check_level_broken(c1m, level)
         if broken:
-            return (
-                f"🔴 {symbol} осложнение\n"
-                f"   Промежуточный уровень пробит без отскока\n"
-                f"   → импульс сильный, твой уровень под угрозой"
-            ), "level_broken"
+            key = f"{symbol}_{level}"
+            now = time.time()
+            if now - _level_broken_sent.get(key, 0) > LEVEL_BROKEN_ALERT_COOLDOWN:
+                _level_broken_sent[key] = now
+                return (
+                    f"🔴 {symbol} осложнение\n"
+                    f"   Промежуточный уровень пробит без отскока\n"
+                    f"   → импульс сильный, твой уровень под угрозой"
+                ), "level_broken"
+
+    # FIX BUG-M2: _check_volume_spike определена, но никогда не вызывалась
+    if not volume_spike_notified:
+        spike_ratio = _check_volume_spike(c1m)
+        if spike_ratio is not None:
+            key = f"{symbol}_{level}"
+            now = time.time()
+            if now - _volume_spike_sent.get(key, 0) > VOLUME_SPIKE_ALERT_COOLDOWN:
+                _volume_spike_sent[key] = now
+                return (
+                    f"📊 {symbol} всплеск объёма ×{spike_ratio}\n"
+                    f"   → давление продавцов усиливается"
+                ), "volume_spike"
 
     return None, None
 
