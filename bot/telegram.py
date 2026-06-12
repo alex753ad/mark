@@ -40,10 +40,94 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📋 Список"), KeyboardButton(text="👁 Мониторинги")],
             [KeyboardButton(text="🔍 Проверить уровень"), KeyboardButton(text="📊 Статистика")],
             [KeyboardButton(text="📊 Анализ"), KeyboardButton(text="📊 Рынок")],
+            [KeyboardButton(text="🟢 Live ON"), KeyboardButton(text="🔴 Live OFF"), KeyboardButton(text="📈 Live статистика")],
         ],
         resize_keyboard=True,
         persistent=True,
     )
+
+
+
+
+@router.message(F.text == "🟢 Live ON")
+async def btn_live_on(message: Message):
+    if not _authorized(message):
+        return
+    from trading.strategy2_live import set_live_enabled, is_live_enabled
+    if is_live_enabled():
+        await message.answer("⚡ S2 Live уже включён", reply_markup=get_main_keyboard())
+        return
+    from config import validate_bybit_config
+    if not validate_bybit_config():
+        await message.answer(
+            "❌ Не заданы BYBIT_API_KEY / BYBIT_API_SECRET в .env\n"
+            "   Live-торговля невозможна",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+    set_live_enabled(True)
+    await message.answer(
+        "🟢 S2 Live торговля ВКЛЮЧЕНА\n"
+        "   Новые сигналы S2 будут исполняться на Bybit Demo",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@router.message(F.text == "🔴 Live OFF")
+async def btn_live_off(message: Message):
+    if not _authorized(message):
+        return
+    from trading.strategy2_live import set_live_enabled, is_live_enabled
+    if not is_live_enabled():
+        await message.answer("⚡ S2 Live уже выключен", reply_markup=get_main_keyboard())
+        return
+    set_live_enabled(False)
+    await message.answer(
+        "🔴 S2 Live торговля ВЫКЛЮЧЕНА\n"
+        "   Текущие открытые позиции остаются до закрытия по сигналу",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@router.message(F.text == "📈 Live статистика")
+async def btn_live_stats(message: Message):
+    if not _authorized(message):
+        return
+    from trading.strategy2_live import is_live_enabled
+    from trading.live_trade_log import get_live_trade_stats, get_open_live_trades
+
+    enabled_str = "🟢 Включена" if is_live_enabled() else "🔴 Выключена"
+    try:
+        stats = await get_live_trade_stats()
+        open_trades = await get_open_live_trades()
+    except Exception as e:
+        await message.answer(f"Ошибка получения статистики: {e}", reply_markup=get_main_keyboard())
+        return
+
+    open_lines = []
+    for t in open_trades:
+        from data.collector import candles_1m
+        c1m = candles_1m.get(t["symbol"], [])
+        price = c1m[-1]["close"] if c1m else 0
+        ep = t.get("entry_price") or 0
+        pnl = (price - ep) / ep * 100 if ep > 0 else 0
+        fills = t.get("grid_fill_count") or 0
+        open_lines.append(
+            f"  {t['symbol']} | fills={fills}/{10} | текущий PnL: {pnl:+.2f}%"
+        )
+
+    open_str = "\n".join(open_lines) if open_lines else "  нет"
+
+    text = (
+        f"📈 S2 Live (Bybit Demo)\n"
+        f"   Статус: {enabled_str}\n\n"
+        f"Открытые позиции:\n{open_str}\n\n"
+        f"Закрытые сделки: {stats['total']}\n"
+        f"  Win rate: {stats['win_rate']:.0f}% ({stats['wins']}W / {stats['losses']}L)\n"
+        f"  PnL итого: {stats['total_pnl_usdt']:+.2f} USDT\n"
+        f"  Avg время: {stats['avg_duration_minutes']:.0f} мин"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard())
 
 
 class CheckLevel(StatesGroup):
