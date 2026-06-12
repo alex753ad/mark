@@ -17,24 +17,18 @@ logger.add(
     colorize=True,
 )
 
-# File handler - detailed format with structured data
+# File handler - INFO only, compact format, gzip compression
 logger.add(
     "logs/bot_{time:YYYY-MM-DD}.log",
     rotation="1 day",
     retention="7 days",
-    level="DEBUG",
+    level="INFO",
     encoding="utf-8",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message} | {extra}",
-    serialize=False,  # Keep human-readable format
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level:<5} | {name}:{line} | {message}",
+    serialize=False,
+    compression="gz",
 )
 
 
 def log_with_context(level: str, message: str, **kwargs):
-    """
-    Log with structured context data.
-    
-    Example:
-        log_with_context("info", "Level triggered", symbol="BTCUSDT", level=50000, strength=5)
-    """
     logger.bind(**kwargs).log(level.upper(), message)
-

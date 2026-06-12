@@ -1,47 +1,42 @@
 [
   {
-    "symbol": "BEATUSDT",
-    "level": 9.328,
+    "symbol": "VELVETUSDT",
+    "level": 0.91113,
     "level_side": "resistance"
   },
   {
-    "symbol": "STGUSDT",
-    "level": 0.5107,
+    "symbol": "HUSDT",
+    "level": 0.23162,
     "level_side": "support"
   },
   {
-    "symbol": "HMSTRUSDT",
-    "level": 0.00029268,
+    "symbol": "AIOUSDT",
+    "level": 0.13776,
     "level_side": "support"
   },
   {
     "symbol": "SKYAIUSDT",
-    "level": 0.23103,
-    "level_side": "resistance"
-  },
-  {
-    "symbol": "SPACEUSDT",
-    "level": 0.007397,
+    "level": 0.30342,
     "level_side": "support"
   },
   {
-    "symbol": "BTWUSDT",
-    "level": 0.081955,
+    "symbol": "NAORISUSDT",
+    "level": 0.05013,
     "level_side": "support"
   },
   {
-    "symbol": "IDUSDT",
-    "level": 0.034779,
-    "level_side": "resistance"
-  },
-  {
-    "symbol": "LABUSDT",
-    "level": 9.003,
+    "symbol": "ALLOUSDT",
+    "level": 0.40748,
     "level_side": "support"
   },
   {
-    "symbol": "LABUSDT",
-    "level": 9.3796,
+    "symbol": "ALLOUSDT",
+    "level": 0.42744,
     "level_side": "resistance"
+  },
+  {
+    "symbol": "BEATUSDT",
+    "level": 9.893,
+    "level_side": "support"
   }
 ]

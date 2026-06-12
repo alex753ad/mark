@@ -13,6 +13,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY")  # Optional proxy URL
 
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+
 # File paths
 TOKENS_FILE = "tokens.json"
 BLACKLIST_FILE = "blacklist.json"
@@ -133,5 +136,16 @@ def validate_config() -> bool:
         return False
     if TELEGRAM_CHAT_ID == 0:
         logger.error("Missing or invalid TELEGRAM_CHAT_ID in environment")
+        return False
+    return True
+
+
+def validate_bybit_config() -> bool:
+    """Проверить наличие Bybit ключей перед включением live-торговли."""
+    if not BYBIT_API_KEY:
+        logger.error("Missing BYBIT_API_KEY in environment")
+        return False
+    if not BYBIT_API_SECRET:
+        logger.error("Missing BYBIT_API_SECRET in environment")
         return False
     return True

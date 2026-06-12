@@ -34,7 +34,7 @@ from analysis.trigger import (
 from utils import calculate_strength, calc_atr as _calc_atr_util
 from analysis.monitor import start_monitor
 from bot.telegram import send_message, start_bot
-from config import token_registry, blacklist, validate_config, TRIGGER_TIMES_FILE, ACTIVE_MONITORS_FILE
+from config import token_registry, blacklist, validate_config, TRIGGER_TIMES_FILE, ACTIVE_MONITORS_FILE, BYBIT_API_KEY, BYBIT_API_SECRET
 from data.history import init_db, save_level_outcome, update_symbol_profile, get_outcome_probs, log_event
 
 
@@ -1737,6 +1737,38 @@ async def _ml_retrain_loop():
         await asyncio.sleep(3600)  # check every hour
 
 
+
+async def _check_bybit() -> bool:
+    """Проверить подключение к Bybit Demo при старте. Возвращает False если ключи не заданы или подпись неверна."""
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        logger.warning("Bybit API keys not set — S2 Live trading disabled")
+        return False
+    try:
+        from trading.bybit_client import _get
+        resp = await _get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+        if resp.get("retCode") != 0:
+            logger.error(
+                "Bybit Demo auth failed — S2 Live disabled",
+                retCode=resp.get("retCode"),
+                retMsg=resp.get("retMsg"),
+            )
+            await send_message(
+                f"⚠️ Bybit Demo: ошибка авторизации (retCode={resp.get('retCode')}). "
+                f"S2 Live торговля отключена."
+            )
+            return False
+        coins = resp["result"]["list"][0].get("coin", [])
+        usdt = next((c for c in coins if c["coin"] == "USDT"), None)
+        balance = float(usdt.get("walletBalance", 0)) if usdt else 0.0
+        logger.info("Bybit Demo connected", balance_usdt=round(balance, 2))
+        await send_message(f"✅ Bybit Demo подключён | Баланс: {balance:.2f} USDT")
+        return True
+    except Exception as e:
+        logger.error("Bybit Demo connection error — S2 Live disabled", error=str(e))
+        await send_message(f"⚠️ Bybit Demo: ошибка подключения ({e}). S2 Live торговля отключена.")
+        return False
+
+
 async def main():
     """Main entry point."""
     # Validate configuration
@@ -1747,6 +1779,9 @@ async def main():
     # Initialize database
     await init_db()
     logger.info("Database initialized")
+
+    # Check Bybit Demo connection
+    await _check_bybit()
 
     # Setup signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()
