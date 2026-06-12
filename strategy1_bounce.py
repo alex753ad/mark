@@ -1,0 +1,319 @@
+"""Strategy 1: Bounce — вход по подтверждённому отбою (bounce / sweep)."""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+
+from trading.base_strategy import BaseStrategy
+from trading.trade_log import open_trade, add_trade_event, get_open_trades
+from bot.telegram import send_message, send_close_with_chart
+from data.collector import candles_1m
+from constants import S1_MIN_STRENGTH, S1_MIN_P_BOUNCE, S1_MAX_VOL_RATIO, S1_TP1_RR, S1_TP2_RR
+from logger import logger
+
+# Trailing stop до TP1: активируется при max_favorable >= порога
+S1_TRAILING_ACTIVATE_PCT = 0.005   # 0.5% от пика для активации
+S1_TRAILING_OFFSET_PCT   = 0.003   # стоп = пик − 0.3%
+
+
+class Strategy1Bounce(BaseStrategy):
+    strategy_id = 1
+    strategy_name = "bounce"
+
+    # ── Вход ──────────────────────────────────────────────────────────
+
+    async def on_event(self, event: dict) -> None:
+        event_type = event.get("event_type")
+
+        # Реагируем на bounce и sweep как сигналы входа
+        if event_type in ("bounce", "sweep"):
+            await self._try_open(event)
+            return
+
+        # Breakout по открытой сделке — экстренный выход
+        if event_type == "breakout":
+            await self._handle_breakout(event)
+
+    async def _try_open(self, event: dict) -> None:
+        symbol = event["symbol"]
+        strength = event.get("strength", 0)
+        p_bounce = event.get("p_bounce", 0.0)
+        approach_style = event.get("approach_style", "unknown")
+
+        if strength < S1_MIN_STRENGTH:
+            return
+        if p_bounce < S1_MIN_P_BOUNCE:
+            return
+        if approach_style == "bleed":
+            return
+        # pump_base уровни в bearish режиме пробиваются насквозь — исключить полностью
+        level_type = event.get("level_type", "")
+        if level_type == "pump_base":
+            logger.debug("S1 skip: pump_base level", symbol=symbol, level_type=level_type)
+            return
+        # Не входить если объём на касании выше порога — S1 ловит тихие отбои.
+        # Данные history.db: vol 0.8–3.0× даёт одинаковый bounce rate ~41%.
+        # Высокий vol (>1.2×) — уже активное движение, для S2/S3, не S1.
+        vol_ratio = event.get("vol_ratio", 1.0)
+        if vol_ratio > S1_MAX_VOL_RATIO:
+            logger.debug(
+                "S1 skip: vol_ratio above threshold (noisy touch)",
+                symbol=symbol, vol_ratio=vol_ratio, threshold=S1_MAX_VOL_RATIO,
+            )
+            return
+        if not await self._can_open_trade(symbol):
+            return
+
+        entry_price = event["current_price"]
+        atr = event.get("atr", 0.0)
+        expected_depth = event.get("expected_depth", 0.0)
+
+        # Если expected_depth слишком мал — использовать ATR как ориентир
+        if expected_depth < 0.1:
+            expected_depth = (atr / entry_price * 100) if entry_price > 0 else 0.5
+
+        expected_depth_abs = entry_price * (expected_depth / 100)
+        stop_loss = event["level"] - expected_depth_abs * 1.5
+        risk = entry_price - stop_loss
+        # FIX BUG-8: при нулевом/отрицательном risk TP окажется ниже entry — не открывать
+        if risk <= 0:
+            logger.warning(
+                "S1 skip: non-positive risk",
+                symbol=symbol, entry=entry_price, sl=stop_loss, level=event["level"],
+            )
+            return
+        take_profit_1 = entry_price + risk * S1_TP1_RR
+        take_profit_2 = entry_price + risk * S1_TP2_RR
+
+        trade_id = str(uuid.uuid4())
+        trade = {
+            "trade_id": trade_id,
+            "strategy_id": self.strategy_id,
+            "strategy_name": self.strategy_name,
+            "symbol": symbol,
+            "level": event["level"],
+            "level_type": event.get("level_type", ""),
+            "level_side": event.get("level_side", "support"),
+            "entry_signal": event["event_type"],
+            "strength_at_entry": strength,
+            "p_bounce_at_entry": p_bounce,
+            "expected_depth_at_entry": expected_depth,
+            "approach_style": approach_style,
+            "vol_ratio_at_entry": event.get("vol_ratio", 1.0),
+            "atr_at_entry": atr,
+            "entry_price": entry_price,
+            "entry_time": time.time(),
+            "position_size": self.POSITION_SIZE_USDT,
+            "direction": "long",
+            "grid_orders_json": None,
+            "grid_fill_count": None,
+            # Параметры выхода хранятся в extra-полях events_json
+        }
+
+        await open_trade(trade)
+
+        # Сохранить параметры выхода как первое событие
+        params_note = json.dumps({
+            "stop_loss": round(stop_loss, 8),
+            "take_profit_1": round(take_profit_1, 8),
+            "take_profit_2": round(take_profit_2, 8),
+            "tp1_hit": False,
+            "stop_moved_to_breakeven": False,
+            "trailing_active": False,
+            "trailing_peak": None,
+            "trailing_stop": None,
+        })
+        await add_trade_event(trade_id, "params_set", entry_price, params_note)
+
+        trade["entry_price"] = entry_price  # для сообщения
+        await self._send_open_message(trade, stop_loss, take_profit_1, take_profit_2)
+
+        logger.info(
+            "S1 trade opened",
+            trade_id=trade_id,
+            symbol=symbol,
+            entry=entry_price,
+            sl=round(stop_loss, 8),
+            tp1=round(take_profit_1, 8),
+            tp2=round(take_profit_2, 8),
+        )
+
+    # ── Сопровождение ─────────────────────────────────────────────────
+
+    async def _check_exit(self, trade: dict, current_price: float) -> None:
+        trade_id = trade["trade_id"]
+        entry_price = trade["entry_price"]
+
+        # Восстановить параметры выхода из events_json
+        params = self._extract_params(trade)
+        if params is None:
+            return
+
+        stop_loss = params["stop_loss"]
+        take_profit_1 = params["take_profit_1"]
+        take_profit_2 = params["take_profit_2"]
+        tp1_hit = params.get("tp1_hit", False)
+        stop_moved = params.get("stop_moved_to_breakeven", False)
+        trailing_active = params.get("trailing_active", False)
+        trailing_peak = params.get("trailing_peak")
+        trailing_stop = params.get("trailing_stop")
+
+        # После TP1 стоп сдвинут на безубыток (trailing уже не нужен — логика TP2/SL)
+        effective_stop = entry_price if stop_moved else stop_loss
+
+        # TP2
+        if current_price >= take_profit_2:
+            # Финальный PnL: 50% по TP1 + 50% по TP2
+            if tp1_hit:
+                avg_exit = (take_profit_1 + take_profit_2) / 2
+            else:
+                avg_exit = take_profit_2
+            await self._close_and_track(trade_id, trade["symbol"], avg_exit, "take_profit_2")
+            await self._send_close_message(trade, avg_exit, "take_profit_2")
+            return
+
+        # TP1 — частичная фиксация
+        if not tp1_hit and current_price >= take_profit_1:
+            params["tp1_hit"] = True
+            params["stop_moved_to_breakeven"] = True
+            params["trailing_active"] = False  # trailing снимается, стоп уходит в breakeven
+            await add_trade_event(
+                trade_id, "tp1_hit", current_price,
+                json.dumps({"partial_exit_price": current_price, "partial_exit_pct": 50})
+            )
+            await add_trade_event(trade_id, "params_updated", current_price, json.dumps(params))
+            logger.info("S1 TP1 hit, stop moved to breakeven", trade_id=trade_id)
+            return
+
+        # ── Trailing stop до TP1 ──────────────────────────────────────────
+        if not tp1_hit:
+            # High последних 2 свечей 1М — захватывает быстрые пики между тиками поллинга
+            _c1m = candles_1m.get(trade["symbol"], [])
+            _last_high = max((c["high"] for c in _c1m[-2:]), default=current_price)
+            fav_pct = (_last_high - entry_price) / entry_price
+
+            if trailing_active and trailing_peak is not None:
+                # Обновить пик если high пошёл выше
+                if _last_high > trailing_peak:
+                    trailing_peak = _last_high
+                    trailing_stop = round(trailing_peak * (1.0 - S1_TRAILING_OFFSET_PCT), 8)
+                    params["trailing_peak"] = trailing_peak
+                    params["trailing_stop"] = trailing_stop
+                    await add_trade_event(
+                        trade_id, "params_updated", current_price, json.dumps(params)
+                    )
+                    logger.debug(
+                        "S1 trailing peak updated",
+                        trade_id=trade_id, peak=trailing_peak, trailing_stop=trailing_stop,
+                    )
+
+                # Проверить срабатывание trailing stop по current_price (консервативно)
+                if trailing_stop is not None and current_price <= trailing_stop:
+                    await self._close_and_track(trade_id, trade["symbol"], current_price, "trailing_stop")
+                    await self._send_close_message(trade, current_price, "trailing_stop")
+                    return
+
+            elif fav_pct >= S1_TRAILING_ACTIVATE_PCT:
+                # Активировать trailing: пик = last_high
+                trailing_peak = _last_high
+                trailing_stop = round(trailing_peak * (1.0 - S1_TRAILING_OFFSET_PCT), 8)
+                params["trailing_active"] = True
+                params["trailing_peak"] = trailing_peak
+                params["trailing_stop"] = trailing_stop
+                await add_trade_event(
+                    trade_id, "params_updated", current_price,
+                    json.dumps(params)
+                )
+                logger.info(
+                    "S1 trailing activated",
+                    trade_id=trade_id, peak=trailing_peak, trailing_stop=trailing_stop,
+                )
+                return
+
+        # Stop loss (статичный — до активации trailing или после TP1 в breakeven)
+        if current_price <= effective_stop:
+            if tp1_hit:
+                # Половина уже зафиксирована по TP1, вторая половина по стопу (= безубыток)
+                avg_exit = (take_profit_1 + entry_price) / 2
+                await self._close_and_track(trade_id, trade["symbol"], avg_exit, "stop_loss")
+                await self._send_close_message(trade, avg_exit, "stop_loss")
+            else:
+                await self._close_and_track(trade_id, trade["symbol"], current_price, "stop_loss")
+                await self._send_close_message(trade, current_price, "stop_loss")
+
+    async def _handle_breakout(self, event: dict) -> None:
+        """Закрыть сделку при подтверждённом пробое того же уровня."""
+        trades = await get_open_trades(self.strategy_id)
+        for trade in trades:
+            if trade["symbol"] != event["symbol"]:
+                continue
+            if abs(trade["level"] - event["level"]) / max(trade["level"], 1) > 0.005:
+                continue
+            current_price = event["current_price"]
+            await self._close_and_track(trade["trade_id"], trade["symbol"], current_price, "breakout_confirmed")
+            await self._send_close_message(trade, current_price, "breakout_confirmed")
+            logger.info("S1 trade closed on breakout", trade_id=trade["trade_id"])
+
+    # ── Вспомогательные ───────────────────────────────────────────────
+
+    def _extract_params(self, trade: dict) -> dict | None:
+        """Достать последний params_set / params_updated из events_json."""
+        try:
+            events = json.loads(trade.get("events_json") or "[]")
+        except Exception:
+            return None
+        # Берём последний params_updated или params_set
+        for ev in reversed(events):
+            if ev["type"] in ("params_updated", "params_set"):
+                try:
+                    return json.loads(ev["note"])
+                except Exception:
+                    return None
+        return None
+
+    # ── Telegram ──────────────────────────────────────────────────────
+
+    async def _send_open_message(
+        self, trade: dict, stop_loss: float, tp1: float, tp2: float
+    ) -> None:
+        ep = trade["entry_price"]
+        sl_pct = self._format_pct((stop_loss - ep) / ep * 100)
+        tp1_pct = self._format_pct((tp1 - ep) / ep * 100)
+        tp2_pct = self._format_pct((tp2 - ep) / ep * 100)
+        text = (
+            f"📈 [S1 Bounce] {trade['symbol']} LONG\n"
+            f"   Уровень: {trade['level']} ({trade['level_type']}, strength={trade['strength_at_entry']})\n"
+            f"   Вход: {ep} | p_bounce={trade['p_bounce_at_entry']:.2f} | style={trade['approach_style']}\n"
+            f"   SL: {round(stop_loss, 8)} ({sl_pct}) | TP1: {round(tp1, 8)} ({tp1_pct}) | TP2: {round(tp2, 8)} ({tp2_pct})\n"
+            f"   Позиция: {int(self.POSITION_SIZE_USDT)} USDT"
+        )
+        try:
+            await send_message(text)
+        except Exception as e:
+            logger.error("S1 send_open_message failed", error=str(e))
+
+    async def _send_close_message(self, trade: dict, exit_price: float, reason: str) -> None:
+        ep = trade["entry_price"]
+        pnl_pct = (exit_price - ep) / ep * 100
+        pnl_usdt = self.POSITION_SIZE_USDT * pnl_pct / 100
+        icon = "✅" if pnl_pct >= 0 else "🔴"
+        max_fav  = trade.get("max_favorable_pct") or 0.0
+        max_adv  = trade.get("max_adverse_pct") or 0.0
+        max_profit_usdt = self.POSITION_SIZE_USDT * max_fav / 100
+        max_loss_usdt   = self.POSITION_SIZE_USDT * max_adv / 100
+        text = (
+            f"{icon} [S1 Bounce] {trade['symbol']} закрыт\n"
+            f"   Причина: {reason}\n"
+            f"   Вход: {ep} → Выход: {exit_price}\n"
+            f"   PnL: {self._format_pct(pnl_pct)} ({self._format_pct(pnl_usdt, sign=True)} USDT)"
+            f" | Время: {self._format_duration(trade['entry_time'])}\n"
+            f"   📈 Max profit: +{max_fav:.2f}% (+{max_profit_usdt:.2f} USDT)\n"
+            f"   📉 Max drawdown: -{max_adv:.2f}% (-{max_loss_usdt:.2f} USDT)"
+        )
+        try:
+            await send_close_with_chart(text, trade["symbol"],
+                entry_price=trade["entry_price"], exit_price=exit_price, level=trade.get("level"))
+        except Exception as e:
+            logger.error("S1 send_close_message failed", error=str(e))
